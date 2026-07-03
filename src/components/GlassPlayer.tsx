@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Star,
@@ -80,8 +80,6 @@ export default function GlassPlayer({
   onCyclePlayMode,
 }: GlassPlayerProps) {
   const progressBarRef = useRef<HTMLDivElement>(null);
-  const lyricsContainerRef = useRef<HTMLDivElement>(null);
-  const lyricLineRefs = useRef<(HTMLDivElement | null)[]>([]);
 
   // State
   const [isHoveringProgress, setIsHoveringProgress] = useState(false);
@@ -128,24 +126,35 @@ export default function GlassPlayer({
       return idx;
     }
     return acc;
-  }, 0);
+  }, -1);
 
-  // Scroll active lyric into center
-  useEffect(() => {
-    if (layout === 'lyrics' && activeLyricIndex !== -1 && lyricLineRefs.current[activeLyricIndex] && lyricsContainerRef.current) {
-      const activeElement = lyricLineRefs.current[activeLyricIndex];
-      const container = lyricsContainerRef.current;
+  const lyricAnchorIndex = useMemo(() => {
+    if (activeLyricIndex >= 0) return activeLyricIndex;
+    const upcomingIndex = song.lyrics.findIndex((line) => line.time > currentTime);
+    return upcomingIndex >= 0 ? upcomingIndex : 0;
+  }, [activeLyricIndex, currentTime, song.lyrics]);
 
-      const elementOffsetTop = activeElement.offsetTop;
-      const elementHeight = activeElement.offsetHeight;
-      const containerHeight = container.offsetHeight;
+  const visibleLyricItems = useMemo(() => {
+    const start = Math.max(0, lyricAnchorIndex - 3);
+    const end = Math.min(song.lyrics.length - 1, lyricAnchorIndex + 5);
+    return song.lyrics.slice(start, end + 1).map((line, localIndex) => {
+      const index = start + localIndex;
+      return {
+        line,
+        index,
+        offset: index - lyricAnchorIndex,
+      };
+    });
+  }, [lyricAnchorIndex, song.lyrics]);
 
-      container.scrollTo({
-        top: elementOffsetTop - containerHeight / 2 + elementHeight / 2,
-        behavior: 'smooth',
-      });
-    }
-  }, [activeLyricIndex, layout]);
+  const activeLyricProgress = useMemo(() => {
+    if (activeLyricIndex < 0) return 0;
+    const activeLine = song.lyrics[activeLyricIndex];
+    if (!activeLine) return 0;
+    const nextTime = song.lyrics[activeLyricIndex + 1]?.time ?? song.duration;
+    const duration = Math.max(0.2, nextTime - activeLine.time);
+    return Math.min(1, Math.max(0, (currentTime - activeLine.time) / duration));
+  }, [activeLyricIndex, currentTime, song.duration, song.lyrics]);
 
   // Adjust speed
   const increaseSpeed = () => {
@@ -565,32 +574,82 @@ export default function GlassPlayer({
                     <X size={14} />
                   </button>
                 </div>
-                {/* Synced Lyrics Scrollable Container */}
-                <div 
-                  ref={lyricsContainerRef}
-                  className="flex-1 overflow-y-auto pr-2 flex flex-col gap-6 scrollbar-none pb-24 pt-20"
-                  style={{ 
-                    maskImage: 'linear-gradient(to bottom, transparent 0%, white 15%, white 85%, transparent 100%)', 
-                    WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, white 15%, white 85%, transparent 100%)' 
+                {/* Synced Lyrics Rail */}
+                <div
+                  className="relative flex-1 overflow-hidden pr-2 pb-24 pt-20"
+                  style={{
+                    maskImage: 'linear-gradient(to bottom, transparent 0%, white 14%, white 82%, transparent 100%)',
+                    WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, white 14%, white 82%, transparent 100%)'
                   }}
                 >
-                  {song.lyrics.map((line, idx) => {
-                    const isActive = idx === activeLyricIndex;
-                    return (
-                      <div
-                        key={idx}
-                        ref={el => lyricLineRefs.current[idx] = el}
-                        onClick={() => onSeek(line.time)}
-                        className={`transition-all duration-700 ease-out cursor-pointer text-left py-1 origin-left select-none text-[21px] font-bold font-sans tracking-tight leading-relaxed
-                          ${isActive 
-                            ? 'text-white scale-100 opacity-100 filter blur-0 translate-x-0' 
-                            : 'text-white/30 scale-[0.96] opacity-65 filter blur-[0.4px] hover:text-white/60 hover:opacity-90'
-                          }`}
-                      >
-                        {line.text}
-                      </div>
-                    );
-                  })}
+                  <div className="absolute left-0 right-2 top-1/2 h-[460px] -translate-y-1/2">
+                    <AnimatePresence initial={false}>
+                      {visibleLyricItems.map(({ line, index, offset }) => {
+                        const isActive = index === activeLyricIndex;
+                        const distance = Math.abs(offset);
+                        const isPassed = offset < 0;
+                        const y = offset * 68;
+                        const scale = isActive ? 1 : Math.max(0.86, 0.96 - distance * 0.035);
+                        const opacity = isActive
+                          ? 1
+                          : isPassed
+                            ? Math.max(0.12, 0.46 - distance * 0.1)
+                            : Math.max(0.18, 0.62 - distance * 0.11);
+                        const blur = isActive ? 0 : Math.min(2.2, 0.35 + distance * 0.38);
+
+                        return (
+                          <motion.button
+                            type="button"
+                            key={`${index}-${line.time}-${line.text}`}
+                            onClick={() => onSeek(line.time)}
+                            initial={{ opacity: 0, y: y + 22, scale: scale * 0.98, filter: `blur(${blur + 1}px)` }}
+                            animate={{ opacity, y, scale, filter: `blur(${blur}px)` }}
+                            exit={{ opacity: 0, y: y - 18, scale: scale * 0.98, filter: 'blur(3px)' }}
+                            transition={{
+                              y: { type: 'spring', stiffness: 148, damping: 30, mass: 0.82 },
+                              scale: { type: 'spring', stiffness: 170, damping: 30, mass: 0.78 },
+                              opacity: { duration: 0.28, ease: [0.32, 0.72, 0, 1] },
+                              filter: { duration: 0.32, ease: [0.32, 0.72, 0, 1] },
+                            }}
+                            className="absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight"
+                            style={{
+                              color: isActive ? 'rgba(255,255,255,0.42)' : 'rgba(255,255,255,0.64)',
+                              textShadow: isActive
+                                ? '0 10px 36px rgba(255,255,255,0.18), 0 1px 18px rgba(0,0,0,0.42)'
+                                : '0 1px 14px rgba(0,0,0,0.28)',
+                            }}
+                          >
+                            <span className="relative inline-block">
+                              {line.text}
+                              {isActive && (
+                                <>
+                                  <motion.span
+                                    aria-hidden
+                                    className="absolute inset-0 overflow-hidden text-white"
+                                    initial={{ clipPath: 'inset(0 100% 0 0)', opacity: 0 }}
+                                    animate={{
+                                      clipPath: `inset(0 ${Math.max(0, 100 - activeLyricProgress * 100)}% 0 0)`,
+                                      opacity: 1,
+                                    }}
+                                    transition={{ duration: 0.18, ease: 'easeOut' }}
+                                  >
+                                    {line.text}
+                                  </motion.span>
+                                  <motion.span
+                                    aria-hidden
+                                    className="absolute -bottom-1 left-0 h-[3px] w-full origin-left rounded-full bg-white/80"
+                                    initial={{ scaleX: 0, opacity: 0 }}
+                                    animate={{ scaleX: activeLyricProgress, opacity: 0.86 }}
+                                    transition={{ duration: 0.18, ease: 'easeOut' }}
+                                  />
+                                </>
+                              )}
+                            </span>
+                          </motion.button>
+                        );
+                      })}
+                    </AnimatePresence>
+                  </div>
                 </div>
 
                 {/* Drawer Footer Controls — hidden until hovering the lyrics panel */}
