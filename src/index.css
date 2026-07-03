@@ -1,0 +1,156 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-display: "Outfit", var(--font-sans);
+  
+  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    background: transparent !important;
+  }
+  body {
+    @apply font-sans text-white overflow-hidden w-screen h-screen;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  /* Window drag region (move window by dragging blank areas).
+     Tauri honors data-tauri-drag-region; the CSS below makes it robust. */
+  [data-tauri-drag-region] {
+    -webkit-app-region: drag;
+    app-region: drag;
+  }
+  /* interactive children opt back out of dragging */
+  button,
+  a,
+  input,
+  [role="button"],
+  .no-drag,
+  .cursor-pointer {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+}
+
+/* Hide scrollbars for a premium, application-like feel */
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Background radial gradient mask for extra lighting effects */
+.bg-radial-gradient {
+  background-image: radial-gradient(var(--tw-gradient-stops));
+}
+
+.app-window-frame {
+  isolation: isolate;
+  background: transparent;
+  border-radius: 20px;
+}
+
+/* Player shell: liquid-glass displacement filter is applied at runtime via the
+   useLiquidGlass hook (lib/liquidGlass.ts, ported from nikdelvin/liquid-glass).
+   The displacement map is size-aware + corner-shaped, so no corner spikes. */
+.player-liquid-glass {
+  --player-radius: 20px;
+  border-radius: var(--player-radius) !important;
+  background-clip: padding-box;
+  clip-path: inset(0 round var(--player-radius));
+  isolation: isolate;
+  transform: translateZ(0);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.player-liquid-glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  border-radius: var(--player-radius);
+  padding: 1px;
+  pointer-events: none;
+  background:
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.48) 0%,
+      rgba(255, 255, 255, 0.16) 42%,
+      rgba(255, 255, 255, 0.12) 66%,
+      rgba(255, 255, 255, 0.34) 100%
+    );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+
+.player-liquid-glass::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: var(--player-radius);
+  pointer-events: none;
+  background:
+    radial-gradient(88% 60% at 16% 2%, rgba(255, 255, 255, 0.08), transparent 48%),
+    radial-gradient(70% 48% at 102% 98%, color-mix(in srgb, var(--player-theme-color, white) 12%, transparent), transparent 62%),
+    linear-gradient(132deg, rgba(255, 255, 255, 0.06), transparent 24%, transparent 78%, rgba(255, 255, 255, 0.03));
+  mix-blend-mode: screen;
+}
+
+.player-liquid-content {
+  position: relative;
+  z-index: 3;
+}
+
+.player-liquid-glow {
+  z-index: 1;
+}
+
+.liquid-glass-studio-canvas {
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  border-radius: var(--player-radius);
+}
+
+.liquid-glass-panel,
+.liquid-glass-control {
+  backdrop-filter: blur(18px) saturate(210%) brightness(1.06);
+  -webkit-backdrop-filter: blur(18px) saturate(210%) brightness(1.06);
+}
+
+.liquid-glass-panel {
+  box-shadow:
+    inset 1px 0 rgba(255, 255, 255, 0.08),
+    inset 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.liquid-glass-control {
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.42),
+    inset 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 -1px rgba(0, 0, 0, 0.18),
+    0 8px 18px -12px rgba(0, 0, 0, 0.65);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .player-liquid-glass {
+    transition: none !important;
+  }
+}
