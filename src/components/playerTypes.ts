@@ -29,4 +29,6 @@ export type LyricMotionStyle =
   | 'dialogue'
   | 'poster'
   | 'tilt'
-  | 'ripple';
+  | 'ripple'
+  | 'float'
+  | 'stagger';

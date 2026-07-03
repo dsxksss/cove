@@ -29,6 +29,19 @@ const USE_COVER_BACKGROUND_KEY = "nmp.useCoverBackground";
 const DEFAULT_BACKGROUND_BLUR = 30;
 const DEFAULT_BACKGROUND_OPACITY = 0;
 const DEFAULT_LYRIC_MOTION_STYLE: LyricMotionStyle = "rail";
+const LYRIC_MOTION_STYLE_OPTIONS: Array<{ value: LyricMotionStyle; label: string }> = [
+  { value: "rail", label: "流动" },
+  { value: "cascade", label: "分层" },
+  { value: "focus", label: "聚焦" },
+  { value: "typewriter", label: "打印" },
+  { value: "beam", label: "光束" },
+  { value: "dialogue", label: "对话" },
+  { value: "poster", label: "海报" },
+  { value: "tilt", label: "倾斜" },
+  { value: "ripple", label: "涟漪" },
+  { value: "float", label: "漂浮" },
+  { value: "stagger", label: "散列" },
+];
 
 function loadBackgroundBlur(): number {
   try {
@@ -65,17 +78,7 @@ function saveBackgroundOpacity(value: number) {
 }
 
 function isLyricMotionStyle(value: string | null): value is LyricMotionStyle {
-  return (
-    value === "rail" ||
-    value === "cascade" ||
-    value === "focus" ||
-    value === "typewriter" ||
-    value === "beam" ||
-    value === "dialogue" ||
-    value === "poster" ||
-    value === "tilt" ||
-    value === "ripple"
-  );
+  return LYRIC_MOTION_STYLE_OPTIONS.some((option) => option.value === value);
 }
 
 function loadLyricMotionStyle(): LyricMotionStyle {
@@ -637,40 +640,14 @@ function SettingsPanel({
                   <div className="mb-2 flex items-center justify-between">
                     <span className="text-sm font-semibold text-white/85">歌词动画</span>
                     <span className="font-mono text-xs text-white/45">
-                      {lyricMotionStyle === "rail"
-                        ? "流动"
-                        : lyricMotionStyle === "cascade"
-                          ? "分层"
-                          : lyricMotionStyle === "focus"
-                            ? "聚焦"
-                            : lyricMotionStyle === "typewriter"
-                              ? "打印"
-                              : lyricMotionStyle === "beam"
-                                ? "光束"
-                                : lyricMotionStyle === "dialogue"
-                                  ? "对话"
-                                  : lyricMotionStyle === "poster"
-                                    ? "海报"
-                                    : lyricMotionStyle === "tilt"
-                                      ? "倾斜"
-                                      : "涟漪"}
+                      {LYRIC_MOTION_STYLE_OPTIONS.find((option) => option.value === lyricMotionStyle)?.label ?? "流动"}
                     </span>
                   </div>
                   <div className="grid grid-cols-4 gap-1 rounded-2xl bg-white/[0.06] p-1 border border-white/10">
-                    {[
-                      ["rail", "流动"],
-                      ["cascade", "分层"],
-                      ["focus", "聚焦"],
-                      ["typewriter", "打印"],
-                      ["beam", "光束"],
-                      ["dialogue", "对话"],
-                      ["poster", "海报"],
-                      ["tilt", "倾斜"],
-                      ["ripple", "涟漪"],
-                    ].map(([value, label]) => (
+                    {LYRIC_MOTION_STYLE_OPTIONS.map(({ value, label }) => (
                       <button
                         key={value}
-                        onClick={() => onLyricMotionStyleChange(value as LyricMotionStyle)}
+                        onClick={() => onLyricMotionStyleChange(value)}
                         className={`h-8 rounded-full text-xs font-bold transition-colors ${
                           lyricMotionStyle === value
                             ? "bg-white text-slate-950"
