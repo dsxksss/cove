@@ -21,7 +21,7 @@ import {
 } from 'lucide-react';
 // LiquidGlassCanvas (WebGL glass) removed for performance — pure CSS
 // backdrop-filter is used on the player card instead.
-import { Song, PlayerLayout } from './playerTypes';
+import { LyricMotionStyle, Song, PlayerLayout } from './playerTypes';
 
 interface GlassPlayerProps {
   song: Song;
@@ -44,6 +44,7 @@ interface GlassPlayerProps {
   onOpenSettings: () => void;
   backgroundBlur: number;
   backgroundOpacity: number;
+  lyricMotionStyle: LyricMotionStyle;
   useCoverBackground: boolean;
   onMinimize: () => void;
   onClose: () => void;
@@ -73,6 +74,7 @@ export default function GlassPlayer({
   onOpenSettings,
   backgroundBlur,
   backgroundOpacity,
+  lyricMotionStyle,
   useCoverBackground,
   onMinimize,
   onClose,
@@ -588,38 +590,84 @@ export default function GlassPlayer({
                         const isActive = index === activeLyricIndex;
                         const distance = Math.abs(offset);
                         const isPassed = offset < 0;
-                        const y = offset * 68;
-                        const scale = isActive ? 1 : Math.max(0.86, 0.96 - distance * 0.035);
+                        const rowGap = lyricMotionStyle === 'focus' ? 76 : lyricMotionStyle === 'cascade' ? 64 : 68;
+                        const y = offset * rowGap;
+                        const x = lyricMotionStyle === 'cascade' && !isActive
+                          ? (offset % 2 === 0 ? 22 : -12) + offset * 4
+                          : 0;
+                        const rotate = lyricMotionStyle === 'cascade' && !isActive
+                          ? Math.max(-5, Math.min(5, offset * -1.2))
+                          : 0;
+                        const scale = isActive
+                          ? lyricMotionStyle === 'focus'
+                            ? 1.08
+                            : lyricMotionStyle === 'cascade'
+                              ? 1.03
+                              : 1
+                          : Math.max(
+                              lyricMotionStyle === 'focus' ? 0.78 : 0.86,
+                              lyricMotionStyle === 'cascade'
+                                ? 0.98 - distance * 0.052
+                                : 0.96 - distance * 0.035
+                            );
                         const opacity = isActive
                           ? 1
                           : isPassed
-                            ? Math.max(0.12, 0.46 - distance * 0.1)
-                            : Math.max(0.18, 0.62 - distance * 0.11);
-                        const blur = isActive ? 0 : Math.min(2.2, 0.35 + distance * 0.38);
+                            ? Math.max(0.1, (lyricMotionStyle === 'focus' ? 0.36 : 0.46) - distance * 0.1)
+                            : Math.max(0.16, (lyricMotionStyle === 'focus' ? 0.7 : 0.62) - distance * 0.11);
+                        const blur = isActive ? 0 : Math.min(lyricMotionStyle === 'focus' ? 3.4 : 2.2, 0.35 + distance * 0.38);
+                        const rowClassName = lyricMotionStyle === 'cascade'
+                          ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight'
+                          : lyricMotionStyle === 'focus'
+                            ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[24px] font-extrabold leading-relaxed tracking-tight'
+                            : 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight';
+                        const activeTextColor = lyricMotionStyle === 'focus'
+                          ? 'rgba(255,255,255,0.3)'
+                          : 'rgba(255,255,255,0.42)';
 
                         return (
                           <motion.button
                             type="button"
                             key={`${index}-${line.time}-${line.text}`}
                             onClick={() => onSeek(line.time)}
-                            initial={{ opacity: 0, y: y + 22, scale: scale * 0.98, filter: `blur(${blur + 1}px)` }}
-                            animate={{ opacity, y, scale, filter: `blur(${blur}px)` }}
-                            exit={{ opacity: 0, y: y - 18, scale: scale * 0.98, filter: 'blur(3px)' }}
+                            initial={{ opacity: 0, x, y: y + 22, rotate, scale: scale * 0.98, filter: `blur(${blur + 1}px)` }}
+                            animate={{ opacity, x, y, rotate, scale, filter: `blur(${blur}px)` }}
+                            exit={{ opacity: 0, x, y: y - 18, rotate, scale: scale * 0.98, filter: 'blur(3px)' }}
                             transition={{
                               y: { type: 'spring', stiffness: 148, damping: 30, mass: 0.82 },
+                              x: { type: 'spring', stiffness: 136, damping: 28, mass: 0.8 },
+                              rotate: { type: 'spring', stiffness: 150, damping: 28, mass: 0.72 },
                               scale: { type: 'spring', stiffness: 170, damping: 30, mass: 0.78 },
                               opacity: { duration: 0.28, ease: [0.32, 0.72, 0, 1] },
                               filter: { duration: 0.32, ease: [0.32, 0.72, 0, 1] },
                             }}
-                            className="absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight"
+                            className={rowClassName}
                             style={{
-                              color: isActive ? 'rgba(255,255,255,0.42)' : 'rgba(255,255,255,0.64)',
+                              color: isActive ? activeTextColor : 'rgba(255,255,255,0.64)',
                               textShadow: isActive
-                                ? '0 10px 36px rgba(255,255,255,0.18), 0 1px 18px rgba(0,0,0,0.42)'
+                                ? lyricMotionStyle === 'focus'
+                                  ? '0 0 34px rgba(255,255,255,0.3), 0 16px 48px rgba(255,255,255,0.16), 0 1px 18px rgba(0,0,0,0.42)'
+                                  : '0 10px 36px rgba(255,255,255,0.18), 0 1px 18px rgba(0,0,0,0.42)'
                                 : '0 1px 14px rgba(0,0,0,0.28)',
                             }}
                           >
                             <span className="relative inline-block">
+                              {lyricMotionStyle === 'cascade' && (
+                                <span
+                                  aria-hidden
+                                  className={`absolute -left-5 top-1/2 h-2 w-2 -translate-y-1/2 rounded-full transition-colors ${
+                                    isActive ? 'bg-white/85 shadow-[0_0_18px_rgba(255,255,255,0.45)]' : 'bg-white/18'
+                                  }`}
+                                />
+                              )}
+                              {lyricMotionStyle === 'focus' && isActive && (
+                                <motion.span
+                                  aria-hidden
+                                  className="absolute -inset-x-7 -inset-y-3 rounded-full bg-white/10 blur-xl"
+                                  animate={{ opacity: [0.34, 0.72, 0.34], scale: [0.94, 1.08, 0.94] }}
+                                  transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
+                                />
+                              )}
                               {line.text}
                               {isActive && (
                                 <>

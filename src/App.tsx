@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { Search, X, Loader2, ListMusic, RefreshCw, Save, Settings, LogOut } from "lucide-react";
 import GlassPlayer from "./components/GlassPlayer";
 import { LoginPanel } from "./components/LoginPanel";
-import type { PlayerLayout, Song as PlayerSong } from "./components/playerTypes";
+import type { LyricMotionStyle, PlayerLayout, Song as PlayerSong } from "./components/playerTypes";
 import { getAudio } from "./lib/audio";
 import { useAudioEngine } from "./hooks/useAudioEngine";
 import { usePlayerStore } from "./store/playerStore";
@@ -24,9 +24,11 @@ import type { Song } from "./lib/types";
 const DEFAULT_FAV_PLAYLIST_ID = 797461443;
 const BACKGROUND_BLUR_KEY = "nmp.backgroundBlur";
 const BACKGROUND_OPACITY_KEY = "nmp.backgroundOpacity";
+const LYRIC_MOTION_STYLE_KEY = "nmp.lyricMotionStyle";
 const USE_COVER_BACKGROUND_KEY = "nmp.useCoverBackground";
 const DEFAULT_BACKGROUND_BLUR = 30;
 const DEFAULT_BACKGROUND_OPACITY = 0;
+const DEFAULT_LYRIC_MOTION_STYLE: LyricMotionStyle = "rail";
 
 function loadBackgroundBlur(): number {
   try {
@@ -57,6 +59,27 @@ function loadBackgroundOpacity(): number {
 function saveBackgroundOpacity(value: number) {
   try {
     localStorage.setItem(BACKGROUND_OPACITY_KEY, String(value));
+  } catch {
+    /* ignore */
+  }
+}
+
+function isLyricMotionStyle(value: string | null): value is LyricMotionStyle {
+  return value === "rail" || value === "cascade" || value === "focus";
+}
+
+function loadLyricMotionStyle(): LyricMotionStyle {
+  try {
+    const value = localStorage.getItem(LYRIC_MOTION_STYLE_KEY);
+    return isLyricMotionStyle(value) ? value : DEFAULT_LYRIC_MOTION_STYLE;
+  } catch {
+    return DEFAULT_LYRIC_MOTION_STYLE;
+  }
+}
+
+function saveLyricMotionStyle(value: LyricMotionStyle) {
+  try {
+    localStorage.setItem(LYRIC_MOTION_STYLE_KEY, value);
   } catch {
     /* ignore */
   }
@@ -126,6 +149,7 @@ export default function App() {
   const [loginStatus, setLoginStatus] = useState<LoginStatus | null>(null);
   const [backgroundBlur, setBackgroundBlur] = useState(loadBackgroundBlur);
   const [backgroundOpacity, setBackgroundOpacity] = useState(loadBackgroundOpacity);
+  const [lyricMotionStyle, setLyricMotionStyle] = useState(loadLyricMotionStyle);
   const [useCoverBackground, setUseCoverBackground] = useState(loadUseCoverBackground);
   const [favorites, setFavorites] = useState<Record<string, boolean>>({});
 
@@ -260,6 +284,11 @@ export default function App() {
     saveBackgroundOpacity(nextValue);
   };
 
+  const handleLyricMotionStyleChange = (value: LyricMotionStyle) => {
+    setLyricMotionStyle(value);
+    saveLyricMotionStyle(value);
+  };
+
   const handleUseCoverBackgroundChange = (value: boolean) => {
     setUseCoverBackground(value);
     saveUseCoverBackground(value);
@@ -372,6 +401,7 @@ export default function App() {
           onOpenSettings={() => setSettingsOpen(true)}
           backgroundBlur={backgroundBlur}
           backgroundOpacity={backgroundOpacity}
+          lyricMotionStyle={lyricMotionStyle}
           useCoverBackground={useCoverBackground}
           onMinimize={() => void minimizeWindow()}
           onClose={() => void closeWindow()}
@@ -419,6 +449,8 @@ export default function App() {
         onBackgroundBlurChange={handleBackgroundBlurChange}
         backgroundOpacity={backgroundOpacity}
         onBackgroundOpacityChange={handleBackgroundOpacityChange}
+        lyricMotionStyle={lyricMotionStyle}
+        onLyricMotionStyleChange={handleLyricMotionStyleChange}
         useCoverBackground={useCoverBackground}
         onUseCoverBackgroundChange={handleUseCoverBackgroundChange}
       />
@@ -436,6 +468,8 @@ function SettingsPanel({
   onBackgroundBlurChange,
   backgroundOpacity,
   onBackgroundOpacityChange,
+  lyricMotionStyle,
+  onLyricMotionStyleChange,
   useCoverBackground,
   onUseCoverBackgroundChange,
 }: {
@@ -448,6 +482,8 @@ function SettingsPanel({
   onBackgroundBlurChange: (value: number) => void;
   backgroundOpacity: number;
   onBackgroundOpacityChange: (value: number) => void;
+  lyricMotionStyle: LyricMotionStyle;
+  onLyricMotionStyleChange: (value: LyricMotionStyle) => void;
   useCoverBackground: boolean;
   onUseCoverBackgroundChange: (value: boolean) => void;
 }) {
@@ -586,6 +622,38 @@ function SettingsPanel({
                     className="w-full accent-white"
                   />
                 </label>
+
+                <div>
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="text-sm font-semibold text-white/85">歌词动画</span>
+                    <span className="font-mono text-xs text-white/45">
+                      {lyricMotionStyle === "rail"
+                        ? "流动"
+                        : lyricMotionStyle === "cascade"
+                          ? "分层"
+                          : "聚焦"}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 rounded-full bg-white/[0.06] p-1 border border-white/10">
+                    {[
+                      ["rail", "流动"],
+                      ["cascade", "分层"],
+                      ["focus", "聚焦"],
+                    ].map(([value, label]) => (
+                      <button
+                        key={value}
+                        onClick={() => onLyricMotionStyleChange(value as LyricMotionStyle)}
+                        className={`h-8 rounded-full text-xs font-bold transition-colors ${
+                          lyricMotionStyle === value
+                            ? "bg-white text-slate-950"
+                            : "text-white/55 hover:text-white hover:bg-white/8"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </section>
 
               <label className="block">
