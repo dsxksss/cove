@@ -605,6 +605,8 @@ export default function GlassPlayer({
                         const isRipple = lyricMotionStyle === 'ripple';
                         const isFloat = lyricMotionStyle === 'float';
                         const isStagger = lyricMotionStyle === 'stagger';
+                        const isSolo = lyricMotionStyle === 'solo';
+                        const isChorus = lyricMotionStyle === 'chorus';
                         const dialogueSide = index % 2 === 0 ? 'left' : 'right';
                         let rowGap = 68;
                         if (lyricMotionStyle === 'focus') rowGap = 76;
@@ -617,6 +619,8 @@ export default function GlassPlayer({
                         else if (isRipple) rowGap = 76;
                         else if (isFloat) rowGap = 78;
                         else if (isStagger) rowGap = 70;
+                        else if (isSolo) rowGap = 88;
+                        else if (isChorus) rowGap = 72;
 
                         const y = offset * rowGap;
                         let x = 0;
@@ -628,6 +632,8 @@ export default function GlassPlayer({
                         else if (isRipple && isActive) x = 4;
                         else if (isFloat) x = isActive ? 0 : Math.sin(index * 1.7) * 18 + offset * 2;
                         else if (isStagger) x = isActive ? 0 : (offset % 2 === 0 ? 34 : -28) + offset * 8;
+                        else if (isSolo) x = isActive ? 0 : offset * 5;
+                        else if (isChorus) x = isActive ? 0 : (offset % 2 === 0 ? 28 : -24) + offset * 5;
 
                         let rotate = 0;
                         if (lyricMotionStyle === 'cascade' && !isActive) rotate = Math.max(-5, Math.min(5, offset * -1.2));
@@ -635,6 +641,7 @@ export default function GlassPlayer({
                         else if (isTilt) rotate = Math.max(-7, Math.min(7, offset * -2.2 + (isActive ? -2 : 0)));
                         else if (isFloat && !isActive) rotate = Math.sin(index * 1.2) * 1.8;
                         else if (isStagger) rotate = Math.max(-8, Math.min(8, offset * -2.8 + (offset % 2 === 0 ? 1.2 : -1.2)));
+                        else if (isChorus && !isActive) rotate = Math.max(-4, Math.min(4, offset * 1.5));
 
                         let scale = 1;
                         if (isActive) {
@@ -643,15 +650,21 @@ export default function GlassPlayer({
                           else if (isTypewriter || isDialogue) scale = 1.02;
                           else if (isBeam || isStagger) scale = 1.04;
                           else if (isPoster) scale = 1.12;
+                          else if (isSolo) scale = 1.12;
                           else if (isTilt || isFloat) scale = 1.05;
+                          else if (isChorus) scale = 1.05;
                           else if (isRipple) scale = 1.06;
                         } else {
                           const minScale = lyricMotionStyle === 'focus'
                             ? 0.78
                             : isPoster || isStagger
                               ? 0.76
+                              : isSolo
+                                ? 0.72
                               : isFloat
                                 ? 0.82
+                                : isChorus
+                                  ? 0.8
                                 : 0.86;
                           let relaxedScale = 0.96 - distance * 0.035;
                           if (lyricMotionStyle === 'cascade') relaxedScale = 0.98 - distance * 0.052;
@@ -662,14 +675,16 @@ export default function GlassPlayer({
                           else if (isRipple) relaxedScale = 0.92 - distance * 0.04;
                           else if (isFloat) relaxedScale = 0.94 - distance * 0.052;
                           else if (isStagger) relaxedScale = 0.9 - distance * 0.058;
+                          else if (isSolo) relaxedScale = 0.86 - distance * 0.06;
+                          else if (isChorus) relaxedScale = 0.93 - distance * 0.045;
                           scale = Math.max(minScale, relaxedScale);
                         }
                         const opacity = isActive
                           ? 1
                           : isPassed
-                            ? Math.max(0.1, (lyricMotionStyle === 'focus' || isPoster || isStagger ? 0.36 : 0.46) - distance * 0.1)
-                            : Math.max(0.16, (lyricMotionStyle === 'focus' || isPoster || isFloat ? 0.7 : 0.62) - distance * 0.11);
-                        const blur = isActive ? 0 : Math.min(lyricMotionStyle === 'focus' || isPoster || isFloat ? 3.4 : 2.2, 0.35 + distance * 0.38);
+                            ? Math.max(0.1, (lyricMotionStyle === 'focus' || isPoster || isStagger || isSolo ? 0.36 : 0.46) - distance * 0.1)
+                            : Math.max(0.16, (lyricMotionStyle === 'focus' || isPoster || isFloat || isSolo ? 0.7 : 0.62) - distance * 0.11);
+                        const blur = isActive ? 0 : Math.min(lyricMotionStyle === 'focus' || isPoster || isFloat || isSolo ? 3.4 : isChorus ? 2.6 : 2.2, 0.35 + distance * 0.38);
                         const rowClassName = lyricMotionStyle === 'cascade'
                           ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight'
                           : lyricMotionStyle === 'focus'
@@ -690,6 +705,10 @@ export default function GlassPlayer({
                                           ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[24px] font-extrabold leading-relaxed tracking-tight'
                                           : isStagger
                                             ? 'absolute left-0 right-0 top-1/2 block origin-center -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-black leading-relaxed tracking-tight'
+                                            : isSolo
+                                              ? 'absolute left-0 right-0 top-1/2 block origin-center -translate-y-1/2 cursor-pointer select-none py-3 text-center font-sans text-[28px] font-black leading-tight tracking-tight'
+                                              : isChorus
+                                                ? 'absolute left-0 right-0 top-1/2 block origin-center -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[21px] font-extrabold leading-relaxed tracking-tight'
                             : 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight';
                         const activeTextColor = lyricMotionStyle === 'focus'
                           ? 'rgba(255,255,255,0.3)'
@@ -709,6 +728,10 @@ export default function GlassPlayer({
                                       ? 'rgba(255,255,255,0.32)'
                                       : isStagger
                                         ? 'rgba(255,255,255,0.28)'
+                                        : isSolo
+                                          ? 'rgba(255,255,255,0.24)'
+                                          : isChorus
+                                            ? 'rgba(255,255,255,0.36)'
                           : 'rgba(255,255,255,0.42)';
                         const activeRevealText = isTypewriter ? getTypewriterText(line.text) : line.text;
 
@@ -731,7 +754,7 @@ export default function GlassPlayer({
                             className={rowClassName}
                             style={{
                               color: isActive ? activeTextColor : 'rgba(255,255,255,0.64)',
-                              transformOrigin: isTilt ? '0% 55%' : isStagger ? '50% 55%' : undefined,
+                              transformOrigin: isTilt ? '0% 55%' : isStagger || isSolo || isChorus ? '50% 55%' : undefined,
                               background: isDialogue
                                 ? isActive
                                   ? dialogueSide === 'right'
@@ -759,6 +782,10 @@ export default function GlassPlayer({
                                             ? '0 0 34px rgba(255,255,255,0.24), 0 18px 50px rgba(255,255,255,0.12), 0 1px 18px rgba(0,0,0,0.44)'
                                             : isStagger
                                               ? '0 18px 0 rgba(255,255,255,0.05), 0 18px 46px rgba(0,0,0,0.52)'
+                                              : isSolo
+                                                ? '0 0 44px rgba(255,255,255,0.3), 0 24px 70px rgba(255,255,255,0.12), 0 2px 22px rgba(0,0,0,0.55)'
+                                                : isChorus
+                                                  ? '-8px 0 0 rgba(255,255,255,0.08), 8px 0 0 rgba(255,255,255,0.06), 0 16px 42px rgba(0,0,0,0.5)'
                                   : '0 10px 36px rgba(255,255,255,0.18), 0 1px 18px rgba(0,0,0,0.42)'
                                 : '0 1px 14px rgba(0,0,0,0.28)',
                             }}
@@ -887,6 +914,45 @@ export default function GlassPlayer({
                                   />
                                 </>
                               )}
+                              {isSolo && isActive && (
+                                <>
+                                  <motion.span
+                                    aria-hidden
+                                    className="absolute -inset-x-16 -inset-y-8 rounded-full blur-2xl"
+                                    style={{
+                                      background: 'radial-gradient(circle at 50% 50%, rgba(255,255,255,0.22), rgba(255,255,255,0.06) 42%, transparent 72%)',
+                                    }}
+                                    animate={{ opacity: [0.26, 0.7, 0.26], scale: [0.9, 1.08, 0.9] }}
+                                    transition={{ duration: 2.8, repeat: Infinity, ease: 'easeInOut' }}
+                                  />
+                                  <motion.span
+                                    aria-hidden
+                                    className="absolute -bottom-4 left-1/2 h-px w-36 -translate-x-1/2 bg-gradient-to-r from-transparent via-white/55 to-transparent"
+                                    animate={{ opacity: [0.26, 0.78, 0.26], scaleX: [0.78, 1.12, 0.78] }}
+                                    transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
+                                  />
+                                </>
+                              )}
+                              {isChorus && isActive && (
+                                <>
+                                  <motion.span
+                                    aria-hidden
+                                    className="absolute inset-0 -translate-x-5 text-white/16"
+                                    animate={{ x: [-20, -13, -20], opacity: [0.12, 0.28, 0.12] }}
+                                    transition={{ duration: 2.05, repeat: Infinity, ease: 'easeInOut' }}
+                                  >
+                                    {line.text}
+                                  </motion.span>
+                                  <motion.span
+                                    aria-hidden
+                                    className="absolute inset-0 translate-x-5 text-white/12"
+                                    animate={{ x: [20, 12, 20], opacity: [0.1, 0.24, 0.1] }}
+                                    transition={{ duration: 2.35, repeat: Infinity, ease: 'easeInOut' }}
+                                  >
+                                    {line.text}
+                                  </motion.span>
+                                </>
+                              )}
                               {line.text}
                               {isActive && (
                                 <>
@@ -920,9 +986,13 @@ export default function GlassPlayer({
                                         : isRipple
                                           ? 'bg-white/90 shadow-[0_0_22px_rgba(255,255,255,0.5)]'
                                           : isFloat
-                                            ? 'bg-gradient-to-r from-white/30 via-white/90 to-transparent shadow-[0_0_24px_rgba(255,255,255,0.28)]'
-                                            : isStagger
-                                              ? 'bg-white/90 shadow-[0_0_18px_rgba(255,255,255,0.38)]'
+                                          ? 'bg-gradient-to-r from-white/30 via-white/90 to-transparent shadow-[0_0_24px_rgba(255,255,255,0.28)]'
+                                          : isStagger
+                                            ? 'bg-white/90 shadow-[0_0_18px_rgba(255,255,255,0.38)]'
+                                            : isSolo
+                                              ? 'bg-gradient-to-r from-transparent via-white to-transparent shadow-[0_0_24px_rgba(255,255,255,0.36)]'
+                                              : isChorus
+                                                ? 'bg-gradient-to-r from-white/30 via-white/90 to-white/30 shadow-[0_0_20px_rgba(255,255,255,0.32)]'
                                         : 'bg-white/80'
                                     }`}
                                     initial={{ scaleX: 0, opacity: 0 }}

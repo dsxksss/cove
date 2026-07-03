@@ -41,6 +41,8 @@ const LYRIC_MOTION_STYLE_OPTIONS: Array<{ value: LyricMotionStyle; label: string
   { value: "ripple", label: "涟漪" },
   { value: "float", label: "漂浮" },
   { value: "stagger", label: "散列" },
+  { value: "solo", label: "独唱" },
+  { value: "chorus", label: "合唱" },
 ];
 
 function loadBackgroundBlur(): number {

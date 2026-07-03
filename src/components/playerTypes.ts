@@ -31,4 +31,6 @@ export type LyricMotionStyle =
   | 'tilt'
   | 'ripple'
   | 'float'
-  | 'stagger';
+  | 'stagger'
+  | 'solo'
+  | 'chorus';
