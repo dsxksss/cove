@@ -158,6 +158,13 @@ export default function GlassPlayer({
     return Math.min(1, Math.max(0, (currentTime - activeLine.time) / duration));
   }, [activeLyricIndex, currentTime, song.duration, song.lyrics]);
 
+  const getTypewriterText = (text: string) => {
+    const chars = Array.from(text);
+    if (chars.length === 0) return "";
+    const count = Math.min(chars.length, Math.max(1, Math.ceil(chars.length * activeLyricProgress)));
+    return chars.slice(0, count).join("");
+  };
+
   // Adjust speed
   const increaseSpeed = () => {
     const speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
@@ -590,10 +597,22 @@ export default function GlassPlayer({
                         const isActive = index === activeLyricIndex;
                         const distance = Math.abs(offset);
                         const isPassed = offset < 0;
-                        const rowGap = lyricMotionStyle === 'focus' ? 76 : lyricMotionStyle === 'cascade' ? 64 : 68;
+                        const isTypewriter = lyricMotionStyle === 'typewriter';
+                        const isBeam = lyricMotionStyle === 'beam';
+                        const rowGap = lyricMotionStyle === 'focus'
+                          ? 76
+                          : lyricMotionStyle === 'cascade'
+                            ? 64
+                            : isTypewriter
+                              ? 72
+                              : isBeam
+                                ? 70
+                                : 68;
                         const y = offset * rowGap;
                         const x = lyricMotionStyle === 'cascade' && !isActive
                           ? (offset % 2 === 0 ? 22 : -12) + offset * 4
+                          : isBeam && isActive
+                            ? 8
                           : 0;
                         const rotate = lyricMotionStyle === 'cascade' && !isActive
                           ? Math.max(-5, Math.min(5, offset * -1.2))
@@ -603,11 +622,17 @@ export default function GlassPlayer({
                             ? 1.08
                             : lyricMotionStyle === 'cascade'
                               ? 1.03
+                              : isTypewriter
+                                ? 1.02
+                                : isBeam
+                                  ? 1.04
                               : 1
                           : Math.max(
                               lyricMotionStyle === 'focus' ? 0.78 : 0.86,
                               lyricMotionStyle === 'cascade'
                                 ? 0.98 - distance * 0.052
+                                : isTypewriter
+                                  ? 0.95 - distance * 0.04
                                 : 0.96 - distance * 0.035
                             );
                         const opacity = isActive
@@ -620,10 +645,19 @@ export default function GlassPlayer({
                           ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight'
                           : lyricMotionStyle === 'focus'
                             ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[24px] font-extrabold leading-relaxed tracking-tight'
+                            : isTypewriter
+                              ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight'
+                              : isBeam
+                                ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[23px] font-extrabold leading-relaxed tracking-tight'
                             : 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight';
                         const activeTextColor = lyricMotionStyle === 'focus'
                           ? 'rgba(255,255,255,0.3)'
+                          : isTypewriter
+                            ? 'rgba(255,255,255,0.2)'
+                            : isBeam
+                              ? 'rgba(255,255,255,0.34)'
                           : 'rgba(255,255,255,0.42)';
+                        const activeRevealText = isTypewriter ? getTypewriterText(line.text) : line.text;
 
                         return (
                           <motion.button
@@ -647,6 +681,8 @@ export default function GlassPlayer({
                               textShadow: isActive
                                 ? lyricMotionStyle === 'focus'
                                   ? '0 0 34px rgba(255,255,255,0.3), 0 16px 48px rgba(255,255,255,0.16), 0 1px 18px rgba(0,0,0,0.42)'
+                                  : isBeam
+                                    ? '0 0 22px rgba(255,255,255,0.28), 0 10px 32px rgba(255,255,255,0.16), 0 1px 18px rgba(0,0,0,0.42)'
                                   : '0 10px 36px rgba(255,255,255,0.18), 0 1px 18px rgba(0,0,0,0.42)'
                                 : '0 1px 14px rgba(0,0,0,0.28)',
                             }}
@@ -668,24 +704,47 @@ export default function GlassPlayer({
                                   transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
                                 />
                               )}
+                              {isBeam && isActive && (
+                                <motion.span
+                                  aria-hidden
+                                  className="absolute -inset-x-8 top-1/2 h-12 -translate-y-1/2 rounded-full bg-gradient-to-r from-transparent via-white/18 to-transparent blur-md"
+                                  initial={{ x: -120, opacity: 0 }}
+                                  animate={{ x: 120, opacity: [0, 0.92, 0] }}
+                                  transition={{ duration: 1.8, repeat: Infinity, ease: 'easeInOut' }}
+                                />
+                              )}
                               {line.text}
                               {isActive && (
                                 <>
                                   <motion.span
                                     aria-hidden
                                     className="absolute inset-0 overflow-hidden text-white"
-                                    initial={{ clipPath: 'inset(0 100% 0 0)', opacity: 0 }}
+                                    initial={{ clipPath: isTypewriter ? 'inset(0 0 0 0)' : 'inset(0 100% 0 0)', opacity: 0 }}
                                     animate={{
-                                      clipPath: `inset(0 ${Math.max(0, 100 - activeLyricProgress * 100)}% 0 0)`,
+                                      clipPath: isTypewriter
+                                        ? 'inset(0 0 0 0)'
+                                        : `inset(0 ${Math.max(0, 100 - activeLyricProgress * 100)}% 0 0)`,
                                       opacity: 1,
                                     }}
                                     transition={{ duration: 0.18, ease: 'easeOut' }}
                                   >
-                                    {line.text}
+                                    {activeRevealText}
+                                    {isTypewriter && (
+                                      <motion.span
+                                        aria-hidden
+                                        className="ml-1 inline-block h-[1.05em] w-[2px] translate-y-[0.16em] rounded-full bg-white/85"
+                                        animate={{ opacity: [0.2, 1, 0.2] }}
+                                        transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut' }}
+                                      />
+                                    )}
                                   </motion.span>
                                   <motion.span
                                     aria-hidden
-                                    className="absolute -bottom-1 left-0 h-[3px] w-full origin-left rounded-full bg-white/80"
+                                    className={`absolute -bottom-1 left-0 h-[3px] w-full origin-left rounded-full ${
+                                      isBeam
+                                        ? 'bg-gradient-to-r from-white/20 via-white to-white/20 shadow-[0_0_18px_rgba(255,255,255,0.32)]'
+                                        : 'bg-white/80'
+                                    }`}
                                     initial={{ scaleX: 0, opacity: 0 }}
                                     animate={{ scaleX: activeLyricProgress, opacity: 0.86 }}
                                     transition={{ duration: 0.18, ease: 'easeOut' }}

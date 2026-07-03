@@ -65,7 +65,13 @@ function saveBackgroundOpacity(value: number) {
 }
 
 function isLyricMotionStyle(value: string | null): value is LyricMotionStyle {
-  return value === "rail" || value === "cascade" || value === "focus";
+  return (
+    value === "rail" ||
+    value === "cascade" ||
+    value === "focus" ||
+    value === "typewriter" ||
+    value === "beam"
+  );
 }
 
 function loadLyricMotionStyle(): LyricMotionStyle {
@@ -631,14 +637,20 @@ function SettingsPanel({
                         ? "流动"
                         : lyricMotionStyle === "cascade"
                           ? "分层"
-                          : "聚焦"}
+                          : lyricMotionStyle === "focus"
+                            ? "聚焦"
+                            : lyricMotionStyle === "typewriter"
+                              ? "打印"
+                              : "光束"}
                     </span>
                   </div>
-                  <div className="grid grid-cols-3 gap-2 rounded-full bg-white/[0.06] p-1 border border-white/10">
+                  <div className="grid grid-cols-5 gap-1 rounded-full bg-white/[0.06] p-1 border border-white/10">
                     {[
                       ["rail", "流动"],
                       ["cascade", "分层"],
                       ["focus", "聚焦"],
+                      ["typewriter", "打印"],
+                      ["beam", "光束"],
                     ].map(([value, label]) => (
                       <button
                         key={value}
