@@ -72,7 +72,9 @@ function isLyricMotionStyle(value: string | null): value is LyricMotionStyle {
     value === "typewriter" ||
     value === "beam" ||
     value === "dialogue" ||
-    value === "poster"
+    value === "poster" ||
+    value === "tilt" ||
+    value === "ripple"
   );
 }
 
@@ -647,7 +649,11 @@ function SettingsPanel({
                                 ? "光束"
                                 : lyricMotionStyle === "dialogue"
                                   ? "对话"
-                                  : "海报"}
+                                  : lyricMotionStyle === "poster"
+                                    ? "海报"
+                                    : lyricMotionStyle === "tilt"
+                                      ? "倾斜"
+                                      : "涟漪"}
                     </span>
                   </div>
                   <div className="grid grid-cols-4 gap-1 rounded-2xl bg-white/[0.06] p-1 border border-white/10">
@@ -659,6 +665,8 @@ function SettingsPanel({
                       ["beam", "光束"],
                       ["dialogue", "对话"],
                       ["poster", "海报"],
+                      ["tilt", "倾斜"],
+                      ["ripple", "涟漪"],
                     ].map(([value, label]) => (
                       <button
                         key={value}

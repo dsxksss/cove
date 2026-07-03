@@ -27,4 +27,6 @@ export type LyricMotionStyle =
   | 'typewriter'
   | 'beam'
   | 'dialogue'
-  | 'poster';
+  | 'poster'
+  | 'tilt'
+  | 'ripple';

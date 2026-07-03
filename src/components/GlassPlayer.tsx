@@ -601,6 +601,8 @@ export default function GlassPlayer({
                         const isBeam = lyricMotionStyle === 'beam';
                         const isDialogue = lyricMotionStyle === 'dialogue';
                         const isPoster = lyricMotionStyle === 'poster';
+                        const isTilt = lyricMotionStyle === 'tilt';
+                        const isRipple = lyricMotionStyle === 'ripple';
                         const dialogueSide = index % 2 === 0 ? 'left' : 'right';
                         const rowGap = lyricMotionStyle === 'focus'
                           ? 76
@@ -614,6 +616,10 @@ export default function GlassPlayer({
                                   ? 82
                                   : isPoster
                                     ? 88
+                                    : isTilt
+                                      ? 72
+                                      : isRipple
+                                        ? 76
                                 : 68;
                         const y = offset * rowGap;
                         const x = lyricMotionStyle === 'cascade' && !isActive
@@ -626,11 +632,17 @@ export default function GlassPlayer({
                               : isActive ? 4 : -10
                           : isPoster
                             ? isActive ? 0 : offset * 10
+                          : isTilt
+                            ? offset * 18
+                          : isRipple && isActive
+                            ? 4
                           : 0;
                         const rotate = lyricMotionStyle === 'cascade' && !isActive
                           ? Math.max(-5, Math.min(5, offset * -1.2))
                           : isPoster && !isActive
                             ? Math.max(-2.5, Math.min(2.5, offset * 0.7))
+                          : isTilt
+                            ? Math.max(-7, Math.min(7, offset * -2.2 + (isActive ? -2 : 0)))
                           : 0;
                         const scale = isActive
                           ? lyricMotionStyle === 'focus'
@@ -645,6 +657,10 @@ export default function GlassPlayer({
                                     ? 1.02
                                     : isPoster
                                       ? 1.12
+                                      : isTilt
+                                        ? 1.05
+                                        : isRipple
+                                          ? 1.06
                               : 1
                           : Math.max(
                               lyricMotionStyle === 'focus' ? 0.78 : isPoster ? 0.76 : 0.86,
@@ -656,6 +672,10 @@ export default function GlassPlayer({
                                     ? 0.92 - distance * 0.03
                                     : isPoster
                                       ? 0.88 - distance * 0.05
+                                      : isTilt
+                                        ? 0.96 - distance * 0.045
+                                        : isRipple
+                                          ? 0.92 - distance * 0.04
                                 : 0.96 - distance * 0.035
                             );
                         const opacity = isActive
@@ -676,6 +696,10 @@ export default function GlassPlayer({
                                   ? `absolute top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none rounded-3xl border px-4 py-3 text-left font-sans text-[18px] font-extrabold leading-relaxed tracking-tight backdrop-blur-xl ${dialogueSide === 'right' ? 'right-0 max-w-[82%] rounded-br-md' : 'left-0 max-w-[82%] rounded-bl-md'}`
                                   : isPoster
                                     ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-3 pl-6 text-left font-sans text-[26px] font-black leading-tight tracking-tight'
+                                    : isTilt
+                                      ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[24px] font-black leading-relaxed tracking-tight'
+                                      : isRipple
+                                        ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[23px] font-extrabold leading-relaxed tracking-tight'
                             : 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight';
                         const activeTextColor = lyricMotionStyle === 'focus'
                           ? 'rgba(255,255,255,0.3)'
@@ -685,8 +709,12 @@ export default function GlassPlayer({
                               ? 'rgba(255,255,255,0.34)'
                               : isDialogue
                                 ? 'rgba(255,255,255,0.92)'
-                                : isPoster
-                                  ? 'rgba(255,255,255,0.26)'
+                              : isPoster
+                                ? 'rgba(255,255,255,0.26)'
+                                : isTilt
+                                  ? 'rgba(255,255,255,0.34)'
+                                  : isRipple
+                                    ? 'rgba(255,255,255,0.38)'
                           : 'rgba(255,255,255,0.42)';
                         const activeRevealText = isTypewriter ? getTypewriterText(line.text) : line.text;
 
@@ -709,6 +737,7 @@ export default function GlassPlayer({
                             className={rowClassName}
                             style={{
                               color: isActive ? activeTextColor : 'rgba(255,255,255,0.64)',
+                              transformOrigin: isTilt ? '0% 55%' : undefined,
                               background: isDialogue
                                 ? isActive
                                   ? dialogueSide === 'right'
@@ -726,13 +755,37 @@ export default function GlassPlayer({
                                     ? '0 0 22px rgba(255,255,255,0.28), 0 10px 32px rgba(255,255,255,0.16), 0 1px 18px rgba(0,0,0,0.42)'
                                     : isDialogue
                                       ? '0 10px 28px rgba(0,0,0,0.42)'
-                                      : isPoster
-                                        ? '0 18px 50px rgba(255,255,255,0.14), 0 2px 18px rgba(0,0,0,0.5)'
+                                    : isPoster
+                                      ? '0 18px 50px rgba(255,255,255,0.14), 0 2px 18px rgba(0,0,0,0.5)'
+                                      : isTilt
+                                        ? '10px 12px 0 rgba(255,255,255,0.06), 0 14px 42px rgba(0,0,0,0.5)'
+                                        : isRipple
+                                          ? '0 0 28px rgba(255,255,255,0.24), 0 14px 42px rgba(0,0,0,0.46)'
                                   : '0 10px 36px rgba(255,255,255,0.18), 0 1px 18px rgba(0,0,0,0.42)'
                                 : '0 1px 14px rgba(0,0,0,0.28)',
                             }}
                           >
                             <span className="relative inline-block">
+                              {isTilt && (
+                                <>
+                                  <span
+                                    aria-hidden
+                                    className="absolute inset-0 translate-x-2 translate-y-1 text-white/12"
+                                  >
+                                    {line.text}
+                                  </span>
+                                  {isActive && (
+                                    <motion.span
+                                      aria-hidden
+                                      className="absolute inset-0 -translate-x-2 text-white/20"
+                                      animate={{ x: [-2, 2, -2] }}
+                                      transition={{ duration: 2.1, repeat: Infinity, ease: 'easeInOut' }}
+                                    >
+                                      {line.text}
+                                    </motion.span>
+                                  )}
+                                </>
+                              )}
                               {isDialogue && (
                                 <span
                                   aria-hidden
@@ -788,6 +841,24 @@ export default function GlassPlayer({
                                   transition={{ duration: 3.2, repeat: Infinity, ease: 'easeInOut' }}
                                 />
                               )}
+                              {isRipple && isActive && (
+                                <>
+                                  <motion.span
+                                    aria-hidden
+                                    className="absolute left-1/2 top-1/2 h-10 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/35"
+                                    initial={{ scale: 0.3, opacity: 0.68 }}
+                                    animate={{ scale: 5.2, opacity: 0 }}
+                                    transition={{ duration: 1.35, repeat: Infinity, ease: 'easeOut' }}
+                                  />
+                                  <motion.span
+                                    aria-hidden
+                                    className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/18"
+                                    initial={{ scale: 0.2, opacity: 0.42 }}
+                                    animate={{ scale: 4.4, opacity: 0 }}
+                                    transition={{ duration: 1.35, repeat: Infinity, ease: 'easeOut', delay: 0.42 }}
+                                  />
+                                </>
+                              )}
                               {line.text}
                               {isActive && (
                                 <>
@@ -818,6 +889,8 @@ export default function GlassPlayer({
                                     className={`absolute -bottom-1 left-0 h-[3px] w-full origin-left rounded-full ${
                                       isBeam
                                         ? 'bg-gradient-to-r from-white/20 via-white to-white/20 shadow-[0_0_18px_rgba(255,255,255,0.32)]'
+                                        : isRipple
+                                          ? 'bg-white/90 shadow-[0_0_22px_rgba(255,255,255,0.5)]'
                                         : 'bg-white/80'
                                     }`}
                                     initial={{ scaleX: 0, opacity: 0 }}
