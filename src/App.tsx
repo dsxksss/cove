@@ -70,7 +70,9 @@ function isLyricMotionStyle(value: string | null): value is LyricMotionStyle {
     value === "cascade" ||
     value === "focus" ||
     value === "typewriter" ||
-    value === "beam"
+    value === "beam" ||
+    value === "dialogue" ||
+    value === "poster"
   );
 }
 
@@ -641,16 +643,22 @@ function SettingsPanel({
                             ? "聚焦"
                             : lyricMotionStyle === "typewriter"
                               ? "打印"
-                              : "光束"}
+                              : lyricMotionStyle === "beam"
+                                ? "光束"
+                                : lyricMotionStyle === "dialogue"
+                                  ? "对话"
+                                  : "海报"}
                     </span>
                   </div>
-                  <div className="grid grid-cols-5 gap-1 rounded-full bg-white/[0.06] p-1 border border-white/10">
+                  <div className="grid grid-cols-4 gap-1 rounded-2xl bg-white/[0.06] p-1 border border-white/10">
                     {[
                       ["rail", "流动"],
                       ["cascade", "分层"],
                       ["focus", "聚焦"],
                       ["typewriter", "打印"],
                       ["beam", "光束"],
+                      ["dialogue", "对话"],
+                      ["poster", "海报"],
                     ].map(([value, label]) => (
                       <button
                         key={value}

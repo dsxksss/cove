@@ -20,4 +20,11 @@ export interface Song {
 
 export type PlayerLayout = 'vertical' | 'mini' | 'lyrics';
 
-export type LyricMotionStyle = 'rail' | 'cascade' | 'focus' | 'typewriter' | 'beam';
+export type LyricMotionStyle =
+  | 'rail'
+  | 'cascade'
+  | 'focus'
+  | 'typewriter'
+  | 'beam'
+  | 'dialogue'
+  | 'poster';
