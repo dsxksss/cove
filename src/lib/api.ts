@@ -17,10 +17,15 @@ import type { Song, SongJson, SongUrl } from "./types";
 
 const STORAGE_KEY = "nmp.apiBase";
 const DEFAULT_BASE = "http://localhost:5000";
+const LOCAL_FALLBACK_BASES = ["http://localhost:5000", "http://127.0.0.1:5000"];
+
+function normalizeBase(base: string): string {
+  return base.trim().replace(/\/+$/, "");
+}
 
 export function getApiBase(): string {
   try {
-    return localStorage.getItem(STORAGE_KEY) || DEFAULT_BASE;
+    return normalizeBase(localStorage.getItem(STORAGE_KEY) || DEFAULT_BASE) || DEFAULT_BASE;
   } catch {
     return DEFAULT_BASE;
   }
@@ -28,10 +33,42 @@ export function getApiBase(): string {
 
 export function setApiBase(base: string) {
   try {
-    localStorage.setItem(STORAGE_KEY, base.replace(/\/+$/, ""));
+    localStorage.setItem(STORAGE_KEY, normalizeBase(base));
   } catch {
     /* ignore */
   }
+}
+
+export function getApiBaseCandidates(): string[] {
+  const seen = new Set<string>();
+  return [getApiBase(), ...LOCAL_FALLBACK_BASES].filter((base) => {
+    const normalized = normalizeBase(base);
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+}
+
+function shouldTryNextBase(e: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false;
+  const err = e as { name?: string; message?: string };
+  const message = err?.message ?? String(e);
+  return (
+    err?.name === "AbortError" ||
+    e instanceof TypeError ||
+    /failed to fetch|networkerror|load failed|fetch/i.test(message)
+  );
+}
+
+function formatApiError(path: string, base: string, e: unknown): Error {
+  const err = e as { name?: string; message?: string };
+  if (err?.name === "AbortError") {
+    return new Error(`API 请求超时：${base}${path}`);
+  }
+  if (e instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(err?.message ?? "")) {
+    return new Error(`无法连接 API：${base}${path}`);
+  }
+  return e instanceof Error ? e : new Error(String(e));
 }
 
 async function getJson<T>(
@@ -39,21 +76,36 @@ async function getJson<T>(
   signal?: AbortSignal,
   timeoutMs = 12000
 ): Promise<T> {
-  const base = getApiBase();
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  // chain external abort
-  if (signal) signal.addEventListener("abort", () => ctrl.abort());
-  try {
-    const res = await fetch(`${base}${path}`, {
-      signal: ctrl.signal,
-      headers: { Accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return (await res.json()) as T;
-  } finally {
-    clearTimeout(t);
+  const bases = getApiBaseCandidates();
+  let lastBase = bases[0] ?? DEFAULT_BASE;
+  let lastErr: unknown;
+
+  for (const base of bases) {
+    lastBase = base;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const abort = () => ctrl.abort();
+    if (signal) signal.addEventListener("abort", abort, { once: true });
+
+    try {
+      const res = await fetch(`${base}${path}`, {
+        signal: ctrl.signal,
+        headers: { Accept: "application/json" },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return (await res.json()) as T;
+    } catch (e) {
+      lastErr = e;
+      if (!shouldTryNextBase(e, signal) || base === bases[bases.length - 1]) {
+        throw formatApiError(path, base, e);
+      }
+    } finally {
+      clearTimeout(t);
+      if (signal) signal.removeEventListener("abort", abort);
+    }
   }
+
+  throw formatApiError(path, lastBase, lastErr);
 }
 
 /** Retry wrapper: transient network/timeout errors shouldn't kill a load.

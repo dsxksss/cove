@@ -136,13 +136,13 @@ export function LoginPanel({
                 ) : (
                   <Loader2 className="animate-spin text-slate-400" size={32} />
                 )}
-                {phase === "expired" && (
+                {(phase === "expired" || err) && (
                   <button
                     onClick={() => void startLogin()}
                     className="absolute inset-0 grid place-items-center bg-black/30 rounded-xl text-white text-sm font-medium flex-col gap-2"
                   >
                     <RefreshCw size={22} />
-                    点击刷新
+                    点击重试
                   </button>
                 )}
                 {phase === "success" && (
