@@ -1,9 +1,9 @@
-# Netease Music Player
+# Cove · 可沃
 
-沉浸式网易云音乐播放器 —— 模糊封面背景 + 玻璃质感卡片 + 实时同步歌词。
+多音源沉浸式桌面音乐播放器 —— 液态玻璃界面 + 同步歌词 + 网易云 / QQ / 酷狗。
 
 基于 **Tauri 2 + React 18 + Tailwind CSS v4 + Zustand + Motion** 构建。
-音频源使用 [Suxiaoqinx/Netease_url](https://github.com/Suxiaoqinx/Netease_url) 自托管服务。
+网易云音频源可使用内置接口或 [Suxiaoqinx/Netease_url](https://github.com/Suxiaoqinx/Netease_url) 自托管服务。
 
 ---
 
@@ -71,11 +71,15 @@ pnpm dev
 | 按键 | 功能 |
 |---|---|
 | `空格` | 播放 / 暂停 |
-| `Ctrl/⌘ + →` | 下一首 |
-| `Ctrl/⌘ + ←` | 上一首 |
+| `←` / `→` | 后退 / 前进 5 秒 |
+| `Ctrl/⌘ + ←` / `→` | 上一首 / 下一首 |
+| `↑` / `↓` | 音量 ±5% |
 | `/` | 打开搜索 |
+| `q` | 播放队列 |
+| `l` | 登录 |
 | `Ctrl/⌘ + ,` | 打开设置 |
 | `Esc` | 关闭浮层 / 取消输入聚焦 |
+| 系统媒体键 / 耳机线控 | 播放、暂停、切歌、快进退（Media Session） |
 
 ---
 

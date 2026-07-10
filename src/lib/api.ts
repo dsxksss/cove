@@ -1,4 +1,4 @@
-import type { Song, SongJson, SongUrl } from "./types";
+import type { PlaylistSummary, Song, SongJson, SongUrl } from "./types";
 
 /**
  * Thin client for Suxiaoqinx/Netease_url (self-hosted Flask server).
@@ -21,6 +21,20 @@ const LOCAL_FALLBACK_BASES = ["http://localhost:5000", "http://127.0.0.1:5000"];
 
 function normalizeBase(base: string): string {
   return base.trim().replace(/\/+$/, "");
+}
+
+function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+export function usesBuiltInNeteaseApi(): boolean {
+  return isTauriRuntime();
+}
+
+async function invokeNative<T>(command: string, args?: Record<string, unknown>): Promise<T | null> {
+  if (!isTauriRuntime()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(command, args);
 }
 
 export function getApiBase(): string {
@@ -159,10 +173,12 @@ export async function search(
 ): Promise<Song[]> {
   const kw = keyword.trim();
   if (!kw) return [];
-  const env = await getJson<SearchEnvelope>(
-    `/search?keyword=${encodeURIComponent(kw)}&limit=${limit}&type=1`,
-    signal
-  );
+  const env =
+    (await invokeNative<SearchEnvelope>("netease_search", { args: { keyword: kw, limit } })) ??
+    (await getJson<SearchEnvelope>(
+      `/search?keyword=${encodeURIComponent(kw)}&limit=${limit}&type=1`,
+      signal
+    ));
   const list: any[] =
     env.data && Array.isArray(env.data)
       ? env.data
@@ -190,10 +206,12 @@ export async function getSongUrl(
   level = "exhigh",
   signal?: AbortSignal
 ): Promise<string | null> {
-  const env = await getJson<SongUrlEnvelope>(
-    `/song?id=${id}&level=${level}&type=url`,
-    signal
-  );
+  const env =
+    (await invokeNative<SongUrlEnvelope>("netease_song_url", { args: { id, level } })) ??
+    (await getJson<SongUrlEnvelope>(
+      `/song?id=${id}&level=${level}&type=url`,
+      signal
+    ));
   return env.data?.url ?? null;
 }
 
@@ -208,11 +226,22 @@ interface PlaylistEnvelope {
   } & Record<string, any>;
 }
 
+interface UserPlaylistsEnvelope {
+  data?: {
+    playlists?: any[];
+    more?: boolean;
+  };
+  playlist?: any[];
+  more?: boolean;
+}
+
 interface PlaylistPage {
   songs: Song[];
   total: number;
   offset: number;
 }
+
+export type { PlaylistSummary };
 
 function mapTracks(tracks: any[]): Song[] {
   return tracks.map((t: any) => ({
@@ -234,16 +263,18 @@ export async function getPlaylistPage(
   offset: number,
   signal?: AbortSignal
 ): Promise<PlaylistPage> {
-  const env = await withRetry(
-    (sig) =>
-      getJson<PlaylistEnvelope>(
-        `/playlist?id=${id}&limit=${limit}&offset=${offset}`,
-        sig,
-        30000
-      ),
-    2,
-    signal
-  );
+  const env =
+    (await invokeNative<PlaylistEnvelope>("netease_playlist_page", { args: { id, limit, offset } })) ??
+    (await withRetry(
+      (sig) =>
+        getJson<PlaylistEnvelope>(
+          `/playlist?id=${id}&limit=${limit}&offset=${offset}`,
+          sig,
+          30000
+        ),
+      2,
+      signal
+    ));
   const pl = env.data?.playlist;
   const tracks = pl?.tracks ?? (Array.isArray(env.data) ? env.data : []);
   return {
@@ -251,6 +282,146 @@ export async function getPlaylistPage(
     total: pl?.trackTotal ?? tracks.length,
     offset: pl?.trackOffset ?? offset,
   };
+}
+
+function mapPlaylist(raw: any, ownerUid: number): PlaylistSummary {
+  const creatorUid = Number(raw.creatorUid ?? raw.creator?.userId ?? 0);
+  return {
+    id: Number(raw.id),
+    name: String(raw.name ?? "未命名歌单"),
+    coverImgUrl: raw.coverImgUrl ?? raw.cover ?? raw.pic,
+    trackCount: Number(raw.trackCount ?? raw.track_count ?? 0),
+    playCount: Number(raw.playCount ?? raw.play_count ?? 0),
+    createTime: Number(raw.createTime ?? raw.create_time ?? 0),
+    updateTime: Number(raw.updateTime ?? raw.update_time ?? 0),
+    subscribed: Boolean(raw.subscribed),
+    creatorUid,
+    creatorName: String(raw.creatorName ?? raw.creator?.nickname ?? ""),
+    createdByAccount: raw.createdByAccount === undefined ? creatorUid === ownerUid : Boolean(raw.createdByAccount),
+    source: raw.source === "kugou" || raw.source === "qq" ? raw.source : "netease",
+    kgListId: raw.kgListId != null ? Number(raw.kgListId) : undefined,
+    kgGlobalId: raw.kgGlobalId ? String(raw.kgGlobalId) : undefined,
+    qqDissTid: raw.qqDissTid != null ? Number(raw.qqDissTid) : undefined,
+  };
+}
+
+export async function getUserPlaylists(
+  uid: number,
+  limit = 200,
+  offset = 0,
+  signal?: AbortSignal
+): Promise<PlaylistSummary[]> {
+  const env =
+    (await invokeNative<UserPlaylistsEnvelope>("netease_user_playlists", {
+      args: { uid, limit, offset },
+    })) ??
+    (await getJson<UserPlaylistsEnvelope>(
+      `/user/playlist?uid=${uid}&limit=${limit}&offset=${offset}`,
+      signal,
+      30000
+    ));
+  const list = env.data?.playlists ?? env.playlist ?? [];
+  return list
+    .map((item) => mapPlaylist(item, uid))
+    .filter((playlist) => Number.isFinite(playlist.id) && playlist.id > 0)
+    .map((p) => ({ ...p, source: "netease" as const }));
+}
+
+/** Kugou account playlists (requires kugou QR login session). */
+export async function getKugouUserPlaylists(): Promise<PlaylistSummary[]> {
+  const env = await invokeNative<UserPlaylistsEnvelope>("kugou_user_playlists");
+  if (!env) throw new Error("酷狗歌单需要桌面端");
+  const list = env.data?.playlists ?? [];
+  return list
+    .map((item) => mapPlaylist(item, Number(item.creatorUid ?? 0)))
+    .filter((p) => Number.isFinite(p.id))
+    .map((p) => ({ ...p, source: "kugou" as const, createdByAccount: true }));
+}
+
+/** Page of tracks from a Kugou playlist. */
+export async function getKugouPlaylistPage(
+  listid: number,
+  opts?: { globalCollectionId?: string; page?: number; pagesize?: number }
+): Promise<PlaylistPage> {
+  const page = opts?.page ?? 1;
+  const pagesize = opts?.pagesize ?? 50;
+  const env = await invokeNative<PlaylistEnvelope>("kugou_playlist_page", {
+    args: {
+      listid,
+      global_collection_id: opts?.globalCollectionId,
+      page,
+      pagesize,
+    },
+  });
+  if (!env) throw new Error("酷狗歌单需要桌面端");
+  const pl = env.data?.playlist;
+  const tracks = pl?.tracks ?? [];
+  const songs = mapTracks(tracks).map((s, i) => {
+    const raw = tracks[i] as any;
+    return {
+      ...s,
+      source: "kugou" as const,
+      kgHash: raw?.kgHash ? String(raw.kgHash) : s.kgHash,
+      kgHqHash: raw?.kgHqHash ? String(raw.kgHqHash) : undefined,
+      kgSqHash: raw?.kgSqHash ? String(raw.kgSqHash) : undefined,
+    };
+  });
+  return {
+    songs,
+    total: pl?.trackTotal ?? songs.length,
+    offset: pl?.trackOffset ?? (page - 1) * pagesize,
+  };
+}
+
+/** QQ Music account playlists (requires QQ QR → y.qq.com session). */
+export async function getQqUserPlaylists(): Promise<PlaylistSummary[]> {
+  const env = await invokeNative<UserPlaylistsEnvelope>("qq_user_playlists");
+  if (!env) throw new Error("QQ 歌单需要桌面端");
+  const list = env.data?.playlists ?? [];
+  return list
+    .map((item) => mapPlaylist(item, Number(item.creatorUid ?? 0)))
+    .filter((p) => Number.isFinite(p.id))
+    .map((p) => ({
+      ...p,
+      source: "qq" as const,
+      createdByAccount: true,
+      qqDissTid: p.qqDissTid && p.qqDissTid > 0 ? p.qqDissTid : p.id,
+    }));
+}
+
+/** Page of tracks from a QQ Music playlist (disstid). */
+export async function getQqPlaylistPage(
+  disstid: number,
+  opts?: { page?: number; pagesize?: number }
+): Promise<PlaylistPage> {
+  const page = opts?.page ?? 1;
+  const pagesize = opts?.pagesize ?? 50;
+  const env = await invokeNative<PlaylistEnvelope>("qq_playlist_page", {
+    args: { disstid, page, pagesize },
+  });
+  if (!env) throw new Error("QQ 歌单需要桌面端");
+  const pl = env.data?.playlist;
+  const tracks = pl?.tracks ?? [];
+  const songs = mapTracks(tracks).map((s, i) => {
+    const raw = tracks[i] as any;
+    return {
+      ...s,
+      source: "qq" as const,
+      qqMid: raw?.qqMid ? String(raw.qqMid) : s.qqMid,
+      qqMediaMid: raw?.qqMediaMid ? String(raw.qqMediaMid) : undefined,
+      albumId: raw?.albumId ? String(raw.albumId) : s.albumId,
+    };
+  });
+  return {
+    songs,
+    total: pl?.trackTotal ?? songs.length,
+    offset: pl?.trackOffset ?? (page - 1) * pagesize,
+  };
+}
+
+/** Stable key to avoid ID collisions across platforms. */
+export function playlistKey(p: Pick<PlaylistSummary, "id" | "source">): string {
+  return `${p.source ?? "netease"}:${p.id}`;
 }
 
 /** Fetch ALL of a playlist's tracks (no pagination). Kept for compatibility,
@@ -298,6 +469,8 @@ export interface QrKey {
 }
 /** Generate a QR login key + the URL to encode into a QR image. */
 export async function getQrKey(signal?: AbortSignal): Promise<QrKey> {
+  const native = await invokeNative<QrKey>("netease_qr_key");
+  if (native) return native;
   const env = await getJson<{ data: QrKey }>("/qr/key", signal);
   return env.data!;
 }
@@ -310,6 +483,8 @@ export interface QrStatus {
 }
 /** Poll QR login status. On 803 the server writes cookie.txt. */
 export async function checkQrLogin(unikey: string, signal?: AbortSignal): Promise<QrStatus> {
+  const native = await invokeNative<QrStatus>("netease_qr_check", { unikey });
+  if (native) return native;
   const env = await getJson<{ data: QrStatus }>(
     `/qr/check?unikey=${encodeURIComponent(unikey)}`,
     signal
@@ -325,12 +500,21 @@ export interface LoginStatus {
 }
 /** Whether cookie.txt corresponds to a logged-in account. */
 export async function getLoginStatus(signal?: AbortSignal): Promise<LoginStatus> {
+  const native = await invokeNative<LoginStatus>("netease_login_status");
+  if (native) return native;
   const env = await getJson<{ data: LoginStatus }>("/login/status", signal);
   return env.data!;
 }
 
 /** Log out the current NetEase account on the API server. */
 export async function logout(signal?: AbortSignal): Promise<void> {
+  // Rust unit commands serialize to `null`, so checking the returned value
+  // cannot distinguish a successful native call from the web fallback path.
+  // Branch on the runtime first or desktop logout would also call /logout.
+  if (isTauriRuntime()) {
+    await invokeNative<void>("netease_logout");
+    return;
+  }
   await getJson<unknown>("/logout", signal);
 }
 
@@ -343,9 +527,11 @@ export async function getSongJson(
   id: number,
   signal?: AbortSignal
 ): Promise<SongJson | null> {
-  const env = await getJson<SongJsonEnvelope>(
-    `/song?id=${id}&type=json`,
-    signal
-  );
+  const env =
+    (await invokeNative<SongJsonEnvelope>("netease_song_json", { id })) ??
+    (await getJson<SongJsonEnvelope>(
+      `/song?id=${id}&type=json`,
+      signal
+    ));
   return (env.data as SongJson) ?? null;
 }

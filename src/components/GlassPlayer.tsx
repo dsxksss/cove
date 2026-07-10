@@ -1,27 +1,55 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import {
-  Star,
   MoreHorizontal,
   SkipBack,
   Play,
   Pause,
   SkipForward,
   Volume1,
-  Volume2,
   Plus,
+  Languages,
   Minus,
   X,
-  ListMusic,
+  Clipboard,
   Maximize2,
   Repeat,
   Repeat1,
   Settings,
   Shuffle,
+  LocateFixed,
+  ChevronLeft,
+  ChevronRight,
+  Gauge,
+  Sparkles,
+  ListMusic,
 } from 'lucide-react';
 // LiquidGlassCanvas (WebGL glass) removed for performance — pure CSS
 // backdrop-filter is used on the player card instead.
 import { LyricMotionStyle, Song, PlayerLayout } from './playerTypes';
+import { getLyricLineMotion, isFoliaAbsoluteStyle } from './lyricMotion';
+import FoliaLyricsRail from './FoliaLyricsRail';
+import { LEVEL_OPTIONS } from '../lib/playbackPrefs';
+import type { LyricSourceMode } from '../lib/lyrics/matchLyrics';
+import { useScrollEdgeFriction } from '../hooks/useScrollEdgeFriction';
+
+const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
+
+const LYRIC_MOTION_OPTIONS: Array<{ value: LyricMotionStyle; label: string }> = [
+  { value: "monet", label: "莫奈" },
+  { value: "fume", label: "浮名" },
+  { value: "classic", label: "流光" },
+  { value: "rail", label: "滚动" },
+  { value: "dialogue", label: "对话" },
+];
+
+const LYRIC_SOURCE_OPTIONS: Array<{ value: LyricSourceMode; label: string }> = [
+  { value: "auto", label: "自动" },
+  { value: "netease", label: "网易云音乐" },
+  { value: "qq", label: "QQ音乐" },
+  { value: "kugou", label: "酷狗音乐" },
+];
 
 interface GlassPlayerProps {
   song: Song;
@@ -30,27 +58,38 @@ interface GlassPlayerProps {
   onPlayPause: () => void;
   onNext: () => void;
   onPrev: () => void;
+  onOpenQueue: () => void;
+  onLyricsPanelHoverChange?: (hovered: boolean) => void;
   onSeek: (time: number) => void;
   layout: PlayerLayout;
   onToggleLayout: (layout: PlayerLayout) => void;
-  isFavorited: boolean;
-  onToggleFavorite: () => void;
-  speed: number;
-  onSpeedChange: (speed: number) => void;
+  lyricOffsetSeconds: number;
+  onLyricOffsetChange: (offsetSeconds: number) => void;
   volume: number;
   onVolumeChange: (volume: number) => void;
-  isShowQueue: boolean;
-  onShowQueueToggle: () => void;
   onOpenSettings: () => void;
+  onReloadFavorites: () => void | Promise<void>;
   backgroundBlur: number;
   backgroundOpacity: number;
   lyricMotionStyle: LyricMotionStyle;
+  onLyricMotionStyleChange: (value: LyricMotionStyle) => void;
+  lyricSourceMode: LyricSourceMode;
+  onLyricSourceModeChange: (value: LyricSourceMode) => void;
+  level: string;
+  onLevelChange: (level: string) => void;
+  speed: number;
+  onSpeedChange: (speed: number) => void;
   useCoverBackground: boolean;
+  /** whether to render the translated line (tr) beneath the original */
+  showTranslation: boolean;
+  onToggleTranslation: () => void;
   onMinimize: () => void;
   onClose: () => void;
-  /** unified play mode: sequence | list | one | shuffle */
-  playMode: "sequence" | "list" | "one" | "shuffle";
+  /** unified play mode: list | one | shuffle */
+  playMode: "list" | "one" | "shuffle";
   onCyclePlayMode: () => void;
+  /** jh3yy-style motion intensity */
+  motionLevel?: "off" | "light" | "full";
 }
 
 export default function GlassPlayer({
@@ -60,31 +99,227 @@ export default function GlassPlayer({
   onPlayPause,
   onNext,
   onPrev,
+  onOpenQueue,
+  onLyricsPanelHoverChange,
   onSeek,
   layout,
   onToggleLayout,
-  isFavorited,
-  onToggleFavorite,
-  speed,
-  onSpeedChange,
+  lyricOffsetSeconds,
+  onLyricOffsetChange,
   volume,
   onVolumeChange,
-  isShowQueue,
-  onShowQueueToggle,
   onOpenSettings,
+  onReloadFavorites,
   backgroundBlur,
   backgroundOpacity,
   lyricMotionStyle,
+  onLyricMotionStyleChange,
+  lyricSourceMode,
+  onLyricSourceModeChange,
+  level,
+  onLevelChange,
+  speed,
+  onSpeedChange,
   useCoverBackground,
+  showTranslation,
+  onToggleTranslation,
   onMinimize,
   onClose,
   playMode,
   onCyclePlayMode,
+  motionLevel = "light",
 }: GlassPlayerProps) {
   const progressBarRef = useRef<HTMLDivElement>(null);
+  const [seekPop, setSeekPop] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+  const moreBtnRef = useRef<HTMLButtonElement>(null);
+  const morePanelRef = useRef<HTMLDivElement>(null);
+  const volumePanelRef = useRef<HTMLDivElement>(null);
+  const lyricQuickRef = useRef<HTMLDivElement>(null);
+  const lyricsChromeLeaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  type MorePage =
+    | "root"
+    | "quality"
+    | "speed"
+    | "lyrics"
+    | "motion"
+    | "source";
 
   // State
-  const [isHoveringProgress, setIsHoveringProgress] = useState(false);
+  const [isDraggingProgress, setIsDraggingProgress] = useState(false);
+  const [isMoreOpen, setIsMoreOpen] = useState(false);
+  const [morePage, setMorePage] = useState<MorePage>("root");
+  /** Volume slider is toggled by its own button (not the More menu). */
+  const [volumeOpen, setVolumeOpen] = useState(false);
+  /** Fixed position for More popover (portal — avoids overflow:hidden clipping). */
+  const [moreMenuBox, setMoreMenuBox] = useState<{
+    top?: number;
+    bottom?: number;
+    right: number;
+    maxHeight: number;
+  } | null>(null);
+  /** Sticky hover for lyrics chrome — CSS group-hover fails over Tauri drag regions. */
+  const [lyricsPanelHovered, setLyricsPanelHovered] = useState(false);
+  /** Window controls have their own top-right hover target. */
+  const [windowChromeHovered, setWindowChromeHovered] = useState(false);
+  const canUseSongActions = song.id !== 'empty';
+
+  // Lyrics footer (offset / follow) — only while hovering the lyrics panel.
+  const lyricsChromeOpen = lyricsPanelHovered;
+
+  const closeMoreMenu = () => {
+    setIsMoreOpen(false);
+    setMorePage("root");
+    setMoreMenuBox(null);
+  };
+
+  const openMoreMenu = () => {
+    setMorePage("root");
+    setIsMoreOpen((v) => !v);
+    // Don't couple volume to more; leave volumeOpen as-is.
+  };
+
+  // Place More menu in a fixed portal so left-panel overflow-hidden cannot clip it.
+  useLayoutEffect(() => {
+    if (!isMoreOpen) {
+      setMoreMenuBox(null);
+      return;
+    }
+    const place = () => {
+      const btn = moreBtnRef.current;
+      if (!btn) return;
+      const rect = btn.getBoundingClientRect();
+      const gap = 8;
+      const spaceBelow = window.innerHeight - rect.bottom - gap;
+      const spaceAbove = rect.top - gap;
+      // Prefer opening upward (more room over the cover); flip if needed.
+      const openUp = spaceBelow < 260 || spaceAbove >= spaceBelow;
+      const maxHeight = Math.max(
+        160,
+        Math.min(400, openUp ? spaceAbove : spaceBelow)
+      );
+      setMoreMenuBox(
+        openUp
+          ? {
+              bottom: window.innerHeight - rect.top + gap,
+              right: Math.max(8, window.innerWidth - rect.right),
+              maxHeight,
+            }
+          : {
+              top: rect.bottom + gap,
+              right: Math.max(8, window.innerWidth - rect.right),
+              maxHeight,
+            }
+      );
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [isMoreOpen, morePage]);
+
+  const toggleVolumeOpen = () => {
+    setVolumeOpen((v) => !v);
+  };
+
+  const clearLyricsChromeLeaveTimer = () => {
+    if (lyricsChromeLeaveTimer.current != null) {
+      clearTimeout(lyricsChromeLeaveTimer.current);
+      lyricsChromeLeaveTimer.current = null;
+    }
+  };
+
+  const handleLyricsPanelEnter = () => {
+    clearLyricsChromeLeaveTimer();
+    setLyricsPanelHovered(true);
+  };
+
+  const handleLyricsPanelLeave = () => {
+    clearLyricsChromeLeaveTimer();
+    // Delay hide so the cursor can travel onto top/footer controls without flicker.
+    lyricsChromeLeaveTimer.current = setTimeout(() => {
+      setLyricsPanelHovered(false);
+      lyricsChromeLeaveTimer.current = null;
+    }, 280);
+  };
+
+  useEffect(() => {
+    return () => clearLyricsChromeLeaveTimer();
+  }, []);
+
+  useEffect(() => {
+    if (layout !== "lyrics") {
+      clearLyricsChromeLeaveTimer();
+      setLyricsPanelHovered(false);
+      setWindowChromeHovered(false);
+    }
+  }, [layout]);
+
+  useEffect(() => {
+    onLyricsPanelHoverChange?.(lyricsPanelHovered);
+    return () => {
+      if (lyricsPanelHovered) onLyricsPanelHoverChange?.(false);
+    };
+  }, [lyricsPanelHovered, onLyricsPanelHoverChange]);
+
+  const levelLabel = LEVEL_OPTIONS.find((o) => o.value === level)?.label ?? level;
+  const speedLabel = `${String(speed).replace(/\.0$/, "")}×`;
+  const motionLabel =
+    LYRIC_MOTION_OPTIONS.find((o) => o.value === lyricMotionStyle)?.label ?? "动画";
+  const sourceLabel =
+    LYRIC_SOURCE_OPTIONS.find((o) => o.value === lyricSourceMode)?.label ?? "来源";
+
+  useEffect(() => {
+    if (!isMoreOpen && !volumeOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const t = event.target as Node;
+      const el = event.target as HTMLElement | null;
+      if (
+        moreMenuRef.current?.contains(t) ||
+        morePanelRef.current?.contains(t)
+      ) {
+        /* keep more */
+      } else if (isMoreOpen) {
+        closeMoreMenu();
+      }
+      const inVolume =
+        volumePanelRef.current?.contains(t) ||
+        Boolean(el?.closest?.("[data-volume-panel]"));
+      if (!inVolume && volumeOpen) {
+        setVolumeOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (isMoreOpen) {
+        if (morePage !== "root") setMorePage("root");
+        else closeMoreMenu();
+        return;
+      }
+      if (volumeOpen) setVolumeOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [isMoreOpen, morePage, volumeOpen]);
+
+  useEffect(() => {
+    if (!isDraggingProgress) return;
+    const stopDragging = () => setIsDraggingProgress(false);
+    window.addEventListener('mouseup', stopDragging);
+    window.addEventListener('mouseleave', stopDragging);
+    return () => {
+      window.removeEventListener('mouseup', stopDragging);
+      window.removeEventListener('mouseleave', stopDragging);
+    };
+  }, [isDraggingProgress]);
 
   // Formatting utilities
   const formatTime = (secs: number) => {
@@ -93,25 +328,35 @@ export default function GlassPlayer({
     return `${m}:${s}`;
   };
 
-  const progressPercent = (currentTime / song.duration) * 100;
+  // Guard against duration=0 (NaN/Infinity width freezes the bar visually).
+  const safeDuration = Number.isFinite(song.duration) && song.duration > 0 ? song.duration : 0;
+  const progressPercent =
+    safeDuration > 0
+      ? Math.min(100, Math.max(0, (currentTime / safeDuration) * 100))
+      : 0;
 
   // Handles
-  const handleProgressClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!progressBarRef.current) return;
+  const seekFromProgressClientX = (clientX: number, pop = false) => {
+    if (!progressBarRef.current || safeDuration <= 0) return;
     const rect = progressBarRef.current.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
+    const clickX = clientX - rect.left;
     const width = rect.width;
     const clickRatio = Math.max(0, Math.min(1, clickX / width));
-    onSeek(clickRatio * song.duration);
+    onSeek(clickRatio * safeDuration);
+    if (pop && motionLevel !== "off") {
+      setSeekPop(true);
+      window.setTimeout(() => setSeekPop(false), 320);
+    }
+  };
+
+  const handleProgressMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    setIsDraggingProgress(true);
+    seekFromProgressClientX(e.clientX, true);
   };
 
   const handleProgressDrag = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.buttons !== 1 || !progressBarRef.current) return;
-    const rect = progressBarRef.current.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const width = rect.width;
-    const clickRatio = Math.max(0, Math.min(1, clickX / width));
-    onSeek(clickRatio * song.duration);
+    if (!isDraggingProgress || e.buttons !== 1) return;
+    seekFromProgressClientX(e.clientX);
   };
 
   const handleVolumeClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -122,9 +367,17 @@ export default function GlassPlayer({
     onVolumeChange(clickRatio);
   };
 
+  const copySongInfo = async () => {
+    if (!canUseSongActions) return;
+    const info = `${song.title} - ${song.artist}`;
+    await navigator.clipboard?.writeText(info).catch(() => {});
+  };
+
   // Find active lyric index
+  const lyricCurrentTime = Math.max(0, currentTime + lyricOffsetSeconds);
+
   const activeLyricIndex = song.lyrics.reduce((acc, line, idx) => {
-    if (currentTime >= line.time) {
+    if (lyricCurrentTime >= line.time) {
       return idx;
     }
     return acc;
@@ -132,63 +385,217 @@ export default function GlassPlayer({
 
   const lyricAnchorIndex = useMemo(() => {
     if (activeLyricIndex >= 0) return activeLyricIndex;
-    const upcomingIndex = song.lyrics.findIndex((line) => line.time > currentTime);
+    const upcomingIndex = song.lyrics.findIndex((line) => line.time > lyricCurrentTime);
     return upcomingIndex >= 0 ? upcomingIndex : 0;
-  }, [activeLyricIndex, currentTime, song.lyrics]);
+  }, [activeLyricIndex, lyricCurrentTime, song.lyrics]);
 
-  const visibleLyricItems = useMemo(() => {
-    const start = Math.max(0, lyricAnchorIndex - 3);
-    const end = Math.min(song.lyrics.length - 1, lyricAnchorIndex + 5);
-    return song.lyrics.slice(start, end + 1).map((line, localIndex) => {
-      const index = start + localIndex;
-      return {
-        line,
-        index,
-        offset: index - lyricAnchorIndex,
-      };
+  // ---- Manual lyric scrolling ----
+  // null = follow the active line. number = user is browsing manually.
+  // Manual browsing remains locked until the user selects a line or taps
+  // "回到当前"; an idle timer must not pull the list away before they click.
+  const [manualAnchor, setManualAnchor] = useState<number | null>(null);
+  // Spotlight for blur/scale/opacity:
+  //   auto-follow  → playing line (original rail effect)
+  //   manual browse → line nearest viewport center (same curves, different anchor)
+  const [visualFocusIndex, setVisualFocusIndex] = useState(0);
+  const lyricScrollRef = useRef<HTMLDivElement>(null);
+  const lyricLineRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const programmaticScrollRef = useRef(false);
+  const programmaticScrollTimerRef = useRef<number | null>(null);
+  const ignoreUserScrollUntilRef = useRef(0);
+  const focusRafRef = useRef<number | null>(null);
+
+  useScrollEdgeFriction(
+    lyricScrollRef,
+    layout === "lyrics" && !isFoliaAbsoluteStyle(lyricMotionStyle),
+  );
+
+  const findLineNearestViewportCenter = () => {
+    const container = lyricScrollRef.current;
+    if (!container) return lyricAnchorIndex;
+    // Match scrollLyricIntoCenter's optical center (~44% from top).
+    const centerY = container.scrollTop + container.clientHeight * 0.44;
+    let bestIndex = 0;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < lyricLineRefs.current.length; i++) {
+      const row = lyricLineRefs.current[i];
+      if (!row) continue;
+      const mid = row.offsetTop + row.offsetHeight / 2;
+      const dist = Math.abs(mid - centerY);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIndex = i;
+      }
+    }
+    return bestIndex;
+  };
+
+  const scheduleVisualFocusFromScroll = () => {
+    if (focusRafRef.current != null) return;
+    focusRafRef.current = window.requestAnimationFrame(() => {
+      focusRafRef.current = null;
+      setVisualFocusIndex(findLineNearestViewportCenter());
     });
-  }, [lyricAnchorIndex, song.lyrics]);
+  };
+
+  const scrollLyricIntoCenter = (index: number, behavior: ScrollBehavior = "smooth") => {
+    const container = lyricScrollRef.current;
+    const row = lyricLineRefs.current[index];
+    if (!container || !row) return;
+
+    if (programmaticScrollTimerRef.current != null) {
+      clearTimeout(programmaticScrollTimerRef.current);
+      programmaticScrollTimerRef.current = null;
+    }
+
+    programmaticScrollRef.current = true;
+    const targetTop =
+      row.offsetTop - container.clientHeight * 0.44 + row.offsetHeight / 2;
+    container.scrollTo({
+      top: Math.max(0, targetTop),
+      behavior,
+    });
+    // Smooth scroll can keep emitting residual scroll events after the timer;
+    // keep a short grace window so auto-follow is not mis-detected as manual.
+    const lockMs = behavior === "smooth" ? 900 : 120;
+    programmaticScrollTimerRef.current = window.setTimeout(() => {
+      programmaticScrollRef.current = false;
+      programmaticScrollTimerRef.current = null;
+      ignoreUserScrollUntilRef.current = performance.now() + 180;
+    }, lockMs);
+  };
+
+  useEffect(() => {
+    // Folia absolute rails (莫奈/浮名/流光) own their own layout — no native scroll.
+    if (layout !== "lyrics" || manualAnchor != null || isFoliaAbsoluteStyle(lyricMotionStyle)) return;
+    scrollLyricIntoCenter(lyricAnchorIndex, activeLyricIndex < 1 ? "auto" : "smooth");
+  }, [activeLyricIndex, lyricAnchorIndex, layout, manualAnchor, song.id, lyricMotionStyle]);
+
+  // Auto-follow: spotlight hard-locks to the playing line (original behavior).
+  useEffect(() => {
+    if (manualAnchor != null) return;
+    setVisualFocusIndex(Math.max(0, lyricAnchorIndex));
+  }, [lyricAnchorIndex, manualAnchor]);
+
+  const resumeAutoFollow = () => {
+    programmaticScrollRef.current = false;
+    // Clearing manualAnchor re-enables the auto-scroll + spotlight effects
+    // (see effects keyed on manualAnchor / lyricAnchorIndex).
+    setManualAnchor(null);
+  };
+
+  // Clear any pending programmatic scroll timer on unmount / song change.
+  useEffect(() => {
+    return () => {
+      if (programmaticScrollTimerRef.current != null) {
+        clearTimeout(programmaticScrollTimerRef.current);
+        programmaticScrollTimerRef.current = null;
+      }
+      if (focusRafRef.current != null) {
+        cancelAnimationFrame(focusRafRef.current);
+        focusRafRef.current = null;
+      }
+      programmaticScrollRef.current = false;
+    };
+  }, [song.id]);
+
+  // Reset manual lock when switching songs
+  useEffect(() => {
+    setManualAnchor(null);
+    programmaticScrollRef.current = false;
+    setVisualFocusIndex(0);
+  }, [song.id]);
+
+  const enterManualLyricScroll = () => {
+    if (programmaticScrollRef.current) return;
+    if (performance.now() < ignoreUserScrollUntilRef.current) return;
+    if (programmaticScrollTimerRef.current != null) {
+      clearTimeout(programmaticScrollTimerRef.current);
+      programmaticScrollTimerRef.current = null;
+    }
+    programmaticScrollRef.current = false;
+    setManualAnchor((prev) => prev ?? lyricAnchorIndex);
+    scheduleVisualFocusFromScroll();
+  };
+
+  const handleLyricScroll = () => {
+    if (programmaticScrollRef.current) return;
+    if (performance.now() < ignoreUserScrollUntilRef.current) return;
+    enterManualLyricScroll();
+    scheduleVisualFocusFromScroll();
+  };
+
+  const handleLyricWheel = () => {
+    enterManualLyricScroll();
+  };
+
+  /** Folia absolute rail: wheel steps focus index (parent schedules auto-resume). */
+  const handleFoliaManualStep = (nextIndex: number) => {
+    if (programmaticScrollRef.current) return;
+    setManualAnchor(nextIndex);
+    setVisualFocusIndex(nextIndex);
+  };
+
+  const lyricRenderStyle: LyricMotionStyle = lyricMotionStyle;
+  const seekToLyricTime = (lineTime: number) => {
+    // lyricCurrentTime = playback + offset, so invert the offset when seeking
+    // to make the clicked line become active at the exact destination.
+    onSeek(Math.max(0, lineTime - lyricOffsetSeconds));
+  };
 
   const activeLyricProgress = useMemo(() => {
     if (activeLyricIndex < 0) return 0;
     const activeLine = song.lyrics[activeLyricIndex];
     if (!activeLine) return 0;
-    const nextTime = song.lyrics[activeLyricIndex + 1]?.time ?? song.duration;
+    const nextTime = song.lyrics[activeLyricIndex + 1]?.time ?? safeDuration;
     const duration = Math.max(0.2, nextTime - activeLine.time);
-    return Math.min(1, Math.max(0, (currentTime - activeLine.time) / duration));
-  }, [activeLyricIndex, currentTime, song.duration, song.lyrics]);
+    return Math.min(1, Math.max(0, (lyricCurrentTime - activeLine.time) / duration));
+  }, [activeLyricIndex, lyricCurrentTime, safeDuration, song.lyrics]);
 
-  const getTypewriterText = (text: string) => {
-    const chars = Array.from(text);
-    if (chars.length === 0) return "";
-    const count = Math.min(chars.length, Math.max(1, Math.ceil(chars.length * activeLyricProgress)));
-    return chars.slice(0, count).join("");
+  // Adjust lyric sync offset. Positive values make lyrics advance earlier.
+  const increaseLyricOffset = () => {
+    onLyricOffsetChange(lyricOffsetSeconds + 0.1);
   };
 
-  // Adjust speed
-  const increaseSpeed = () => {
-    const speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-    const currentIndex = speeds.indexOf(speed);
-    if (currentIndex < speeds.length - 1) {
-      onSpeedChange(speeds[currentIndex + 1]);
-    }
-  };
-
-  const decreaseSpeed = () => {
-    const speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-    const currentIndex = speeds.indexOf(speed);
-    if (currentIndex > 0) {
-      onSpeedChange(speeds[currentIndex - 1]);
-    }
+  const decreaseLyricOffset = () => {
+    onLyricOffsetChange(lyricOffsetSeconds - 0.1);
   };
 
   const backgroundImageUrl = song.backgroundUrl || song.coverUrl;
   const glassTintOpacity = Math.min(80, Math.max(0, backgroundOpacity)) / 100;
+  const motionClass =
+    motionLevel === "off"
+      ? "motion-off"
+      : motionLevel === "full"
+        ? "motion-pop motion-full"
+        : "motion-pop";
+
+  const progressTrack = (compact: boolean) => (
+    <div
+      ref={progressBarRef}
+      onMouseDown={handleProgressMouseDown}
+      onMouseMove={handleProgressDrag}
+      className={`progress-track ${compact ? "h-4 flex-1" : "h-6 w-full"} ${
+        isDraggingProgress ? "is-dragging" : ""
+      } ${seekPop ? "is-seek-pop" : ""}`}
+    >
+      <div className="progress-track__rail" />
+      <div
+        className="progress-track__fill"
+        style={{ width: `${progressPercent}%` }}
+      />
+      <div
+        className="progress-track__thumb"
+        style={{ left: `${progressPercent}%` }}
+      />
+    </div>
+  );
 
   return (
     <div
       id="unified-player-card"
-      className="player-liquid-glass relative overflow-hidden text-white select-none flex flex-row items-stretch"
+      data-glow={motionLevel === "full" ? "" : undefined}
+      className={`player-liquid-glass relative overflow-hidden text-white select-none flex flex-row items-stretch ${motionClass}`}
       style={
         {
           width: "100%",
@@ -202,9 +609,60 @@ export default function GlassPlayer({
           WebkitBackdropFilter: `blur(${backgroundBlur}px) saturate(180%) brightness(1.08)`,
           boxShadow:
             "inset 0 1px 1px rgba(255,255,255,0.55), inset 1px 0 1px rgba(255,255,255,0.20), inset -1px 0 1px rgba(255,255,255,0.08), inset 0 -1px 1px rgba(255,255,255,0.18), 0 0 0 1px rgba(255,255,255,0.14), 0 26px 64px -18px rgba(0,0,0,0.6)",
+          ["--glow-hue" as string]: "210",
+          ["--player-theme-color" as string]: song.themeColor || "rgba(255,255,255,0.9)",
         } as React.CSSProperties
       }
     >
+      <div className="player-glow-spotlight" aria-hidden />
+      <div className="player-glow-rim" aria-hidden />
+      {/* Titlebar drag — ABOVE panels (z-40) so the window is always movable.
+          Interactive chrome is a higher sibling (z-50) with no-drag; only the
+          actual button clusters use pointer-events-auto so empty gaps still drag. */}
+      <div
+        data-tauri-drag-region
+        aria-hidden
+        className={`absolute inset-x-0 top-0 z-40 pointer-events-auto ${
+          layout === "mini" ? "h-16" : "h-12"
+        }`}
+      />
+
+      {/* Window chrome — an independent top-right hover target, unrelated to lyrics hover. */}
+      {layout === "lyrics" && (
+        <div
+          onPointerEnter={() => setWindowChromeHovered(true)}
+          onPointerLeave={() => setWindowChromeHovered(false)}
+          className="absolute right-0 top-0 z-50 flex h-12 w-24 items-center justify-end pr-3 no-drag"
+          style={{ WebkitAppRegion: "no-drag", appRegion: "no-drag" } as React.CSSProperties}
+        >
+          <div
+            className={`flex items-center gap-1 transition-all duration-200 ${
+              windowChromeHovered
+                ? "translate-y-0 opacity-100"
+                : "pointer-events-none -translate-y-1 opacity-0"
+            }`}
+          >
+            <button
+              type="button"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={onMinimize}
+              title="最小化"
+              className="grid place-items-center w-8 h-7 rounded-md text-white/60 hover:text-white hover:bg-white/10 transition-colors cursor-pointer no-drag"
+            >
+              <Minus size={14} />
+            </button>
+            <button
+              type="button"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={onClose}
+              title="关闭"
+              className="grid place-items-center w-8 h-7 rounded-md text-white/60 hover:text-white hover:bg-red-500/80 transition-colors cursor-pointer no-drag"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+      )}
       {useCoverBackground && backgroundImageUrl && (
         <div className="absolute inset-0 z-0 overflow-hidden rounded-[20px] pointer-events-none">
           <img
@@ -227,10 +685,15 @@ export default function GlassPlayer({
           initial={{ opacity: 0 }} 
           animate={{ opacity: 1 }} 
           exit={{ opacity: 0 }}
-          className="player-liquid-content flex flex-col justify-between w-full h-full p-5"
+          className="player-liquid-content relative flex flex-col justify-between w-full h-full p-5"
         >
-          {/* Top Row: Mini Info */}
-          <div className="flex items-center gap-3.5 w-full">
+          <div
+            data-tauri-drag-region
+            aria-hidden
+            className="absolute inset-x-0 top-0 z-10 h-24"
+          />
+          {/* Top Row: Mini Info — above titlebar drag; interactive bits are no-drag */}
+          <div className="relative z-50 flex items-center gap-3.5 w-full no-drag">
             <motion.div 
               layoutId="album-art"
               className="w-[52px] h-[52px] rounded-xl overflow-hidden shadow-md flex-shrink-0"
@@ -239,6 +702,7 @@ export default function GlassPlayer({
             >
               {song.coverUrl && (
                 <img
+                  key={song.coverUrl}
                   src={song.coverUrl}
                   alt={song.title}
                   referrerPolicy="no-referrer"
@@ -247,7 +711,7 @@ export default function GlassPlayer({
               )}
             </motion.div>
             
-            <div className="flex-1 min-w-0 pr-1">
+            <div key={song.id} className="flex-1 min-w-0 pr-1 song-meta-enter">
               <motion.h3 
                 layoutId="song-title"
                 className="text-[15px] font-bold tracking-tight text-white uppercase truncate font-sans text-left"
@@ -278,27 +742,8 @@ export default function GlassPlayer({
           {/* Middle Row: Progress Slider */}
           <div className="flex items-center gap-2 text-[10px] font-bold text-white/50 font-mono tracking-wider">
             <span className="w-8 text-right">{formatTime(currentTime)}</span>
-            <div 
-              ref={progressBarRef}
-              onClick={handleProgressClick}
-              onMouseMove={handleProgressDrag}
-              onMouseEnter={() => setIsHoveringProgress(true)}
-              onMouseLeave={() => setIsHoveringProgress(false)}
-              className="relative flex-1 h-4 flex items-center cursor-pointer group"
-            >
-              <div className="absolute left-0 right-0 h-[4px] bg-white/12 rounded-full" />
-              <div 
-                className="absolute left-0 h-[4px] bg-white/80 rounded-full"
-                style={{ width: `${progressPercent}%` }}
-              />
-              <motion.div 
-                className="absolute w-[8px] h-[8px] bg-white rounded-full shadow-sm"
-                style={{ left: `calc(${progressPercent}% - 4px)` }}
-                animate={{ scale: isHoveringProgress ? 1.4 : 0 }}
-                transition={{ duration: 0.15 }}
-              />
-            </div>
-            <span className="w-8 text-left">{formatTime(song.duration)}</span>
+            {progressTrack(true)}
+            <span className="w-8 text-left">{formatTime(safeDuration)}</span>
           </div>
 
           {/* Bottom Row: Compact Controls */}
@@ -307,42 +752,33 @@ export default function GlassPlayer({
               <motion.button
                 whileHover={{ scale: 1.12 }}
                 whileTap={{ scale: 0.88 }}
-                onClick={onToggleFavorite}
-                className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
-                  isFavorited ? 'text-yellow-300 bg-white/10' : 'text-white/60 hover:text-white'
-                }`}
-                title="Favorite"
-              >
-                <Star size={15} fill={isFavorited ? "currentColor" : "none"} />
-              </motion.button>
-
-              <motion.button
-                whileHover={{ scale: 1.12 }}
-                whileTap={{ scale: 0.88 }}
                 onClick={() => onToggleLayout('vertical')}
-                className="w-8 h-8 rounded-full flex items-center justify-center text-white/50 hover:text-white transition-colors cursor-pointer"
+                className="liquid-glass-solid flex items-center justify-center cursor-pointer"
+                style={{ ["--lg-solid-size" as string]: "2rem" }}
                 title="Expand to Full Player"
               >
                 <Maximize2 size={15} />
               </motion.button>
             </div>
 
-            <div className="flex items-center gap-5">
+            <div className="flex items-center gap-2.5">
               <motion.button
-                whileHover={{ scale: 1.12 }}
-                whileTap={{ scale: 0.88 }}
+                whileHover={{ scale: 1.06 }}
+                whileTap={{ scale: 0.92 }}
                 onClick={onPrev}
-                className="text-white/70 hover:text-white p-1 cursor-pointer"
+                className="liquid-glass-play w-8 h-8 rounded-full flex items-center justify-center cursor-pointer shrink-0"
               >
-                <SkipBack size={18} fill="currentColor" />
+                <span className="play-glow" aria-hidden />
+                <SkipBack size={14} fill="currentColor" />
               </motion.button>
 
               <motion.button
-                whileHover={{ scale: 1.08 }}
+                whileHover={{ scale: 1.06 }}
                 whileTap={{ scale: 0.92 }}
                 onClick={onPlayPause}
-                className="w-9 h-9 rounded-full flex items-center justify-center bg-white text-slate-900 shadow-sm cursor-pointer"
+                className="liquid-glass-play w-9 h-9 rounded-full flex items-center justify-center cursor-pointer shrink-0"
               >
+                <span className="play-glow" aria-hidden />
                 {isPlaying ? (
                   <Pause size={16} fill="currentColor" strokeWidth={1} />
                 ) : (
@@ -351,25 +787,30 @@ export default function GlassPlayer({
               </motion.button>
 
               <motion.button
+                whileHover={{ scale: 1.06 }}
+                whileTap={{ scale: 0.92 }}
+                onClick={onNext}
+                className="liquid-glass-play w-8 h-8 rounded-full flex items-center justify-center cursor-pointer shrink-0"
+              >
+                <span className="play-glow" aria-hidden />
+                <SkipForward size={14} fill="currentColor" />
+              </motion.button>
+
+              <motion.button
+                type="button"
                 whileHover={{ scale: 1.12 }}
                 whileTap={{ scale: 0.88 }}
-                onClick={onNext}
-                className="text-white/70 hover:text-white p-1 cursor-pointer"
+                onClick={onOpenQueue}
+                className="liquid-glass-solid flex items-center justify-center cursor-pointer"
+                style={{ ["--lg-solid-size" as string]: "2rem" }}
+                title="播放队列"
+                aria-label="播放队列"
               >
-                <SkipForward size={18} fill="currentColor" />
+                <ListMusic size={15} />
               </motion.button>
             </div>
 
-            <motion.button
-              whileHover={{ scale: 1.12 }}
-              whileTap={{ scale: 0.88 }}
-              onClick={onShowQueueToggle}
-              className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
-                isShowQueue ? 'text-white bg-white/12' : 'text-white/60 hover:text-white'
-              }`}
-            >
-              <ListMusic size={16} />
-            </motion.button>
+            <div className="w-8 shrink-0" aria-hidden />
           </div>
         </motion.div>
       )}
@@ -379,20 +820,28 @@ export default function GlassPlayer({
       {/* ========================================================= */}
       {layout !== 'mini' && (
         <>
-          {/* LEFT PLAYER PANEL (Vertical Control Card) */}
+          {/* LEFT PLAYER PANEL (Vertical Control Card)
+              Do NOT put data-tauri-drag-region on the whole panel — WebView2 can
+              swallow button clicks (e.g. cycle play mode) and leave the window
+              feeling "stuck". Drag only on cover / title chrome. */}
+          {/*
+            Early layout (liquid-glass checkpoint):
+            3 justify-between children — cover | meta(title+progress) | transport.
+            Do NOT nest transport inside meta (that collapses the rhythm).
+          */}
           <div
-            data-tauri-drag-region
-            className="player-liquid-content w-[360px] h-full p-7 flex flex-col justify-between flex-shrink-0 rounded-l-[20px] overflow-hidden"
+            className="player-liquid-content relative z-20 w-[360px] h-full p-7 flex flex-col justify-between flex-shrink-0 rounded-l-[20px] overflow-hidden"
           >
-            {/* Main Cover Art */}
+            {/* 1) Cover */}
             <motion.div 
               layoutId="album-art"
-              className="relative w-full h-[320px] rounded-[24px] overflow-hidden group shadow-lg"
+              data-tauri-drag-region
+              className="relative w-full h-[320px] rounded-[24px] overflow-hidden group shadow-lg flex-shrink-0"
             >
               {song.coverUrl && (
                 <>
                   <motion.img
-                    key={song.id}
+                    key={song.coverUrl}
                     src={song.coverUrl}
                     alt={song.title}
                     referrerPolicy="no-referrer"
@@ -405,10 +854,14 @@ export default function GlassPlayer({
               )}
             </motion.div>
 
-            {/* Meta Info Section */}
-            <div className="flex flex-col gap-5 mt-4">
+            {/* 2) Meta — title/more + progress only (gap-5 mt-4 as original) */}
+            <div className="flex flex-col gap-5 mt-4 flex-shrink-0">
               <div className="flex items-center justify-between w-full">
-                <div className="flex-1 min-w-0 pr-4 text-left">
+                <div
+                  key={song.id}
+                  data-tauri-drag-region
+                  className="flex-1 min-w-0 pr-4 text-left song-meta-enter"
+                >
                   <motion.h2 
                     layoutId="song-title"
                     className="text-xl font-bold tracking-tight text-white uppercase truncate font-sans"
@@ -423,127 +876,459 @@ export default function GlassPlayer({
                   </motion.p>
                 </div>
 
-                <div className="flex items-center gap-2.5 flex-shrink-0">
-                  <motion.button
-                    whileHover={{ scale: 1.06, backgroundColor: 'rgba(255, 255, 255, 0.18)' }}
-                    whileTap={{ scale: 0.94 }}
-                    onClick={onToggleFavorite}
-                    className={`liquid-glass-control w-9 h-9 rounded-full flex items-center justify-center transition-colors border border-white/5 cursor-pointer ${
-                      isFavorited ? 'bg-white/20 text-yellow-300' : 'bg-white/8 text-white/80'
-                    }`}
-                  >
-                    <Star size={17} fill={isFavorited ? "currentColor" : "none"} />
-                  </motion.button>
+                <div className="flex items-center gap-2.5 flex-shrink-0 no-drag">
+                  <div ref={volumePanelRef} className="relative">
+                    <motion.button
+                      type="button"
+                      whileHover={{ scale: 1.06 }}
+                      whileTap={{ scale: 0.94 }}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={toggleVolumeOpen}
+                      title={volumeOpen ? "收起音量" : "音量"}
+                      className={`liquid-glass-solid flex items-center justify-center cursor-pointer ${
+                        volumeOpen ? "liquid-glass-solid--active" : ""
+                      }`}
+                      style={{ ["--lg-solid-size" as string]: "2.25rem" }}
+                    >
+                      <Volume1 size={17} />
+                    </motion.button>
+                  </div>
 
+                  <div ref={moreMenuRef} className="relative shrink-0">
                   <motion.button
-                    whileHover={{ scale: 1.06, backgroundColor: 'rgba(255, 255, 255, 0.18)' }}
+                    ref={moreBtnRef}
+                    type="button"
+                    whileHover={{ scale: 1.06 }}
                     whileTap={{ scale: 0.94 }}
-                    className="liquid-glass-control w-9 h-9 rounded-full flex items-center justify-center bg-white/8 text-white/80 border border-white/5 cursor-pointer"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={openMoreMenu}
+                    title="更多"
+                    className={`liquid-glass-solid flex items-center justify-center cursor-pointer ${
+                      isMoreOpen ? "liquid-glass-solid--active" : ""
+                    }`}
+                    style={{ ["--lg-solid-size" as string]: "2.25rem" }}
                   >
                     <MoreHorizontal size={17} />
                   </motion.button>
+
+                  {typeof document !== "undefined" &&
+                    createPortal(
+                  <AnimatePresence mode="wait">
+                    {isMoreOpen && moreMenuBox && (
+                      <motion.div
+                        ref={morePanelRef}
+                        key={morePage}
+                        initial={{ opacity: 0, y: moreMenuBox.bottom != null ? 6 : -6, scale: 0.96 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: moreMenuBox.bottom != null ? 4 : -4, scale: 0.98 }}
+                        transition={{ duration: 0.14 }}
+                        style={{
+                          position: "fixed",
+                          top: moreMenuBox.top,
+                          bottom: moreMenuBox.bottom,
+                          right: moreMenuBox.right,
+                          maxHeight: moreMenuBox.maxHeight,
+                          zIndex: 10000,
+                        }}
+                        className="app-liquid-popover w-56 overflow-y-auto overscroll-contain rounded-2xl no-drag scrollbar-none"
+                        onPointerDown={(e) => e.stopPropagation()}
+                      >
+                          {/* ── Root ── */}
+                          {morePage === "root" && (
+                            <div className="py-1">
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("quality")}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white"
+                              >
+                                <Gauge size={15} className="text-white/45 shrink-0" />
+                                <span className="flex-1">音质</span>
+                                <span className="text-[11px] font-bold text-white/40">{levelLabel}</span>
+                                <ChevronRight size={14} className="text-white/30" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("speed")}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white"
+                              >
+                                <Sparkles size={15} className="text-white/45 shrink-0" />
+                                <span className="flex-1">倍速</span>
+                                <span className="text-[11px] font-mono font-bold text-white/40">{speedLabel}</span>
+                                <ChevronRight size={14} className="text-white/30" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("lyrics")}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white"
+                              >
+                                <Languages size={15} className="text-white/45 shrink-0" />
+                                <span className="flex-1">歌词</span>
+                                <span className="max-w-[5.5rem] truncate text-[11px] font-bold text-white/40">
+                                  {motionLabel} · {sourceLabel}
+                                </span>
+                                <ChevronRight size={14} className="text-white/30" />
+                              </button>
+                              <div className="my-1 h-px bg-white/8" />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  void onReloadFavorites();
+                                  closeMoreMenu();
+                                }}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white"
+                              >
+                                <Repeat size={15} className="text-white/45 shrink-0" />
+                                刷新我喜欢
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  void copySongInfo();
+                                  closeMoreMenu();
+                                }}
+                                disabled={!canUseSongActions}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:text-white/25 disabled:hover:bg-transparent"
+                              >
+                                <Clipboard size={15} className="text-white/45 shrink-0" />
+                                复制歌曲信息
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  onOpenSettings();
+                                  closeMoreMenu();
+                                }}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white"
+                              >
+                                <Settings size={15} className="text-white/45 shrink-0" />
+                                设置
+                              </button>
+                            </div>
+                          )}
+
+                          {/* ── Quality ── */}
+                          {morePage === "quality" && (
+                            <div className="py-1">
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("root")}
+                                className="flex h-9 w-full items-center gap-1.5 px-3 text-left text-[12px] font-bold text-white/55 hover:bg-white/8 hover:text-white/80"
+                              >
+                                <ChevronLeft size={14} />
+                                音质
+                              </button>
+                              <div className="mx-2 mb-1 h-px bg-white/8" />
+                              {LEVEL_OPTIONS.map(({ value, label, hint }) => (
+                                <button
+                                  key={value}
+                                  type="button"
+                                  onClick={() => {
+                                    onLevelChange(value);
+                                    closeMoreMenu();
+                                  }}
+                                  className={`flex h-9 w-full items-center justify-between px-3 text-left text-[12px] font-semibold ${
+                                    level === value
+                                      ? "bg-white/12 text-white"
+                                      : "text-white/70 hover:bg-white/10 hover:text-white"
+                                  }`}
+                                >
+                                  <span>{label}</span>
+                                  <span className={level === value ? "text-white/50" : "text-white/30"}>
+                                    {hint}
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* ── Speed ── */}
+                          {morePage === "speed" && (
+                            <div className="py-1">
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("root")}
+                                className="flex h-9 w-full items-center gap-1.5 px-3 text-left text-[12px] font-bold text-white/55 hover:bg-white/8 hover:text-white/80"
+                              >
+                                <ChevronLeft size={14} />
+                                倍速
+                              </button>
+                              <div className="mx-2 mb-1 h-px bg-white/8" />
+                              {SPEED_OPTIONS.map((s) => (
+                                <button
+                                  key={s}
+                                  type="button"
+                                  onClick={() => {
+                                    onSpeedChange(s);
+                                    closeMoreMenu();
+                                  }}
+                                  className={`flex h-9 w-full items-center px-3 text-left font-mono text-[12px] font-bold ${
+                                    speed === s
+                                      ? "bg-white/12 text-white"
+                                      : "text-white/70 hover:bg-white/10 hover:text-white"
+                                  }`}
+                                >
+                                  {s}×
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* ── Lyrics hub ── */}
+                          {morePage === "lyrics" && (
+                            <div className="py-1">
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("root")}
+                                className="flex h-9 w-full items-center gap-1.5 px-3 text-left text-[12px] font-bold text-white/55 hover:bg-white/8 hover:text-white/80"
+                              >
+                                <ChevronLeft size={14} />
+                                歌词
+                              </button>
+                              <div className="mx-2 mb-1 h-px bg-white/8" />
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("motion")}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white"
+                              >
+                                <span className="flex-1">动画样式</span>
+                                <span className="text-[11px] font-bold text-white/40">{motionLabel}</span>
+                                <ChevronRight size={14} className="text-white/30" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("source")}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white"
+                              >
+                                <span className="flex-1">歌词来源</span>
+                                <span className="text-[11px] font-bold text-white/40">{sourceLabel}</span>
+                                <ChevronRight size={14} className="text-white/30" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => onToggleTranslation()}
+                                className="flex h-10 w-full items-center gap-2.5 px-3 text-left text-[13px] font-semibold text-white/80 hover:bg-white/10 hover:text-white"
+                              >
+                                <Languages size={15} className="text-white/45 shrink-0" />
+                                <span className="flex-1">显示翻译</span>
+                                <span className="text-[11px] font-bold text-white/45">
+                                  {showTranslation ? "开" : "关"}
+                                </span>
+                              </button>
+                            </div>
+                          )}
+
+                          {/* ── Motion styles ── */}
+                          {morePage === "motion" && (
+                            <div className="py-1">
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("lyrics")}
+                                className="flex h-9 w-full items-center gap-1.5 px-3 text-left text-[12px] font-bold text-white/55 hover:bg-white/8 hover:text-white/80"
+                              >
+                                <ChevronLeft size={14} />
+                                动画样式
+                              </button>
+                              <div className="mx-2 mb-1 h-px bg-white/8" />
+                              {LYRIC_MOTION_OPTIONS.map(({ value, label }) => (
+                                <button
+                                  key={value}
+                                  type="button"
+                                  onClick={() => {
+                                    onLyricMotionStyleChange(value);
+                                    setMorePage("lyrics");
+                                  }}
+                                  className={`flex h-9 w-full items-center px-3 text-left text-[12px] font-semibold ${
+                                    lyricMotionStyle === value
+                                      ? "bg-white/12 text-white"
+                                      : "text-white/70 hover:bg-white/10 hover:text-white"
+                                  }`}
+                                >
+                                  {label}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* ── Lyric source ── */}
+                          {morePage === "source" && (
+                            <div className="py-1">
+                              <button
+                                type="button"
+                                onClick={() => setMorePage("lyrics")}
+                                className="flex h-9 w-full items-center gap-1.5 px-3 text-left text-[12px] font-bold text-white/55 hover:bg-white/8 hover:text-white/80"
+                              >
+                                <ChevronLeft size={14} />
+                                歌词来源
+                              </button>
+                              <div className="mx-2 mb-1 h-px bg-white/8" />
+                              {LYRIC_SOURCE_OPTIONS.map(({ value, label }) => (
+                                <button
+                                  key={value}
+                                  type="button"
+                                  onClick={() => {
+                                    onLyricSourceModeChange(value);
+                                    setMorePage("lyrics");
+                                  }}
+                                  className={`flex h-9 w-full items-center px-3 text-left text-[12px] font-semibold ${
+                                    lyricSourceMode === value
+                                      ? "bg-white/12 text-white"
+                                      : "text-white/70 hover:bg-white/10 hover:text-white"
+                                  }`}
+                                >
+                                  {label}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>,
+                      document.body
+                    )}
+                  </div>
+                  </div>
                 </div>
-              </div>
 
               {/* Progress Track */}
-              <div className="flex flex-col gap-2">
-                <div 
-                  ref={progressBarRef}
-                  onClick={handleProgressClick}
-                  onMouseMove={handleProgressDrag}
-                  onMouseEnter={() => setIsHoveringProgress(true)}
-                  onMouseLeave={() => setIsHoveringProgress(false)}
-                  className="relative h-6 flex items-center cursor-pointer group"
-                >
-                  <div className="absolute left-0 right-0 h-[5px] bg-white/15 rounded-full" />
-                  <div 
-                    className="absolute left-0 h-[5px] bg-white rounded-full"
-                    style={{ width: `${progressPercent}%` }}
-                  />
-                  <motion.div 
-                    className="absolute w-[10px] h-[10px] bg-white rounded-full shadow-md"
-                    style={{ left: `calc(${progressPercent}% - 5px)` }}
-                    animate={{ scale: isHoveringProgress ? 1.4 : 0 }}
-                    transition={{ duration: 0.15 }}
-                  />
-                </div>
+              <div className="flex flex-col gap-2 no-drag">
+                {progressTrack(false)}
 
                 <div className="flex items-center justify-between text-[11px] font-semibold text-white/50 tracking-wider font-mono">
                   <span>{formatTime(currentTime)}</span>
-                  <span>{formatTime(song.duration)}</span>
+                  <span>{formatTime(safeDuration)}</span>
                 </div>
               </div>
             </div>
 
-            {/* Controls: play-mode | prev | play/pause | next | queue */}
-            <div className="flex items-center justify-center gap-5 mt-1 mb-2">
-              {/* Play-mode toggle (single button, cycles: sequence → list → one → shuffle) */}
-              <motion.button
-                whileHover={{ scale: 1.12 }}
-                whileTap={{ scale: 0.88 }}
-                onClick={onCyclePlayMode}
-                title={
-                  playMode === "shuffle" ? "随机播放"
-                  : playMode === "one" ? "单曲循环"
-                  : playMode === "list" ? "列表循环"
-                  : "顺序播放"
-                }
-                className={`liquid-glass-control p-2 rounded-full transition-colors cursor-pointer ${
-                  playMode !== "sequence" ? "text-white bg-white/10" : "text-white/45 hover:text-white/85"
-                }`}
-              >
-                {playMode === "shuffle" ? (
-                  <Shuffle size={20} />
-                ) : playMode === "one" ? (
-                  <Repeat1 size={20} />
-                ) : (
-                  <Repeat size={20} />
+            {/*
+              3) Bottom stack — volume + transport as one justify-between child.
+              Opening volume only grows this stack; transport layout-animates down/up.
+            */}
+            <div className="flex flex-col items-stretch flex-shrink-0 no-drag mb-1">
+              <AnimatePresence initial={false}>
+                {volumeOpen && (
+                  <motion.div
+                    key="volume-reveal"
+                    initial={{ opacity: 0, height: 0, marginBottom: 0 }}
+                    animate={{ opacity: 1, height: "auto", marginBottom: 10 }}
+                    exit={{ opacity: 0, height: 0, marginBottom: 0 }}
+                    transition={{ type: "spring", damping: 28, stiffness: 320 }}
+                    className="overflow-hidden"
+                    data-volume-panel=""
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    <div
+                      className="nested-radius flex items-center gap-2 rounded-full border border-white/8 bg-white/8 px-3 py-2"
+                      title="音量"
+                    >
+                      <Volume1 size={14} className="text-white/45 shrink-0" />
+                      <div
+                        onClick={handleVolumeClick}
+                        className="relative h-3 w-full flex items-center cursor-pointer"
+                      >
+                        <div className="absolute left-0 right-0 h-[3px] bg-white/15 rounded-full" />
+                        <div
+                          className="absolute left-0 h-[3px] bg-white/80 rounded-full"
+                          style={{ width: `${volume * 100}%` }}
+                        />
+                      </div>
+                      <span className="w-8 shrink-0 text-right font-mono text-[10px] font-bold text-white/45">
+                        {Math.round(volume * 100)}
+                      </span>
+                    </div>
+                  </motion.div>
                 )}
-              </motion.button>
+              </AnimatePresence>
 
-              <motion.button
-                whileHover={{ scale: 1.12 }}
-                whileTap={{ scale: 0.88 }}
-                onClick={onPrev}
-                className="p-2 text-white/85 hover:text-white transition-colors cursor-pointer"
+              <motion.div
+                layout
+                transition={{ type: "spring", damping: 28, stiffness: 320 }}
+                className="flex items-center justify-center gap-5"
               >
-                <SkipBack size={26} fill="currentColor" />
-              </motion.button>
+                <motion.button
+                  type="button"
+                  whileHover={{ scale: 1.12 }}
+                  whileTap={{ scale: 0.88 }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onCyclePlayMode();
+                  }}
+                  title={
+                    playMode === "shuffle"
+                      ? "随机播放"
+                      : playMode === "one"
+                        ? "单曲循环"
+                        : "列表循环"
+                  }
+                  className="liquid-glass-solid flex items-center justify-center cursor-pointer"
+                  style={{ ["--lg-solid-size" as string]: "2.25rem" }}
+                >
+                  {playMode === "shuffle" ? (
+                    <Shuffle size={18} />
+                  ) : playMode === "one" ? (
+                    <Repeat1 size={18} />
+                  ) : (
+                    <Repeat size={18} />
+                  )}
+                </motion.button>
 
-              <motion.button
-                whileHover={{ scale: 1.08 }}
-                whileTap={{ scale: 0.92 }}
-                onClick={onPlayPause}
-                className="w-16 h-16 rounded-full flex items-center justify-center bg-white text-slate-950 shadow-md cursor-pointer"
-              >
-                {isPlaying ? (
-                  <Pause size={28} fill="currentColor" strokeWidth={1} />
-                ) : (
-                  <Play size={28} fill="currentColor" className="ml-1" strokeWidth={1} />
-                )}
-              </motion.button>
+                <motion.button
+                  type="button"
+                  whileHover={{ scale: 1.06 }}
+                  whileTap={{ scale: 0.92 }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={onPrev}
+                  className="liquid-glass-play w-11 h-11 rounded-full flex items-center justify-center cursor-pointer shrink-0"
+                >
+                  <span className="play-glow" aria-hidden />
+                  <SkipBack size={20} fill="currentColor" />
+                </motion.button>
 
-              <motion.button
-                whileHover={{ scale: 1.12 }}
-                whileTap={{ scale: 0.88 }}
-                onClick={onNext}
-                className="p-2 text-white/85 hover:text-white transition-colors cursor-pointer"
-              >
-                <SkipForward size={26} fill="currentColor" />
-              </motion.button>
+                <motion.button
+                  type="button"
+                  whileHover={{ scale: 1.06 }}
+                  whileTap={{ scale: 0.92 }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={onPlayPause}
+                  className="liquid-glass-play w-[56px] h-[56px] rounded-full flex items-center justify-center cursor-pointer shrink-0"
+                >
+                  <span className="play-glow" aria-hidden />
+                  {isPlaying ? (
+                    <Pause size={26} fill="currentColor" strokeWidth={1} />
+                  ) : (
+                    <Play size={26} fill="currentColor" className="ml-0.5" strokeWidth={1} />
+                  )}
+                </motion.button>
 
-              {/* Queue toggle */}
-              <motion.button
-                whileHover={{ scale: 1.12 }}
-                whileTap={{ scale: 0.88 }}
-                onClick={onShowQueueToggle}
-                title="播放列表"
-                className={`liquid-glass-control p-2 rounded-full transition-colors cursor-pointer ${
-                  isShowQueue ? "text-white bg-white/10" : "text-white/45 hover:text-white/85"
-                }`}
-              >
-                <ListMusic size={20} />
-              </motion.button>
+                <motion.button
+                  type="button"
+                  whileHover={{ scale: 1.06 }}
+                  whileTap={{ scale: 0.92 }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={onNext}
+                  className="liquid-glass-play w-11 h-11 rounded-full flex items-center justify-center cursor-pointer shrink-0"
+                >
+                  <span className="play-glow" aria-hidden />
+                  <SkipForward size={20} fill="currentColor" />
+                </motion.button>
+
+                <motion.button
+                  type="button"
+                  whileHover={{ scale: 1.12 }}
+                  whileTap={{ scale: 0.88 }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={onOpenQueue}
+                  className="liquid-glass-solid flex items-center justify-center cursor-pointer"
+                  style={{ ["--lg-solid-size" as string]: "2.25rem" }}
+                  title="播放队列"
+                  aria-label="播放队列"
+                >
+                  <ListMusic size={18} />
+                </motion.button>
+
+              </motion.div>
             </div>
           </div>
 
@@ -552,498 +1337,211 @@ export default function GlassPlayer({
             {layout === 'lyrics' && (
               <motion.div
                 key="lyrics-drawer"
-                data-tauri-drag-region
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
                 transition={{ type: 'spring', damping: 26, stiffness: 130 }}
-                className="player-liquid-content group h-full flex-1 min-w-0 flex flex-col justify-between p-7 rounded-r-[20px] overflow-hidden text-left before:absolute before:left-0 before:top-7 before:bottom-7 before:w-px before:bg-white/6 before:pointer-events-none"
+                onPointerEnter={handleLyricsPanelEnter}
+                onPointerLeave={handleLyricsPanelLeave}
+                className="player-liquid-content group relative z-20 h-full flex-1 min-w-0 flex flex-col justify-between p-7 rounded-r-[20px] overflow-hidden text-left before:absolute before:left-0 before:top-7 before:bottom-7 before:w-px before:bg-white/6 before:pointer-events-none"
               >
-                {/* Window controls (minimize / close) — top-right, only on hover */}
-                <div className="absolute top-3 right-3 z-40 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                  <button
-                    onClick={onOpenSettings}
-                    title="设置"
-                    className="grid place-items-center w-8 h-7 rounded-md text-white/60 hover:text-white hover:bg-white/10 transition-colors"
-                  >
-                    <Settings size={14} />
-                  </button>
-                  <button
-                    onClick={onMinimize}
-                    title="最小化"
-                    className="grid place-items-center w-8 h-7 rounded-md text-white/60 hover:text-white hover:bg-white/10 transition-colors"
-                  >
-                    <Minus size={14} />
-                  </button>
-                  <button
-                    onClick={onClose}
-                    title="关闭"
-                    className="grid place-items-center w-8 h-7 rounded-md text-white/60 hover:text-white hover:bg-red-500/80 transition-colors"
-                  >
-                    <X size={14} />
-                  </button>
-                </div>
-                {/* Synced Lyrics Rail */}
+                {/* Extra drag surface under the titlebar (blank lyrics chrome).
+                    Toolbar buttons live on the root overlay above the titlebar. */}
                 <div
-                  className="relative flex-1 overflow-hidden pr-2 pb-24 pt-20"
+                  data-tauri-drag-region
+                  aria-hidden
+                  className="absolute inset-x-0 top-12 z-0 h-20"
+                />
+                {/* Synced Lyrics — Folia absolute rail (莫奈/浮名/流光) or scroll list */}
+                {isFoliaAbsoluteStyle(lyricRenderStyle) ? (
+                  <div className="relative flex-1 min-h-0 flex flex-col pb-14 pt-10">
+                    <div className="relative flex-1 min-h-0 no-drag">
+                      <FoliaLyricsRail
+                        style={lyricRenderStyle}
+                        lines={song.lyrics}
+                        currentTime={lyricCurrentTime}
+                        activeIndex={activeLyricIndex}
+                        anchorIndex={lyricAnchorIndex}
+                        showTranslation={showTranslation}
+                        songDuration={safeDuration}
+                        onSeek={seekToLyricTime}
+                        manualAnchor={manualAnchor}
+                        onManualStep={handleFoliaManualStep}
+                        onResumeAuto={resumeAutoFollow}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                <div
+                  ref={lyricScrollRef}
+                  onScroll={handleLyricScroll}
+                  onWheel={handleLyricWheel}
+                  className="relative flex-1 min-h-0 overflow-y-auto pr-2 pb-24 pt-16 no-drag [scrollbar-width:none] [-ms-overflow-style:none]"
                   style={{
-                    maskImage: 'linear-gradient(to bottom, transparent 0%, white 14%, white 82%, transparent 100%)',
-                    WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, white 14%, white 82%, transparent 100%)'
+                    maskImage: 'linear-gradient(to bottom, transparent 0%, white 12%, white 78%, transparent 100%)',
+                    WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, white 12%, white 78%, transparent 100%)'
                   }}
                 >
-                  <div className="absolute left-0 right-2 top-1/2 h-[460px] -translate-y-1/2">
-                    <AnimatePresence initial={false}>
-                      {visibleLyricItems.map(({ line, index, offset }) => {
-                        const isActive = index === activeLyricIndex;
-                        const distance = Math.abs(offset);
-                        const isPassed = offset < 0;
-                        const isTypewriter = lyricMotionStyle === 'typewriter';
-                        const isBeam = lyricMotionStyle === 'beam';
-                        const isDialogue = lyricMotionStyle === 'dialogue';
-                        const isPoster = lyricMotionStyle === 'poster';
-                        const isTilt = lyricMotionStyle === 'tilt';
-                        const isRipple = lyricMotionStyle === 'ripple';
-                        const isFloat = lyricMotionStyle === 'float';
-                        const isStagger = lyricMotionStyle === 'stagger';
-                        const isSolo = lyricMotionStyle === 'solo';
-                        const isChorus = lyricMotionStyle === 'chorus';
-                        const dialogueSide = index % 2 === 0 ? 'left' : 'right';
-                        let rowGap = 68;
-                        if (lyricMotionStyle === 'focus') rowGap = 76;
-                        else if (lyricMotionStyle === 'cascade') rowGap = 64;
-                        else if (isTypewriter) rowGap = 72;
-                        else if (isBeam) rowGap = 70;
-                        else if (isDialogue) rowGap = 82;
-                        else if (isPoster) rowGap = 88;
-                        else if (isTilt) rowGap = 72;
-                        else if (isRipple) rowGap = 76;
-                        else if (isFloat) rowGap = 78;
-                        else if (isStagger) rowGap = 70;
-                        else if (isSolo) rowGap = 88;
-                        else if (isChorus) rowGap = 72;
+                  <div className="flex min-h-full flex-col justify-center gap-5 py-[42vh]">
+                    {song.lyrics.map((line, index) => {
+                      const isActive = index === activeLyricIndex;
+                      const isFocused = index === visualFocusIndex;
+                      const distance = Math.abs(index - visualFocusIndex);
+                      const isPassed = index < visualFocusIndex;
+                      const motionProps = getLyricLineMotion({
+                        style: lyricRenderStyle,
+                        index,
+                        isFocused,
+                        isActive,
+                        isPassed,
+                        distance,
+                        lineProgress: isActive ? activeLyricProgress : 0,
+                        text: line.text,
+                      });
+                      const {
+                        scale,
+                        opacity,
+                        blur,
+                        x,
+                        y,
+                        displayText,
+                        rowVariant,
+                        dialogueSide,
+                        color,
+                        textShadow,
+                      } = motionProps;
+                      const filterValue = `blur(${blur}px)`;
 
-                        const y = offset * rowGap;
-                        let x = 0;
-                        if (lyricMotionStyle === 'cascade' && !isActive) x = (offset % 2 === 0 ? 22 : -12) + offset * 4;
-                        else if (isBeam && isActive) x = 8;
-                        else if (isDialogue) x = dialogueSide === 'right' ? (isActive ? 74 : 92) : (isActive ? 4 : -10);
-                        else if (isPoster) x = isActive ? 0 : offset * 10;
-                        else if (isTilt) x = offset * 18;
-                        else if (isRipple && isActive) x = 4;
-                        else if (isFloat) x = isActive ? 0 : Math.sin(index * 1.7) * 18 + offset * 2;
-                        else if (isStagger) x = isActive ? 0 : (offset % 2 === 0 ? 34 : -28) + offset * 8;
-                        else if (isSolo) x = isActive ? 0 : offset * 5;
-                        else if (isChorus) x = isActive ? 0 : (offset % 2 === 0 ? 28 : -24) + offset * 5;
+                      const rowClassName =
+                        rowVariant === "dialogue"
+                          ? `relative block w-fit max-w-[82%] cursor-pointer select-none rounded-2xl border px-4 py-3 text-left font-sans text-[clamp(15px,2vw,18px)] font-extrabold leading-snug tracking-tight backdrop-blur-xl ${
+                              dialogueSide === "right"
+                                ? "ml-auto rounded-br-md"
+                                : "mr-auto rounded-bl-md"
+                            }`
+                          : "relative block w-full cursor-pointer select-none rounded-2xl px-2 py-3 text-left font-sans text-[clamp(17px,2.45vw,22px)] font-extrabold leading-snug tracking-tight";
 
-                        let rotate = 0;
-                        if (lyricMotionStyle === 'cascade' && !isActive) rotate = Math.max(-5, Math.min(5, offset * -1.2));
-                        else if (isPoster && !isActive) rotate = Math.max(-2.5, Math.min(2.5, offset * 0.7));
-                        else if (isTilt) rotate = Math.max(-7, Math.min(7, offset * -2.2 + (isActive ? -2 : 0)));
-                        else if (isFloat && !isActive) rotate = Math.sin(index * 1.2) * 1.8;
-                        else if (isStagger) rotate = Math.max(-8, Math.min(8, offset * -2.8 + (offset % 2 === 0 ? 1.2 : -1.2)));
-                        else if (isChorus && !isActive) rotate = Math.max(-4, Math.min(4, offset * 1.5));
-
-                        let scale = 1;
-                        if (isActive) {
-                          if (lyricMotionStyle === 'focus') scale = 1.08;
-                          else if (lyricMotionStyle === 'cascade') scale = 1.03;
-                          else if (isTypewriter || isDialogue) scale = 1.02;
-                          else if (isBeam || isStagger) scale = 1.04;
-                          else if (isPoster) scale = 1.12;
-                          else if (isSolo) scale = 1.12;
-                          else if (isTilt || isFloat) scale = 1.05;
-                          else if (isChorus) scale = 1.05;
-                          else if (isRipple) scale = 1.06;
-                        } else {
-                          const minScale = lyricMotionStyle === 'focus'
-                            ? 0.78
-                            : isPoster || isStagger
-                              ? 0.76
-                              : isSolo
-                                ? 0.72
-                              : isFloat
-                                ? 0.82
-                                : isChorus
-                                  ? 0.8
-                                : 0.86;
-                          let relaxedScale = 0.96 - distance * 0.035;
-                          if (lyricMotionStyle === 'cascade') relaxedScale = 0.98 - distance * 0.052;
-                          else if (isTypewriter) relaxedScale = 0.95 - distance * 0.04;
-                          else if (isDialogue) relaxedScale = 0.92 - distance * 0.03;
-                          else if (isPoster) relaxedScale = 0.88 - distance * 0.05;
-                          else if (isTilt) relaxedScale = 0.96 - distance * 0.045;
-                          else if (isRipple) relaxedScale = 0.92 - distance * 0.04;
-                          else if (isFloat) relaxedScale = 0.94 - distance * 0.052;
-                          else if (isStagger) relaxedScale = 0.9 - distance * 0.058;
-                          else if (isSolo) relaxedScale = 0.86 - distance * 0.06;
-                          else if (isChorus) relaxedScale = 0.93 - distance * 0.045;
-                          scale = Math.max(minScale, relaxedScale);
-                        }
-                        const opacity = isActive
-                          ? 1
-                          : isPassed
-                            ? Math.max(0.1, (lyricMotionStyle === 'focus' || isPoster || isStagger || isSolo ? 0.36 : 0.46) - distance * 0.1)
-                            : Math.max(0.16, (lyricMotionStyle === 'focus' || isPoster || isFloat || isSolo ? 0.7 : 0.62) - distance * 0.11);
-                        const blur = isActive ? 0 : Math.min(lyricMotionStyle === 'focus' || isPoster || isFloat || isSolo ? 3.4 : isChorus ? 2.6 : 2.2, 0.35 + distance * 0.38);
-                        const rowClassName = lyricMotionStyle === 'cascade'
-                          ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight'
-                          : lyricMotionStyle === 'focus'
-                            ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[24px] font-extrabold leading-relaxed tracking-tight'
-                            : isTypewriter
-                              ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight'
-                              : isBeam
-                                ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[23px] font-extrabold leading-relaxed tracking-tight'
-                                : isDialogue
-                                  ? `absolute top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none rounded-3xl border px-4 py-3 text-left font-sans text-[18px] font-extrabold leading-relaxed tracking-tight backdrop-blur-xl ${dialogueSide === 'right' ? 'right-0 max-w-[82%] rounded-br-md' : 'left-0 max-w-[82%] rounded-bl-md'}`
-                                  : isPoster
-                                    ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-3 pl-6 text-left font-sans text-[26px] font-black leading-tight tracking-tight'
-                                    : isTilt
-                                      ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[24px] font-black leading-relaxed tracking-tight'
-                                      : isRipple
-                                        ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[23px] font-extrabold leading-relaxed tracking-tight'
-                                        : isFloat
-                                          ? 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[24px] font-extrabold leading-relaxed tracking-tight'
-                                          : isStagger
-                                            ? 'absolute left-0 right-0 top-1/2 block origin-center -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-black leading-relaxed tracking-tight'
-                                            : isSolo
-                                              ? 'absolute left-0 right-0 top-1/2 block origin-center -translate-y-1/2 cursor-pointer select-none py-3 text-center font-sans text-[28px] font-black leading-tight tracking-tight'
-                                              : isChorus
-                                                ? 'absolute left-0 right-0 top-1/2 block origin-center -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[21px] font-extrabold leading-relaxed tracking-tight'
-                            : 'absolute left-0 right-0 top-1/2 block origin-left -translate-y-1/2 cursor-pointer select-none py-2 text-left font-sans text-[22px] font-extrabold leading-relaxed tracking-tight';
-                        const activeTextColor = lyricMotionStyle === 'focus'
-                          ? 'rgba(255,255,255,0.3)'
-                          : isTypewriter
-                            ? 'rgba(255,255,255,0.2)'
-                            : isBeam
-                              ? 'rgba(255,255,255,0.34)'
-                              : isDialogue
-                                ? 'rgba(255,255,255,0.92)'
-                              : isPoster
-                                ? 'rgba(255,255,255,0.26)'
-                                : isTilt
-                                  ? 'rgba(255,255,255,0.34)'
-                                  : isRipple
-                                    ? 'rgba(255,255,255,0.38)'
-                                    : isFloat
-                                      ? 'rgba(255,255,255,0.32)'
-                                      : isStagger
-                                        ? 'rgba(255,255,255,0.28)'
-                                        : isSolo
-                                          ? 'rgba(255,255,255,0.24)'
-                                          : isChorus
-                                            ? 'rgba(255,255,255,0.36)'
-                          : 'rgba(255,255,255,0.42)';
-                        const activeRevealText = isTypewriter ? getTypewriterText(line.text) : line.text;
-
-                        return (
-                          <motion.button
-                            type="button"
-                            key={`${index}-${line.time}-${line.text}`}
-                            onClick={() => onSeek(line.time)}
-                            initial={{ opacity: 0, x, y: y + 22, rotate, scale: scale * 0.98, filter: `blur(${blur + 1}px)` }}
-                            animate={{ opacity, x, y, rotate, scale, filter: `blur(${blur}px)` }}
-                            exit={{ opacity: 0, x, y: y - 18, rotate, scale: scale * 0.98, filter: 'blur(3px)' }}
-                            transition={{
-                              y: { type: 'spring', stiffness: 148, damping: 30, mass: 0.82 },
-                              x: { type: 'spring', stiffness: 136, damping: 28, mass: 0.8 },
-                              rotate: { type: 'spring', stiffness: 150, damping: 28, mass: 0.72 },
-                              scale: { type: 'spring', stiffness: 170, damping: 30, mass: 0.78 },
-                              opacity: { duration: 0.28, ease: [0.32, 0.72, 0, 1] },
-                              filter: { duration: 0.32, ease: [0.32, 0.72, 0, 1] },
-                            }}
-                            className={rowClassName}
-                            style={{
-                              color: isActive ? activeTextColor : 'rgba(255,255,255,0.64)',
-                              transformOrigin: isTilt ? '0% 55%' : isStagger || isSolo || isChorus ? '50% 55%' : undefined,
-                              background: isDialogue
-                                ? isActive
-                                  ? dialogueSide === 'right'
-                                    ? 'linear-gradient(135deg, rgba(255,255,255,0.18), rgba(255,255,255,0.08))'
-                                    : 'linear-gradient(135deg, rgba(255,255,255,0.12), rgba(255,255,255,0.06))'
-                                  : 'rgba(255,255,255,0.045)'
+                      return (
+                        <motion.button
+                          type="button"
+                          key={`${index}-${line.time}-${line.text}`}
+                          ref={(el) => {
+                            lyricLineRefs.current[index] = el;
+                          }}
+                          title={`点击跳转到 ${formatTime(Math.max(0, line.time - lyricOffsetSeconds))}`}
+                          onClick={() => {
+                            setManualAnchor(null);
+                            programmaticScrollRef.current = false;
+                            setVisualFocusIndex(index);
+                            seekToLyricTime(line.time);
+                          }}
+                          initial={{
+                            opacity: 0,
+                            y: y + 12,
+                            x: x * 0.6,
+                            scale: scale * 0.98,
+                            filter: `blur(${blur + 1}px)`,
+                          }}
+                          animate={{
+                            opacity,
+                            y,
+                            x,
+                            scale,
+                            filter: filterValue,
+                          }}
+                          transition={{
+                            y: { type: "spring", stiffness: 148, damping: 30, mass: 0.82 },
+                            x: { type: "spring", stiffness: 136, damping: 28, mass: 0.8 },
+                            scale: { type: "spring", stiffness: 170, damping: 30, mass: 0.78 },
+                            opacity: { duration: 0.28, ease: [0.32, 0.72, 0, 1] },
+                            filter: { duration: 0.32, ease: [0.32, 0.72, 0, 1] },
+                          }}
+                          className={rowClassName}
+                          style={{
+                            color,
+                            wordBreak: "break-word",
+                            willChange: "filter, opacity, transform",
+                            background:
+                              rowVariant === "dialogue"
+                                ? isFocused
+                                  ? dialogueSide === "right"
+                                    ? "linear-gradient(135deg, rgba(255,255,255,0.18), rgba(255,255,255,0.08))"
+                                    : "linear-gradient(135deg, rgba(255,255,255,0.12), rgba(255,255,255,0.06))"
+                                  : "rgba(255,255,255,0.045)"
                                 : undefined,
-                              borderColor: isDialogue
-                                ? isActive ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.08)'
+                            borderColor:
+                              rowVariant === "dialogue"
+                                ? isFocused
+                                  ? "rgba(255,255,255,0.22)"
+                                  : "rgba(255,255,255,0.08)"
                                 : undefined,
-                              textShadow: isActive
-                                ? lyricMotionStyle === 'focus'
-                                  ? '0 0 34px rgba(255,255,255,0.3), 0 16px 48px rgba(255,255,255,0.16), 0 1px 18px rgba(0,0,0,0.42)'
-                                  : isBeam
-                                    ? '0 0 22px rgba(255,255,255,0.28), 0 10px 32px rgba(255,255,255,0.16), 0 1px 18px rgba(0,0,0,0.42)'
-                                    : isDialogue
-                                      ? '0 10px 28px rgba(0,0,0,0.42)'
-                                    : isPoster
-                                      ? '0 18px 50px rgba(255,255,255,0.14), 0 2px 18px rgba(0,0,0,0.5)'
-                                      : isTilt
-                                        ? '10px 12px 0 rgba(255,255,255,0.06), 0 14px 42px rgba(0,0,0,0.5)'
-                                        : isRipple
-                                          ? '0 0 28px rgba(255,255,255,0.24), 0 14px 42px rgba(0,0,0,0.46)'
-                                          : isFloat
-                                            ? '0 0 34px rgba(255,255,255,0.24), 0 18px 50px rgba(255,255,255,0.12), 0 1px 18px rgba(0,0,0,0.44)'
-                                            : isStagger
-                                              ? '0 18px 0 rgba(255,255,255,0.05), 0 18px 46px rgba(0,0,0,0.52)'
-                                              : isSolo
-                                                ? '0 0 44px rgba(255,255,255,0.3), 0 24px 70px rgba(255,255,255,0.12), 0 2px 22px rgba(0,0,0,0.55)'
-                                                : isChorus
-                                                  ? '-8px 0 0 rgba(255,255,255,0.08), 8px 0 0 rgba(255,255,255,0.06), 0 16px 42px rgba(0,0,0,0.5)'
-                                  : '0 10px 36px rgba(255,255,255,0.18), 0 1px 18px rgba(0,0,0,0.42)'
-                                : '0 1px 14px rgba(0,0,0,0.28)',
-                            }}
-                          >
-                            <span className="relative inline-block">
-                              {isTilt && (
-                                <>
-                                  <span
-                                    aria-hidden
-                                    className="absolute inset-0 translate-x-2 translate-y-1 text-white/12"
-                                  >
-                                    {line.text}
-                                  </span>
-                                  {isActive && (
-                                    <motion.span
-                                      aria-hidden
-                                      className="absolute inset-0 -translate-x-2 text-white/20"
-                                      animate={{ x: [-2, 2, -2] }}
-                                      transition={{ duration: 2.1, repeat: Infinity, ease: 'easeInOut' }}
-                                    >
-                                      {line.text}
-                                    </motion.span>
-                                  )}
-                                </>
-                              )}
-                              {isDialogue && (
-                                <span
-                                  aria-hidden
-                                  className={`absolute top-1/2 h-6 w-6 -translate-y-1/2 rounded-full border border-white/15 ${
-                                    dialogueSide === 'right' ? '-right-9' : '-left-9'
-                                  } ${isActive ? 'bg-white/80 shadow-[0_0_24px_rgba(255,255,255,0.35)]' : 'bg-white/10'}`}
-                                />
-                              )}
-                              {isPoster && (
-                                <>
-                                  <span
-                                    aria-hidden
-                                    className={`absolute -left-6 top-1 bottom-1 w-px rounded-full ${
-                                      isActive ? 'bg-white/75 shadow-[0_0_18px_rgba(255,255,255,0.4)]' : 'bg-white/18'
-                                    }`}
-                                  />
-                                  <span className="absolute -left-6 -top-4 font-mono text-[10px] font-bold text-white/35">
-                                    {String(index + 1).padStart(2, '0')}
-                                  </span>
-                                </>
-                              )}
-                              {lyricMotionStyle === 'cascade' && (
-                                <span
-                                  aria-hidden
-                                  className={`absolute -left-5 top-1/2 h-2 w-2 -translate-y-1/2 rounded-full transition-colors ${
-                                    isActive ? 'bg-white/85 shadow-[0_0_18px_rgba(255,255,255,0.45)]' : 'bg-white/18'
-                                  }`}
-                                />
-                              )}
-                              {lyricMotionStyle === 'focus' && isActive && (
-                                <motion.span
-                                  aria-hidden
-                                  className="absolute -inset-x-7 -inset-y-3 rounded-full bg-white/10 blur-xl"
-                                  animate={{ opacity: [0.34, 0.72, 0.34], scale: [0.94, 1.08, 0.94] }}
-                                  transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
-                                />
-                              )}
-                              {isBeam && isActive && (
-                                <motion.span
-                                  aria-hidden
-                                  className="absolute -inset-x-8 top-1/2 h-12 -translate-y-1/2 rounded-full bg-gradient-to-r from-transparent via-white/18 to-transparent blur-md"
-                                  initial={{ x: -120, opacity: 0 }}
-                                  animate={{ x: 120, opacity: [0, 0.92, 0] }}
-                                  transition={{ duration: 1.8, repeat: Infinity, ease: 'easeInOut' }}
-                                />
-                              )}
-                              {isPoster && isActive && (
-                                <motion.span
-                                  aria-hidden
-                                  className="absolute -inset-x-5 -inset-y-4 rounded-sm bg-gradient-to-r from-white/10 via-transparent to-transparent"
-                                  initial={{ opacity: 0, scaleX: 0.82 }}
-                                  animate={{ opacity: [0.18, 0.44, 0.18], scaleX: [0.92, 1.04, 0.92] }}
-                                  transition={{ duration: 3.2, repeat: Infinity, ease: 'easeInOut' }}
-                                />
-                              )}
-                              {isRipple && isActive && (
-                                <>
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute left-1/2 top-1/2 h-10 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/35"
-                                    initial={{ scale: 0.3, opacity: 0.68 }}
-                                    animate={{ scale: 5.2, opacity: 0 }}
-                                    transition={{ duration: 1.35, repeat: Infinity, ease: 'easeOut' }}
-                                  />
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/18"
-                                    initial={{ scale: 0.2, opacity: 0.42 }}
-                                    animate={{ scale: 4.4, opacity: 0 }}
-                                    transition={{ duration: 1.35, repeat: Infinity, ease: 'easeOut', delay: 0.42 }}
-                                  />
-                                </>
-                              )}
-                              {isFloat && isActive && (
-                                <motion.span
-                                  aria-hidden
-                                  className="absolute -inset-x-10 -inset-y-5 rounded-full bg-gradient-to-r from-transparent via-white/14 to-transparent blur-xl"
-                                  animate={{ opacity: [0.22, 0.58, 0.22], scale: [0.94, 1.1, 0.94], y: [4, -6, 4] }}
-                                  transition={{ duration: 3.1, repeat: Infinity, ease: 'easeInOut' }}
-                                />
-                              )}
-                              {isStagger && isActive && (
-                                <>
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute -left-7 top-1 h-2 w-8 rounded-full bg-white/24 blur-[1px]"
-                                    animate={{ opacity: [0.16, 0.72, 0.16], x: [-6, 3, -6] }}
-                                    transition={{ duration: 1.9, repeat: Infinity, ease: 'easeInOut' }}
-                                  />
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute -right-8 bottom-1 h-2 w-10 rounded-full bg-white/18 blur-[1px]"
-                                    animate={{ opacity: [0.12, 0.62, 0.12], x: [5, -4, 5] }}
-                                    transition={{ duration: 2.2, repeat: Infinity, ease: 'easeInOut' }}
-                                  />
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute -right-3 -top-3 h-2 w-2 rounded-full bg-white/70 shadow-[0_0_16px_rgba(255,255,255,0.45)]"
-                                    animate={{ opacity: [0.28, 1, 0.28], scale: [0.7, 1.25, 0.7] }}
-                                    transition={{ duration: 1.55, repeat: Infinity, ease: 'easeInOut' }}
-                                  />
-                                </>
-                              )}
-                              {isSolo && isActive && (
-                                <>
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute -inset-x-16 -inset-y-8 rounded-full blur-2xl"
-                                    style={{
-                                      background: 'radial-gradient(circle at 50% 50%, rgba(255,255,255,0.22), rgba(255,255,255,0.06) 42%, transparent 72%)',
-                                    }}
-                                    animate={{ opacity: [0.26, 0.7, 0.26], scale: [0.9, 1.08, 0.9] }}
-                                    transition={{ duration: 2.8, repeat: Infinity, ease: 'easeInOut' }}
-                                  />
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute -bottom-4 left-1/2 h-px w-36 -translate-x-1/2 bg-gradient-to-r from-transparent via-white/55 to-transparent"
-                                    animate={{ opacity: [0.26, 0.78, 0.26], scaleX: [0.78, 1.12, 0.78] }}
-                                    transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
-                                  />
-                                </>
-                              )}
-                              {isChorus && isActive && (
-                                <>
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute inset-0 -translate-x-5 text-white/16"
-                                    animate={{ x: [-20, -13, -20], opacity: [0.12, 0.28, 0.12] }}
-                                    transition={{ duration: 2.05, repeat: Infinity, ease: 'easeInOut' }}
-                                  >
-                                    {line.text}
-                                  </motion.span>
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute inset-0 translate-x-5 text-white/12"
-                                    animate={{ x: [20, 12, 20], opacity: [0.1, 0.24, 0.1] }}
-                                    transition={{ duration: 2.35, repeat: Infinity, ease: 'easeInOut' }}
-                                  >
-                                    {line.text}
-                                  </motion.span>
-                                </>
-                              )}
-                              {line.text}
-                              {isActive && (
-                                <>
-                                  <motion.span
-                                    aria-hidden
-                                    className="absolute inset-0 overflow-hidden text-white"
-                                    initial={{ clipPath: isTypewriter ? 'inset(0 0 0 0)' : 'inset(0 100% 0 0)', opacity: 0 }}
-                                    animate={{
-                                      clipPath: isTypewriter
-                                        ? 'inset(0 0 0 0)'
-                                        : `inset(0 ${Math.max(0, 100 - activeLyricProgress * 100)}% 0 0)`,
-                                      opacity: 1,
-                                    }}
-                                    transition={{ duration: 0.18, ease: 'easeOut' }}
-                                  >
-                                    {activeRevealText}
-                                    {isTypewriter && (
-                                      <motion.span
-                                        aria-hidden
-                                        className="ml-1 inline-block h-[1.05em] w-[2px] translate-y-[0.16em] rounded-full bg-white/85"
-                                        animate={{ opacity: [0.2, 1, 0.2] }}
-                                        transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut' }}
-                                      />
-                                    )}
-                                  </motion.span>
-                                  <motion.span
-                                    aria-hidden
-                                    className={`absolute -bottom-1 left-0 h-[3px] w-full origin-left rounded-full ${
-                                      isBeam
-                                        ? 'bg-gradient-to-r from-white/20 via-white to-white/20 shadow-[0_0_18px_rgba(255,255,255,0.32)]'
-                                        : isRipple
-                                          ? 'bg-white/90 shadow-[0_0_22px_rgba(255,255,255,0.5)]'
-                                          : isFloat
-                                          ? 'bg-gradient-to-r from-white/30 via-white/90 to-transparent shadow-[0_0_24px_rgba(255,255,255,0.28)]'
-                                          : isStagger
-                                            ? 'bg-white/90 shadow-[0_0_18px_rgba(255,255,255,0.38)]'
-                                            : isSolo
-                                              ? 'bg-gradient-to-r from-transparent via-white to-transparent shadow-[0_0_24px_rgba(255,255,255,0.36)]'
-                                              : isChorus
-                                                ? 'bg-gradient-to-r from-white/30 via-white/90 to-white/30 shadow-[0_0_20px_rgba(255,255,255,0.32)]'
-                                        : 'bg-white/80'
-                                    }`}
-                                    initial={{ scaleX: 0, opacity: 0 }}
-                                    animate={{ scaleX: activeLyricProgress, opacity: 0.86 }}
-                                    transition={{ duration: 0.18, ease: 'easeOut' }}
-                                  />
-                                </>
-                              )}
+                            textShadow,
+                          }}
+                        >
+                          <span className="relative inline-block max-w-full align-top" style={{ wordBreak: "break-word" }}>
+                            <span className="relative z-10">{displayText}</span>
+                          </span>
+                          {showTranslation && line.tr && (
+                            <span
+                              className="mt-1.5 block max-w-full font-sans text-[15px] font-semibold leading-snug tracking-tight"
+                              style={{
+                                color: isFocused || isActive ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.42)",
+                                textShadow: isActive ? "0 1px 14px rgba(0,0,0,0.3)" : "0 1px 12px rgba(0,0,0,0.24)",
+                              }}
+                            >
+                              {line.tr}
                             </span>
-                          </motion.button>
-                        );
-                      })}
-                    </AnimatePresence>
+                          )}
+                        </motion.button>
+                      );
+                    })}
                   </div>
                 </div>
+                )}
+                {/* Lyrics context tools — only offset + follow (hover). Volume is on left card. */}
+                <div
+                  ref={lyricQuickRef}
+                  onPointerEnter={handleLyricsPanelEnter}
+                  className={`absolute bottom-5 left-5 right-5 z-50 flex flex-wrap items-center justify-end gap-2 no-drag transition-opacity duration-200 ${
+                    lyricsChromeOpen
+                      ? "opacity-100 pointer-events-auto"
+                      : "opacity-0 pointer-events-none"
+                  }`}
+                  style={{ WebkitAppRegion: "no-drag", appRegion: "no-drag" } as React.CSSProperties}
+                >
+                  {manualAnchor != null && (
+                    <button
+                      type="button"
+                      onClick={resumeAutoFollow}
+                      title="立即回到当前播放歌词（停止滚动约 2.5 秒也会自动恢复）"
+                      className="flex items-center gap-1.5 bg-white/18 text-white backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 shadow-md text-[11px] font-bold transition-colors hover:bg-white/24 cursor-pointer"
+                    >
+                      <LocateFixed size={13} />
+                      <span>跟随</span>
+                    </button>
+                  )}
 
-                {/* Drawer Footer Controls — hidden until hovering the lyrics panel */}
-                <div className="absolute bottom-6 left-6 right-6 flex items-center justify-end gap-3 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                  {/* Playback speed slider button */}
-                  <div className="flex items-center gap-3 bg-white/8 backdrop-blur-md px-3.5 py-1.5 rounded-full border border-white/5 shadow-md text-[11px] font-bold text-white/90">
-                    <button 
-                      onClick={decreaseSpeed}
+                  <div className="flex items-center gap-2.5 bg-white/8 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/5 shadow-md text-[11px] font-bold text-white/90">
+                    <button
+                      type="button"
+                      onClick={decreaseLyricOffset}
+                      title="歌词延后 0.1 秒"
                       className="p-1 text-white/50 hover:text-white cursor-pointer"
                     >
                       <Minus size={12} className="stroke-[2.5px]" />
                     </button>
-                    <span className="min-w-[70px] text-center font-mono">
-                      Speed {speed.toFixed(2)}x
+                    <span className="min-w-[64px] text-center font-mono">
+                      {lyricOffsetSeconds >= 0 ? "+" : ""}
+                      {lyricOffsetSeconds.toFixed(1)}s
                     </span>
-                    <button 
-                      onClick={increaseSpeed}
+                    <button
+                      type="button"
+                      onClick={increaseLyricOffset}
+                      title="歌词提前 0.1 秒"
                       className="p-1 text-white/50 hover:text-white cursor-pointer"
                     >
                       <Plus size={12} className="stroke-[2.5px]" />
                     </button>
-                  </div>
-
-                  {/* Volume slider proxy inside drawer */}
-                  <div className="flex items-center gap-2 bg-white/8 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/5 shadow-md">
-                    <Volume1 size={13} className="text-white/50" />
-                    <div 
-                      onClick={handleVolumeClick}
-                      className="relative w-16 h-3 flex items-center cursor-pointer group"
-                    >
-                      <div className="absolute left-0 right-0 h-[3px] bg-white/20 rounded-full" />
-                      <div 
-                        className="absolute left-0 h-[3px] bg-white/80 rounded-full"
-                        style={{ width: `${volume * 100}%` }}
-                      />
-                    </div>
-                    <Volume2 size={13} className="text-white/50" />
                   </div>
                 </div>
               </motion.div>

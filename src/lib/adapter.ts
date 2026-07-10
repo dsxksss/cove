@@ -11,6 +11,39 @@ import { extractAccent, rgbToCss } from "./color";
  * themeColor is derived from the cover's dominant color.
  */
 
+/**
+ * Normalize duration to **seconds** for the player UI / progress bar.
+ *
+ * - `audioOrStoreSec`: HTMLMediaElement.duration / store.duration (seconds)
+ * - `songDurationField`: catalog `Song.duration` (milliseconds from APIs)
+ *
+ * Heuristic: values above 10_000 are treated as milliseconds (no song is
+ * 10000+ seconds; many catalogs store ms like 245000).
+ */
+export function toDurationSeconds(
+  audioOrStoreSec?: number | null,
+  songDurationField?: number | null
+): number {
+  const fromAudio = Number(audioOrStoreSec);
+  if (Number.isFinite(fromAudio) && fromAudio > 0) {
+    if (fromAudio > 10_000) return Math.max(0, Math.round(fromAudio / 1000));
+    return Math.max(0, fromAudio);
+  }
+  const raw = Number(songDurationField);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  // Catalog fields are ms; tiny values (<~2min in "ms" form) are treated as seconds.
+  if (raw > 1000) return Math.max(0, Math.round(raw / 1000));
+  return Math.max(0, Math.round(raw));
+}
+
+/** Catalog duration → milliseconds (for lyric matching APIs). */
+export function toDurationMs(songDurationField?: number | null): number {
+  const raw = Number(songDurationField);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  if (raw > 1000) return Math.round(raw);
+  return Math.round(raw * 1000);
+}
+
 export function toPlayerSong(
   song: Song,
   cover: string | undefined,
@@ -28,9 +61,9 @@ export function toPlayerSong(
     artist: song.artist,
     coverUrl: cover ?? "",
     backgroundUrl: bg,
-    duration: durationSec || song.duration ? Math.round((durationSec || (song.duration ?? 0) / 1000)) : 0,
+    duration: toDurationSeconds(durationSec, song.duration),
     badge: "Lossless",
-    lyrics: lyrics.map((l) => ({ time: l.time, text: l.tr ? `${l.text}\n${l.tr}` : l.text })),
+    lyrics: lyrics.map((l) => ({ time: l.time, text: l.text, tr: l.tr })),
     themeColor: theme,
     textColor: "text-white",
   };

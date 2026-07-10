@@ -33,8 +33,8 @@
   [role="button"],
   .no-drag,
   .cursor-pointer {
-    -webkit-app-region: no-drag;
-    app-region: no-drag;
+    -webkit-app-region: no-drag !important;
+    app-region: no-drag !important;
   }
 }
 
@@ -47,6 +47,46 @@
   scrollbar-width: none;
 }
 
+/* Refined glassy scrollbar — thin, translucent, rounded. Fades in on hover.
+   Applies app-wide; opt out with .scrollbar-none. */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: padding-box; /* keeps the rounded inset look */
+  transition: background 0.18s ease;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.34);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:active {
+  background: rgba(255, 255, 255, 0.46);
+  background-clip: padding-box;
+}
+/* the two end buttons (top/bottom) — hide, we never want them */
+*::-webkit-scrollbar-button {
+  display: none;
+  height: 0;
+  width: 0;
+}
+/* corner where two scrollbars meet */
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+/* Firefox (fallback if ever rendered there) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
 /* Background radial gradient mask for extra lighting effects */
 .bg-radial-gradient {
   background-image: radial-gradient(var(--tw-gradient-stops));
@@ -56,6 +96,439 @@
   isolation: isolate;
   background: transparent;
   border-radius: 20px;
+  --app-glass-radius: 20px;
+  --app-glass-line: rgba(255, 255, 255, 0.13);
+  --app-glass-line-strong: rgba(255, 255, 255, 0.24);
+  --app-glass-fill: rgba(8, 11, 19, 0.62);
+  --app-glass-fill-soft: rgba(255, 255, 255, 0.065);
+  --app-glass-shadow: 0 28px 72px -24px rgba(0, 0, 0, 0.72);
+}
+
+/* ── App-wide liquid glass material ───────────────────────────
+   Large pages, inset cards and floating controls deliberately use different
+   densities of the same material. This keeps the wallpaper/cover visible
+   through every screen while preserving enough contrast for long lists. */
+.app-liquid-page,
+.app-liquid-popover,
+.app-liquid-card,
+.app-liquid-control,
+.app-liquid-row {
+  isolation: isolate;
+  transform: translateZ(0);
+  background-clip: padding-box;
+}
+
+.app-liquid-card:not(.absolute):not(.fixed),
+.app-liquid-popover:not(.absolute):not(.fixed),
+.app-liquid-control:not(.absolute):not(.fixed),
+.app-liquid-row:not(.absolute):not(.fixed) {
+  position: relative;
+}
+
+.app-liquid-page {
+  overflow: hidden;
+  border: 1px solid var(--app-glass-line);
+  border-radius: var(--app-glass-radius);
+  background:
+    radial-gradient(120% 90% at 5% -12%, rgba(255, 255, 255, 0.13), transparent 43%),
+    radial-gradient(90% 78% at 106% 108%, rgba(112, 165, 255, 0.10), transparent 52%),
+    linear-gradient(145deg, rgba(255, 255, 255, 0.075), rgba(4, 7, 14, 0.70) 68%),
+    var(--app-glass-fill);
+  backdrop-filter: blur(36px) saturate(205%) brightness(1.04);
+  -webkit-backdrop-filter: blur(36px) saturate(205%) brightness(1.04);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    inset 1px 0 0 rgba(255, 255, 255, 0.10),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25),
+    var(--app-glass-shadow);
+}
+
+.app-liquid-page::before,
+.app-liquid-popover::before,
+.app-liquid-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background:
+    linear-gradient(112deg, rgba(255, 255, 255, 0.16), transparent 22%, transparent 76%, rgba(255, 255, 255, 0.045)),
+    radial-gradient(70% 28% at 28% 0%, rgba(255, 255, 255, 0.18), transparent 72%);
+  opacity: 0.72;
+}
+
+.app-liquid-bar {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025));
+  border-color: rgba(255, 255, 255, 0.10) !important;
+  backdrop-filter: blur(24px) saturate(190%);
+  -webkit-backdrop-filter: blur(24px) saturate(190%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10);
+}
+
+.app-liquid-card {
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.105);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.025) 55%),
+    rgba(7, 10, 18, 0.23);
+  backdrop-filter: blur(22px) saturate(185%) brightness(1.03);
+  -webkit-backdrop-filter: blur(22px) saturate(185%) brightness(1.03);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.17),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.16),
+    0 18px 44px -32px rgba(0, 0, 0, 0.7);
+}
+
+.app-liquid-popover {
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background:
+    linear-gradient(150deg, rgba(255, 255, 255, 0.105), rgba(5, 8, 15, 0.78) 62%),
+    rgba(5, 8, 15, 0.76);
+  backdrop-filter: blur(30px) saturate(210%) brightness(1.04);
+  -webkit-backdrop-filter: blur(30px) saturate(210%) brightness(1.04);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.30),
+    inset 1px 0 0 rgba(255, 255, 255, 0.09),
+    0 26px 64px -20px rgba(0, 0, 0, 0.82);
+}
+
+.app-liquid-control {
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: linear-gradient(155deg, rgba(255, 255, 255, 0.105), rgba(255, 255, 255, 0.045));
+  backdrop-filter: blur(16px) saturate(190%);
+  -webkit-backdrop-filter: blur(16px) saturate(190%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 10px 24px -20px rgba(0, 0, 0, 0.75);
+}
+
+.app-liquid-control:hover {
+  border-color: rgba(255, 255, 255, 0.17);
+  background: linear-gradient(155deg, rgba(255, 255, 255, 0.17), rgba(255, 255, 255, 0.07));
+}
+
+.app-liquid-input {
+  border: 1px solid rgba(255, 255, 255, 0.11) !important;
+  background: rgba(255, 255, 255, 0.065) !important;
+  backdrop-filter: blur(14px) saturate(180%);
+  -webkit-backdrop-filter: blur(14px) saturate(180%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+  transition: border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.app-liquid-input:focus,
+.app-liquid-input:focus-within {
+  border-color: rgba(255, 255, 255, 0.28) !important;
+  background: rgba(255, 255, 255, 0.09) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 0 0 3px rgba(255, 255, 255, 0.055);
+}
+
+.app-liquid-segment {
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.045);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.app-liquid-row {
+  border: 1px solid transparent;
+}
+
+.app-liquid-row:hover {
+  border-color: rgba(255, 255, 255, 0.075);
+  background: linear-gradient(100deg, rgba(255, 255, 255, 0.095), rgba(255, 255, 255, 0.035));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.app-liquid-row.is-active {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: linear-gradient(105deg, rgba(255, 255, 255, 0.17), rgba(255, 255, 255, 0.075));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 12px 30px -24px rgba(0, 0, 0, 0.72);
+}
+
+/* Intent-based controls: keep content calm until the row/card is engaged.
+   Keyboard focus reveals the same actions; coarse pointers keep them visible. */
+@media (hover: hover) and (pointer: fine) {
+  .intent-surface .intent-controls {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(4px) scale(0.96);
+    transition:
+      opacity 0.16s ease,
+      transform 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+
+  .intent-surface .intent-hint {
+    opacity: 0.28;
+    transition: opacity 0.16s ease;
+  }
+
+  .intent-surface:is(:hover, :focus-within) .intent-controls {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(0) scale(1);
+  }
+
+  .intent-surface:is(:hover, :focus-within) .intent-hint {
+    opacity: 0.9;
+  }
+}
+
+.app-liquid-overlay {
+  background:
+    radial-gradient(70% 48% at 50% 30%, rgba(115, 148, 210, 0.10), transparent 72%),
+    rgba(2, 5, 11, 0.48);
+  backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
+}
+
+/* Right-edge hover rail. At rest it reads as a tiny refractive glass tab;
+   expansion is anchored to the edge, so it grows left over the lyric panel. */
+.app-liquid-edge-rail {
+  position: relative;
+  min-height: 218px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-right: 0;
+  border-radius: 24px 0 0 24px;
+  background:
+    radial-gradient(120% 48% at 0% 0%, rgba(255, 255, 255, 0.20), transparent 62%),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.105), rgba(5, 8, 15, 0.64));
+  backdrop-filter: blur(28px) saturate(220%) brightness(1.06);
+  -webkit-backdrop-filter: blur(28px) saturate(220%) brightness(1.06);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.34),
+    inset 1px 0 0 rgba(255, 255, 255, 0.13),
+    0 22px 56px -20px rgba(0, 0, 0, 0.82);
+  transition:
+    min-height 0.28s cubic-bezier(0.32, 0.72, 0, 1),
+    background 0.2s ease,
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.app-liquid-edge-rail--collapsed {
+  min-height: 76px;
+  border-color: transparent;
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+}
+
+.app-liquid-edge-handle {
+  position: absolute;
+  left: 5px;
+  top: 50%;
+  width: 2px;
+  height: 44px;
+  border-radius: 999px;
+  transform: translateY(-50%);
+  background: rgba(255, 255, 255, 0.58);
+  box-shadow: none;
+}
+
+.app-liquid-tab-rail {
+  overflow: visible;
+  isolation: isolate;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 19px;
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(18px) saturate(180%);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  box-shadow: none;
+}
+
+.app-liquid-tab-button:not(.is-active):hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.app-liquid-tab-active {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.16);
+  box-shadow: none;
+}
+
+.app-liquid-tab-button:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.48);
+  outline-offset: 2px;
+}
+
+.app-liquid-tab-label {
+  transform: translateX(5px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(18px) saturate(185%);
+  -webkit-backdrop-filter: blur(18px) saturate(185%);
+  box-shadow: none;
+  text-shadow: none;
+}
+
+/* Context-preserving panels live over the lyric side of the player instead of
+   replacing the whole application. Queue stays narrow; library/settings use
+   the available right workspace while the transport card remains visible. */
+.context-panel {
+  --app-glass-radius: 24px;
+  --player-radius: 24px !important;
+  top: 12px !important;
+  right: 12px !important;
+  bottom: 12px !important;
+  border-radius: 24px !important;
+  clip-path: inset(0 round 24px) !important;
+  transition:
+    backdrop-filter 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.2s ease;
+}
+
+.context-panel--workspace {
+  left: 372px !important;
+}
+
+.context-panel--library {
+  left: auto !important;
+  width: min(520px, calc(100vw - 384px));
+}
+
+.context-panel--tab-page {
+  left: 10vw !important;
+  top: 10vh !important;
+  right: auto !important;
+  bottom: auto !important;
+  width: 80vw;
+  height: 80vh;
+}
+
+.tab-page-surface {
+  width: 80vw;
+  height: 80vh;
+  max-width: none;
+  border-radius: 24px;
+}
+
+.context-panel--queue {
+  left: auto !important;
+  width: min(420px, calc(100vw - 384px));
+}
+
+.context-panel--scrolling {
+  backdrop-filter: blur(14px) saturate(170%) brightness(1.04) !important;
+  -webkit-backdrop-filter: blur(14px) saturate(170%) brightness(1.04) !important;
+}
+
+.context-panel-layer {
+  animation: context-panel-layer-in 0.44s cubic-bezier(0.23, 1, 0.32, 1) both;
+  animation-delay: calc(var(--context-layer, 0) * 46ms);
+}
+
+@keyframes context-panel-layer-in {
+  from {
+    opacity: 0;
+    transform: translateX(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Settings mirrors the player: one dark transparent shell, a quiet split
+   between control zones, and flat inset rows instead of stacked glass cards. */
+.settings-player-page {
+  --player-radius: 20px;
+  --player-inset: 10px;
+  --nested-radius: 10px;
+  border-radius: var(--player-radius);
+  background: rgba(8, 10, 14, 0.76);
+  backdrop-filter: blur(30px) saturate(180%) brightness(1.08);
+  -webkit-backdrop-filter: blur(30px) saturate(180%) brightness(1.08);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.48),
+    inset 1px 0 1px rgba(255, 255, 255, 0.16),
+    inset -1px 0 1px rgba(255, 255, 255, 0.06),
+    inset 0 -1px 1px rgba(255, 255, 255, 0.13),
+    0 0 0 1px rgba(255, 255, 255, 0.11),
+    0 26px 64px -18px rgba(0, 0, 0, 0.62);
+}
+
+.settings-player-header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent);
+}
+
+.settings-player-grid {
+  background:
+    linear-gradient(90deg, transparent calc(44% - 0.5px), rgba(255, 255, 255, 0.055) 44%, transparent calc(44% + 0.5px));
+}
+
+.settings-player-section {
+  position: relative;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  background: rgba(255, 255, 255, 0.028);
+  backdrop-filter: blur(14px) saturate(165%);
+  -webkit-backdrop-filter: blur(14px) saturate(165%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.10),
+    0 18px 36px -34px rgba(0, 0, 0, 0.8);
+}
+
+.settings-player-row {
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  background: rgba(255, 255, 255, 0.035);
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+.settings-player-row:hover {
+  border-color: rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.065);
+}
+
+.settings-player-title-orb,
+.settings-player-inline-icon {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+}
+
+.settings-player-inline-icon {
+  background: rgba(255, 255, 255, 0.045);
+}
+
+@media (max-width: 1060px) {
+  .settings-player-grid {
+    display: block;
+    overflow-y: auto;
+    background: transparent;
+  }
+
+  .settings-player-grid > div {
+    min-height: auto;
+    overflow: visible;
+    padding: 0 0 1rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-liquid-page,
+  .app-liquid-card,
+  .app-liquid-popover,
+  .app-liquid-control,
+  .app-liquid-input,
+  .app-liquid-row {
+    transition: none !important;
+  }
+
+  .context-panel-layer {
+    animation: none !important;
+  }
 }
 
 /* Player shell: liquid-glass displacement filter is applied at runtime via the
@@ -63,12 +536,19 @@
    The displacement map is size-aware + corner-shaped, so no corner spikes. */
 .player-liquid-glass {
   --player-radius: 20px;
+  --player-inset: 10px;
+  --nested-radius: calc(var(--player-radius) - var(--player-inset));
   border-radius: var(--player-radius) !important;
   background-clip: padding-box;
   clip-path: inset(0 round var(--player-radius));
   isolation: isolate;
   transform: translateZ(0);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+/* Nested surfaces (volume pill, menus) — jh3yy nested radius tip */
+.nested-radius {
+  border-radius: var(--nested-radius, 12px) !important;
 }
 
 .player-liquid-glass::before {
@@ -149,8 +629,514 @@
     0 8px 18px -12px rgba(0, 0, 0, 0.65);
 }
 
+/* ============================================================
+   expo-liquid-glass-view visual language (web approximation)
+   Mirrors: clear / tint / regular / interactive / identity
+            continuous vs circular corners
+            GlassEffectContainer morph dock
+   ============================================================ */
+
+.liquid-glass-filters {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.liquid-glass {
+  --lg-radius: 16px;
+  --lg-blur: 20px;
+  --lg-sat: 200%;
+  --lg-fill: rgba(255, 255, 255, 0.1);
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  justify-content: stretch;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  cursor: default;
+  isolation: isolate;
+  overflow: hidden;
+  border-radius: var(--lg-radius);
+  background: var(--lg-fill);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(1.06);
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(1.06);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.48),
+    inset 1px 0 0 rgba(255, 255, 255, 0.16),
+    inset -1px 0 0 rgba(255, 255, 255, 0.06),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.16),
+    0 10px 28px -14px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(255, 255, 255, 0.08);
+  transform: translateZ(0);
+  transition:
+    background 0.22s ease,
+    box-shadow 0.22s ease,
+    filter 0.22s ease;
+}
+
+/* continuous ≈ iOS continuous corner (squircle-ish soft edge) */
+.liquid-glass--corner-continuous {
+  border-radius: var(--lg-radius);
+  /* soft specular rim */
+}
+.liquid-glass--corner-continuous::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background:
+    radial-gradient(120% 80% at 20% 0%, rgba(255, 255, 255, 0.28), transparent 42%),
+    radial-gradient(90% 70% at 100% 100%, rgba(255, 255, 255, 0.08), transparent 50%);
+  mix-blend-mode: screen;
+  opacity: 0.9;
+}
+
+/* circular = perfect circle / capsule */
+.liquid-glass--corner-circular {
+  border-radius: 9999px;
+}
+
+.liquid-glass--clear {
+  --lg-fill: rgba(255, 255, 255, 0.055);
+  --lg-blur: 14px;
+  --lg-sat: 180%;
+}
+
+.liquid-glass--tint {
+  --lg-blur: 22px;
+  --lg-sat: 210%;
+}
+
+.liquid-glass--regular {
+  --lg-fill: rgba(255, 255, 255, 0.1);
+  --lg-blur: 20px;
+}
+
+.liquid-glass--interactive {
+  --lg-fill: rgba(255, 255, 255, 0.12);
+  --lg-blur: 22px;
+  --lg-sat: 220%;
+}
+
+.liquid-glass--identity {
+  --lg-fill: transparent;
+  --lg-blur: 0px;
+  --lg-sat: 100%;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+}
+
+.liquid-glass-is-interactive {
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  will-change: transform;
+}
+
+.liquid-glass-is-interactive:hover {
+  background: color-mix(in srgb, var(--lg-fill) 70%, rgba(255, 255, 255, 0.22));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.58),
+    inset 1px 0 0 rgba(255, 255, 255, 0.22),
+    inset -1px 0 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
+    0 14px 32px -12px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
+.liquid-glass-is-interactive:active {
+  background: color-mix(in srgb, var(--lg-fill) 55%, rgba(255, 255, 255, 0.28));
+}
+
+.liquid-glass-is-interactive:disabled,
+.liquid-glass:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+  transform: none !important;
+}
+
+.liquid-glass__content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+}
+
+/* GlassEffectContainer morph dock — shared liquid rail under children */
+.liquid-glass-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--lg-spacing, 12px);
+  isolation: isolate;
+}
+
+.liquid-glass-container--horizontal {
+  flex-direction: row;
+}
+
+.liquid-glass-container--vertical {
+  flex-direction: column;
+}
+
+.liquid-glass-container__morph {
+  position: absolute;
+  z-index: 0;
+  inset: -6px;
+  border-radius: 9999px;
+  pointer-events: none;
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(18px) saturate(190%) brightness(1.05);
+  -webkit-backdrop-filter: blur(18px) saturate(190%) brightness(1.05);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.14),
+    0 12px 36px -16px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(255, 255, 255, 0.06);
+  transition:
+    inset 0.28s cubic-bezier(0.32, 0.72, 0, 1),
+    opacity 0.22s ease,
+    transform 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.liquid-glass-container > .liquid-glass {
+  z-index: 1;
+  /* Nested glass sits on morph rail — slightly clearer so layers read as one material */
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Circular control orb — ComplexVideo 50×50 glass buttons */
+.liquid-glass-orb {
+  flex-shrink: 0;
+}
+
+.liquid-glass-orb--active {
+  background: rgba(255, 255, 255, 0.2) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
+    0 0 0 1px rgba(255, 255, 255, 0.2),
+    0 10px 24px -10px rgba(0, 0, 0, 0.55) !important;
+}
+
+.liquid-glass-orb .liquid-glass__content {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+/* Primary play / skip orbs — solid white (same family for transport cluster) */
+.liquid-glass-play {
+  flex-shrink: 0;
+  aspect-ratio: 1 / 1;
+  background: #fff !important;
+  color: #0b1220 !important;
+  box-shadow:
+    0 8px 20px -10px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(255, 255, 255, 0.65),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.liquid-glass-play:hover {
+  background: #f4f4f5 !important;
+}
+
+.liquid-glass-play .liquid-glass__content {
+  color: #0b1220;
+}
+
+/* Sibling controls — match volume panel: bg-white/8 + border-white/8 */
+.liquid-glass-solid {
+  flex-shrink: 0;
+  aspect-ratio: 1 / 1;
+  width: var(--lg-solid-size, 2.25rem);
+  height: var(--lg-solid-size, 2.25rem);
+  border-radius: 9999px !important;
+  /* Tailwind white/8 */
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: rgba(255, 255, 255, 0.9) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.liquid-glass-solid:hover {
+  /* slightly above volume track white/15 */
+  background: rgba(255, 255, 255, 0.14) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  color: #fff !important;
+}
+
+.liquid-glass-solid--active {
+  background: rgba(255, 255, 255, 0.16) !important;
+  border-color: rgba(255, 255, 255, 0.14) !important;
+  color: #fff !important;
+}
+
+.liquid-glass-solid svg {
+  color: inherit;
+}
+
+/* ── jh3yy-inspired micro-interactions ───────────────────────── */
+
+/* Popping progress track */
+.progress-track {
+  --progress-h: 5px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.progress-track__rail {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: var(--progress-h);
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.14);
+  transition: height 0.18s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.progress-track__fill {
+  position: absolute;
+  left: 0;
+  height: var(--progress-h);
+  border-radius: 9999px;
+  background: color-mix(
+    in srgb,
+    var(--player-theme-color, #fff) 35%,
+    rgba(255, 255, 255, 0.92)
+  );
+  transition:
+    height 0.18s cubic-bezier(0.32, 0.72, 0, 1),
+    width 0.08s linear;
+  transform-origin: left center;
+}
+
+.progress-track__thumb {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
+  border-radius: 9999px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  transform: scale(0.6);
+  transition:
+    opacity 0.15s ease,
+    transform 0.22s cubic-bezier(0.34, 1.4, 0.64, 1);
+  pointer-events: none;
+}
+
+.motion-pop .progress-track:hover,
+.motion-pop .progress-track.is-dragging {
+  --progress-h: 8px;
+}
+
+.motion-pop .progress-track:hover .progress-track__thumb,
+.motion-pop .progress-track.is-dragging .progress-track__thumb {
+  opacity: 1;
+  transform: scale(1.15);
+}
+
+.motion-pop .progress-track.is-dragging .progress-track__thumb {
+  transform: scale(1.35);
+}
+
+.motion-pop .progress-track.is-seek-pop .progress-track__rail,
+.motion-pop .progress-track.is-seek-pop .progress-track__fill {
+  animation: progress-pop 0.32s cubic-bezier(0.34, 1.45, 0.64, 1);
+}
+
+@keyframes progress-pop {
+  0% {
+    transform: scaleY(1);
+  }
+  40% {
+    transform: scaleY(1.55);
+  }
+  100% {
+    transform: scaleY(1);
+  }
+}
+
+/* List enter stagger (IO sets data-shown) */
+.list-enter {
+  --i: 0;
+  opacity: 0;
+  transform: translateY(10px) scale(0.985);
+  transition:
+    opacity 0.38s cubic-bezier(0.32, 0.72, 0, 1),
+    transform 0.42s cubic-bezier(0.32, 0.72, 0, 1);
+  transition-delay: calc(min(var(--i), 16) * 22ms);
+}
+
+.list-enter[data-shown="1"] {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.motion-off .list-enter {
+  opacity: 1;
+  transform: none;
+  transition: none;
+}
+
+/* Pointer glow shell — full motion only (spotlight + rim light) */
+.player-glow-spotlight {
+  display: none;
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  background-image: radial-gradient(
+    220px 220px at
+      calc(var(--ptr-x, -9999) * 1px)
+      calc(var(--ptr-y, -9999) * 1px),
+    hsl(var(--glow-hue, 210) 85% 72% / 0.12),
+    transparent 72%
+  );
+  background-attachment: fixed;
+  mix-blend-mode: screen;
+}
+
+.motion-full .player-glow-spotlight {
+  display: block;
+}
+
+/* Rim light follows pointer (mask keeps only the border ring) */
+.player-glow-rim {
+  display: none;
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: radial-gradient(
+    160px 160px at
+      calc(var(--ptr-x, -9999) * 1px)
+      calc(var(--ptr-y, -9999) * 1px),
+    rgba(255, 255, 255, 0.85),
+    hsl(var(--glow-hue, 210) 90% 70% / 0.35) 35%,
+    transparent 70%
+  );
+  background-attachment: fixed;
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+}
+
+.motion-full .player-glow-rim {
+  display: block;
+}
+
+/* White play button — conic glow on hover (paused when idle) */
+.liquid-glass-play {
+  position: relative;
+  overflow: hidden;
+  container-type: size;
+}
+
+.liquid-glass-play .play-glow {
+  display: none;
+  position: absolute;
+  inset: -40%;
+  aspect-ratio: 1;
+  margin: auto;
+  width: 140%;
+  height: 140%;
+  background: conic-gradient(
+    from 180deg,
+    transparent 0deg,
+    rgba(99, 102, 241, 0.55) 40deg,
+    transparent 80deg
+  );
+  animation: play-glow-spin 2.4s linear infinite paused;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.motion-full .liquid-glass-play .play-glow {
+  display: block;
+}
+
+.motion-full .liquid-glass-play:is(:hover, :focus-visible) .play-glow {
+  animation-play-state: running;
+  opacity: 0.55;
+}
+
+.liquid-glass-play > *:not(.play-glow) {
+  position: relative;
+  z-index: 1;
+}
+
+@keyframes play-glow-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Song meta enter on track change */
+.motion-pop .song-meta-enter {
+  animation: song-meta-in 0.45s cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+
+@keyframes song-meta-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .player-liquid-glass {
+  .player-liquid-glass,
+  .liquid-glass,
+  .liquid-glass-container__morph {
     transition: none !important;
+  }
+  .liquid-glass-is-interactive {
+    transform: none !important;
+  }
+  .list-enter,
+  .song-meta-enter,
+  .progress-track__fill,
+  .progress-track__rail,
+  .progress-track__thumb {
+    animation: none !important;
+    transition: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+  .player-glow-rim,
+  .player-glow-spotlight,
+  .play-glow {
+    display: none !important;
   }
 }

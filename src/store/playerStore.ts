@@ -1,16 +1,120 @@
 import { create } from "zustand";
 import type { LyricLine, RepeatMode, Song } from "../lib/types";
 import { getAudio, saveVolume } from "../lib/audio";
-import { getFavPlaylistId, getPlaylistPage, getSongJson, getSongUrl } from "../lib/api";
+import { getFavPlaylistId, getPlaylistPage, getSongJson } from "../lib/api";
+import { resolvePlayback, sameSong } from "../lib/musicSources";
 import { mergeTranslation, parseLrc, parseTranslation } from "../lib/lyric";
 import { extractAccent } from "../lib/color";
 import type { AccentColor } from "../lib/types";
+import { toDurationMs, toDurationSeconds } from "../lib/adapter";
+import {
+  loadLevel,
+  loadRepeatMode,
+  loadShuffle,
+  loadSpeed,
+  nextPlayMode,
+  playModeToFlags,
+  saveLevel,
+  saveRepeatMode,
+  saveShuffle,
+  saveSpeed,
+} from "../lib/playbackPrefs";
+import { clearPreload, preloadAudioUrl } from "../lib/preload";
+import {
+  loadLyricSourceMode,
+  resolveExternalLyrics,
+  type LyricSourceMode,
+} from "../lib/lyrics/matchLyrics";
 
 /** Page size for favorites playlist pagination (server-side). */
 const FAV_PAGE_SIZE = 100;
+const SHUFFLE_TRAIL_LIMIT = 200;
+
+/** User-facing message when a track has no playable stream (VIP / rights / region). */
+function playRestrictionMessage(song: Song, resolvedName?: string): string {
+  const title = (resolvedName || song.name || "这首歌").trim();
+  const src = song.source ?? "netease";
+  if (src === "qq") {
+    return `无法播放「${title}」：QQ 音乐音源受限，可能需要会员或暂无试听`;
+  }
+  if (src === "kugou") {
+    return `无法播放「${title}」：酷狗音源受限，可能需要会员或暂无免费音源`;
+  }
+  return `无法播放「${title}」：网易云音源受限，可能需要会员或因版权无法播放`;
+}
+
+/** Normalize invoke / network failures into readable Chinese tips. */
+function formatPlayError(raw: unknown, song?: Song): string {
+  const msg = raw instanceof Error ? raw.message : String(raw ?? "");
+  const title = song?.name ? `「${song.name}」` : "这首歌";
+  const lower = msg.toLowerCase();
+  if (/vip|会员|付费|试听|版权|无版权|not free|need.?login|privilege|fee/i.test(msg)) {
+    return `无法播放${title}：需要会员或受版权限制`;
+  }
+  if (/cookie|登录|login|auth|未登录|unauthorized|401|403/i.test(msg)) {
+    return `无法播放${title}：登录状态失效或权限不足，请重新扫码登录`;
+  }
+  if (/network|fetch|timeout|timed out|econn|dns|连接/i.test(lower)) {
+    return `无法播放${title}：网络异常，请稍后重试`;
+  }
+  if (msg.trim()) {
+    // Keep concise — strip noisy Rust/JS stacks.
+    const short = msg.replace(/\s+/g, " ").trim().slice(0, 120);
+    return `无法播放${title}：${short}`;
+  }
+  return `无法播放${title}：播放出错`;
+}
+
+/** Best-effort: resolve + warm-cache the next track's audio URL. */
+async function warmNextTrack(): Promise<void> {
+  const state = usePlayerStore.getState();
+  const { queue, index, shuffle, shuffleFuture, level, repeat } = state;
+  if (queue.length <= 1 || index < 0) return;
+
+  let nextIndex = -1;
+  if (shuffle && shuffleFuture.length > 0) {
+    nextIndex = shuffleFuture[shuffleFuture.length - 1];
+  } else if (!shuffle) {
+    nextIndex = index + 1;
+    if (nextIndex >= queue.length) {
+      // Always list-loop semantics (no stop-at-end mode).
+      if (repeat === "one") return; // single-loop: next track preload not needed
+      nextIndex = 0;
+    }
+  } else {
+    // Shuffle without a known future: pick a different random track to warm.
+    // Guard with a max-attempt counter so a corrupt queue can never spin forever.
+    let guard = 0;
+    do {
+      nextIndex = Math.floor(Math.random() * queue.length);
+      guard += 1;
+    } while (nextIndex === index && queue.length > 1 && guard < 32);
+    if (nextIndex === index) return;
+  }
+
+  const nextSong = queue[nextIndex];
+  if (!nextSong) return;
+  try {
+    const { url } = await resolvePlayback(nextSong, level);
+    if (url) {
+      clearPreload(); // keep only the latest next candidate
+      preloadAudioUrl(url);
+    }
+  } catch {
+    /* preload is best-effort */
+  }
+}
+
+type PlaySongOptions = {
+  keepShuffleTrail?: boolean;
+  shuffleHistory?: number[];
+  shuffleFuture?: number[];
+};
 
 interface PlayerState {
   queue: Song[];
+  queueSource: "favorites" | "playlist" | "custom";
+  activePlaylistId: number | null;
   index: number;
   isPlaying: boolean;
   currentTime: number;
@@ -19,6 +123,8 @@ interface PlayerState {
   muted: boolean;
   repeat: RepeatMode;
   shuffle: boolean;
+  shuffleHistory: number[];
+  shuffleFuture: number[];
   /** resolved cover for current song */
   currentCover: string | undefined;
   lyrics: LyricLine[];
@@ -30,31 +136,77 @@ interface PlayerState {
   level: string;
   /** playback speed multiplier (1.0 = normal). Wired to audio.playbackRate. */
   speed: number;
+  /** Where the current lyrics came from (netease / qq / kugou / amll…). */
+  lyricSourceLabel: string | null;
   /** favorites playlist pagination: total tracks + how many loaded so far.
    *  0 total = not loaded / unknown. */
   favTotal: number;
   favLoaded: number;
   favLoadingMore: boolean;
+  favSongIds: string[];
+  playlistTotal: number;
+  playlistLoaded: number;
+  playlistLoadingMore: boolean;
+
+  /** Browsing list: songs shown in the queue drawer while the user flips
+   *  through playlists WITHOUT playing. The drawer shows browseList when
+   *  browsePlaylistId is set, falling back to the live queue. Playing a
+   *  track commits its playlist as the live queue. */
+  browseList: Song[];
+  browsePlaylistId: number | null;
+  /** Platform of the browsed playlist — ids can collide across netease/qq/kugou. */
+  browseSource: "netease" | "qq" | "kugou" | null;
+  browseTotal: number;
+  browseLoaded: number;
+  browseLoadingMore: boolean;
 
   // derived
   currentSong: () => Song | undefined;
 
   // actions
-  playSong: (song: Song, queue?: Song[]) => Promise<void>;
+  playSong: (song: Song, queue?: Song[], options?: PlaySongOptions) => Promise<void>;
+  /** Insert a song directly after the current track without interrupting playback. */
+  playNext: (song: Song) => void;
+  /** Remove one queue entry. Removing the current track advances to its replacement. */
+  removeQueueItem: (index: number) => Promise<void>;
+  /** Reorder the live queue while keeping the current track selected. */
+  moveQueueItem: (from: number, to: number) => void;
+  /** Stop playback and remove every item from the live queue. */
+  clearQueue: () => void;
   /** Load the user's "My Favorites" playlist as the queue (no autoplay).
    *  Paginated: loads the first page fast, more on loadMoreFav(). */
   loadFavPlaylist: () => Promise<void>;
+  /** Load any account playlist as the queue (no autoplay). */
+  loadPlaylist: (id: number, source?: "favorites" | "playlist") => Promise<void>;
+  /** Commit an already-loaded playlist's songs as the live queue and start
+   *  playing a given song from it. Unlike loadPlaylist, it does NOT refetch —
+   *  it reuses the provided songs — and fully sets queue/source/pagination so
+   *  next/prev/shuffle operate over the whole playlist. `total` is the true
+   *  playlist track count (may exceed songs.length if only partly loaded). */
+  playFromPlaylist: (playlistId: number, songs: Song[], song: Song, source?: "favorites" | "playlist", total?: number) => Promise<void>;
+  /** Browse a playlist's songs WITHOUT affecting playback. Fills browseList
+   *  only; index/isPlaying/currentTime/currentCover/lyrics are untouched. */
+  browsePlaylist: (id: number, source?: "netease" | "qq" | "kugou") => Promise<void>;
+  /** Append the next page of the currently-browsed playlist. */
+  browseMore: () => Promise<void>;
+  /** Drop the browse list, reverting the drawer to the live queue. */
+  clearBrowse: () => void;
   /** Load the next page of favorites and append to the queue. */
   loadMoreFav: () => Promise<void>;
+  loadMorePlaylist: () => Promise<void>;
   toggle: () => void;
-  next: (auto?: boolean) => Promise<void>;
+  /**
+   * Advance to another track. `auto` = natural end-of-track.
+   * `forceAdvance` skips single-loop replay (used when current track fails / VIP).
+   */
+  next: (auto?: boolean, opts?: { forceAdvance?: boolean }) => Promise<void>;
   prev: () => void;
   seek: (t: number) => void;
   setVolume: (v: number) => void;
   toggleMute: () => void;
   cycleRepeat: () => void;
   toggleShuffle: () => void;
-  /** Unified play mode: "sequence" | "list" | "one" | "shuffle". Cycles on click. */
+  /** Unified play mode: "list" | "one" | "shuffle". Cycles on click. */
   cyclePlayMode: () => void;
   setLevel: (l: string) => void;
   setSpeed: (s: number) => void;
@@ -63,134 +215,411 @@ interface PlayerState {
   _setDuration: (d: number) => void;
   _setPlaying: (p: boolean) => void;
   _clearError: () => void;
+  _setErr: (msg: string) => void;
 }
 
 export const usePlayerStore = create<PlayerState>((set, get) => ({
   queue: [],
+  queueSource: "custom",
+  activePlaylistId: null,
   index: -1,
   isPlaying: false,
   currentTime: 0,
   duration: 0,
   volume: getAudio().volume,
   muted: false,
-  repeat: "off",
-  shuffle: false,
+  repeat: loadRepeatMode("all"),
+  shuffle: loadShuffle(false),
+  shuffleHistory: [],
+  shuffleFuture: [],
   currentCover: undefined,
   lyrics: [],
   loading: false,
   error: null,
   accent: null,
-  level: "exhigh",
-  speed: 1.0,
+  level: loadLevel("exhigh"),
+  speed: loadSpeed(1.0),
+  lyricSourceLabel: null,
   favTotal: 0,
   favLoaded: 0,
   favLoadingMore: false,
+  favSongIds: [],
+  playlistTotal: 0,
+  playlistLoaded: 0,
+  playlistLoadingMore: false,
+
+  browseList: [],
+  browsePlaylistId: null,
+  browseSource: null,
+  browseTotal: 0,
+  browseLoaded: 0,
+  browseLoadingMore: false,
 
   currentSong: () => {
     const { queue, index } = get();
     return index >= 0 ? queue[index] : undefined;
   },
 
-  playSong: async (song, queue) => {
+  clearQueue: () => {
+    const audio = getAudio();
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+    set({
+      queue: [],
+      queueSource: "custom",
+      activePlaylistId: null,
+      index: -1,
+      isPlaying: false,
+      loading: false,
+      error: null,
+      currentTime: 0,
+      duration: 0,
+      currentCover: undefined,
+      lyrics: [],
+      lyricSourceLabel: null,
+      accent: null,
+      playlistTotal: 0,
+      playlistLoaded: 0,
+      playlistLoadingMore: false,
+      shuffleHistory: [],
+      shuffleFuture: [],
+    });
+  },
+
+  playNext: (song) => {
     const state = get();
-    const q = queue ?? state.queue;
-    let idx = q.findIndex((s) => s.id === song.id);
+    const current = state.currentSong();
+    if (!current) {
+      set({
+        queue: [song],
+        queueSource: "custom",
+        activePlaylistId: null,
+        index: 0,
+        currentCover: song.pic,
+        playlistTotal: 1,
+        playlistLoaded: 1,
+        playlistLoadingMore: false,
+        shuffleHistory: [],
+        shuffleFuture: [],
+      });
+      return;
+    }
+    if (sameSong(current, song)) return;
+
+    // Move an existing copy instead of creating duplicate entries.
+    const queue = state.queue.filter(
+      (item, itemIndex) => itemIndex === state.index || !sameSong(item, song),
+    );
+    const currentIndex = queue.indexOf(current);
+    queue.splice(currentIndex + 1, 0, song);
+    set({
+      queue,
+      queueSource: "custom",
+      activePlaylistId: null,
+      index: currentIndex,
+      playlistTotal: queue.length,
+      playlistLoaded: queue.length,
+      playlistLoadingMore: false,
+      shuffleHistory: [],
+      shuffleFuture: [],
+    });
+  },
+
+  removeQueueItem: async (removeIndex) => {
+    const state = get();
+    if (removeIndex < 0 || removeIndex >= state.queue.length) return;
+    const removingCurrent = removeIndex === state.index;
+    const queue = state.queue.slice();
+    queue.splice(removeIndex, 1);
+
+    if (queue.length === 0) {
+      const audio = getAudio();
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      set({
+        queue: [],
+        queueSource: "custom",
+        activePlaylistId: null,
+        index: -1,
+        isPlaying: false,
+        currentTime: 0,
+        duration: 0,
+        currentCover: undefined,
+        lyrics: [],
+        lyricSourceLabel: null,
+        accent: null,
+        playlistTotal: 0,
+        playlistLoaded: 0,
+        playlistLoadingMore: false,
+        shuffleHistory: [],
+        shuffleFuture: [],
+      });
+      return;
+    }
+
+    if (removingCurrent) {
+      const replacementIndex = Math.min(removeIndex, queue.length - 1);
+      set({ queue, index: replacementIndex, queueSource: "custom", activePlaylistId: null });
+      await get().playSong(queue[replacementIndex], queue);
+      return;
+    }
+
+    const nextIndex = removeIndex < state.index ? state.index - 1 : state.index;
+    set({
+      queue,
+      queueSource: "custom",
+      activePlaylistId: null,
+      index: nextIndex,
+      playlistTotal: queue.length,
+      playlistLoaded: queue.length,
+      playlistLoadingMore: false,
+      shuffleHistory: [],
+      shuffleFuture: [],
+    });
+  },
+
+  moveQueueItem: (from, to) => {
+    const state = get();
+    if (
+      from === to ||
+      from < 0 ||
+      to < 0 ||
+      from >= state.queue.length ||
+      to >= state.queue.length
+    ) {
+      return;
+    }
+    const current = state.queue[state.index];
+    const queue = state.queue.slice();
+    const [song] = queue.splice(from, 1);
+    queue.splice(to, 0, song);
+    set({
+      queue,
+      queueSource: "custom",
+      activePlaylistId: null,
+      index: current ? queue.indexOf(current) : -1,
+      playlistTotal: queue.length,
+      playlistLoaded: queue.length,
+      playlistLoadingMore: false,
+      shuffleHistory: [],
+      shuffleFuture: [],
+    });
+  },
+
+  playSong: async (song, queue, options) => {
+    const state = get();
+    const queueProvided = queue !== undefined;
+    let q = queueProvided ? queue.slice() : state.queue.slice();
+    let idx = q.findIndex((s) => sameSong(s, song));
     if (idx < 0) {
       // playing ad-hoc: make a single-item queue
-      q.length = 0;
-      q.push(song);
+      q = [song];
       idx = 0;
     }
-    set({ queue: q, index: idx, loading: true, error: null, lyrics: [], currentTime: 0, duration: 0, accent: null });
+    const shuffleTrail = options?.keepShuffleTrail
+      ? {
+          shuffleHistory: options.shuffleHistory ?? state.shuffleHistory,
+          shuffleFuture: options.shuffleFuture ?? state.shuffleFuture,
+        }
+      : { shuffleHistory: [], shuffleFuture: [] };
+    // Show the new track's cover immediately so we never keep the previous
+    // song's art for the whole resolve/lyrics window (felt like a delayed jump).
+    set({
+      queue: q,
+      queueSource: queueProvided ? "custom" : state.queueSource,
+      activePlaylistId: queueProvided ? null : state.activePlaylistId,
+      index: idx,
+      loading: true,
+      error: null,
+      lyrics: [],
+      currentTime: 0,
+      duration: 0,
+      currentCover: song.pic,
+      accent: null,
+      lyricSourceLabel: null,
+      ...shuffleTrail,
+    });
     const audio = getAudio();
     try {
-      // Prefer the combined json call: gets cover + lyrics + url at once.
-      const json = await getSongJson(song.id);
-      let url: string | null = json?.url ?? null;
-      let pic = song.pic ?? json?.pic;
-      let rawLrc = json?.lyric ?? "";
-      let rawTr = json?.tlyric ?? "";
+      // Multi-source resolve: NetEase / QQ / Kugou streaming + metadata.
+      const { url, meta } = await resolvePlayback(song, state.level);
+      // Prefer playlist/search pic when present — API often returns a different
+      // CDN size/path for the same cover and causes a second visual change.
+      let pic = song.pic || meta.pic;
+      const rawLrc = meta.lyric ?? "";
+      const rawTr = meta.tlyric ?? "";
       let name = song.name;
       let artist = song.artist;
       let album = song.album;
 
-      if (json) {
-        if (!pic && json.pic) pic = json.pic;
-        if (!rawLrc && json.lyric) rawLrc = json.lyric;
-        if (!rawTr && json.tlyric) rawTr = json.tlyric;
-        if (json.name) name = json.name;
-        if (json.ar_name) artist = json.ar_name;
-        if (json.al_name) album = json.al_name;
-      }
-      // If json didn't return a url, fall back to the url-only endpoint.
-      if (!url) url = await getSongUrl(song.id, state.level);
+      if (meta.name) name = meta.name;
+      if (meta.ar_name) artist = meta.ar_name;
+      if (meta.al_name) album = meta.al_name;
+      if (!song.pic && meta.pic) pic = meta.pic;
 
       if (!url) {
-        set({ loading: false, error: "无法播放：该歌曲可能受版权限制或需要会员" });
-        // auto-advance after a beat
+        const msg = playRestrictionMessage(song, name);
+        set({ loading: false, isPlaying: false, error: msg });
+        // Give the user a moment to read the toast, then skip to next.
+        // forceAdvance: don't re-loop the same VIP/broken track in single-loop mode.
         setTimeout(() => {
-          if (get().error) void get().next(true);
-        }, 2500);
+          if (get().error === msg) void get().next(true, { forceAdvance: true });
+        }, 3200);
         return;
       }
 
-      // lyrics
-      const lrc = parseLrc(rawLrc);
-      const merged = rawTr ? mergeTranslation(lrc, parseTranslation(rawTr)) : lrc;
+      // Seed duration from catalog immediately so the progress bar has a real
+      // denominator before loadedmetadata (ms → seconds).
+      const seededDuration = toDurationSeconds(0, song.duration);
 
+      // Provider LRC first (sync). External match (QQ/Kugou) runs AFTER play
+      // starts — waiting on network lyrics previously froze progress/lyrics
+      // for multi-source tracks until the match finished.
+      let lrc = parseLrc(rawLrc);
+      let merged = rawTr ? mergeTranslation(lrc, parseTranslation(rawTr)) : lrc;
+      let lyricSourceLabel: string | null =
+        merged.length > 0
+          ? meta.lyric_source
+            ? String(meta.lyric_source)
+            : song.source ?? "netease"
+          : null;
+
+      // Start audio ASAP so currentTime / rAF clock run while lyrics resolve.
       audio.src = url;
       audio.volume = state.muted ? 0 : state.volume;
       audio.playbackRate = state.speed;
-      await audio.play().catch(() => {
-        /* autoplay may be blocked on first user gesture; toggle() will retry */
-      });
+      try {
+        await audio.play();
+      } catch {
+        // MediaElementError is surfaced via the 'error' event → useAudioEngine.
+        // Autoplay block (no media error) just pauses UI.
+        set({ loading: false, isPlaying: false });
+      }
+
+      const audioDur =
+        Number.isFinite(audio.duration) && audio.duration > 0 && audio.duration < Infinity
+          ? audio.duration
+          : 0;
+      const resolvedDuration = audioDur > 0 ? audioDur : seededDuration;
 
       // patch song meta in queue
-      const updated: Song = { ...song, name, artist, album, pic };
-      const newQ = q.slice();
-      newQ[idx] = updated;
+      const updated: Song = {
+        ...song,
+        name,
+        artist,
+        album,
+        pic,
+        duration: song.duration ?? (resolvedDuration > 0 ? Math.round(resolvedDuration * 1000) : undefined),
+        source: song.source ?? "netease",
+      };
+      const latestQueue = get().queue;
+      const patchIndex = latestQueue.findIndex((s) => sameSong(s, song));
+      const newQ = latestQueue.length > 0 ? latestQueue.slice() : q.slice();
+      newQ[patchIndex >= 0 ? patchIndex : idx] = updated;
 
+      // Only write currentCover when it actually changes (avoids img remount flicker).
+      const coverNow = get().currentCover;
+      const coverNext = pic || coverNow;
       set({
         queue: newQ,
         loading: false,
         isPlaying: !audio.paused,
-        currentCover: pic,
+        currentTime: Number.isFinite(audio.currentTime) ? audio.currentTime : 0,
+        duration: resolvedDuration,
+        currentCover: coverNext,
         lyrics: merged,
+        lyricSourceLabel,
       });
 
-      // accent color from cover (non-blocking)
-      if (pic) {
-        extractAccent(pic).then((c) => {
-          if (c && get().index === idx) set({ accent: c });
+      // Background external lyric match — does not block the progress clock.
+      const mode: LyricSourceMode = loadLyricSourceMode();
+      const needsExternal =
+        mode === "qq" ||
+        mode === "kugou" ||
+        (mode === "auto" && merged.length < 2);
+
+      if (needsExternal) {
+        const playToken = song;
+        void (async () => {
+          try {
+            const extMode: LyricSourceMode =
+              mode === "qq" || mode === "kugou" ? mode : "auto";
+            const ext = await resolveExternalLyrics({
+              title: name,
+              artist,
+              durationMs: toDurationMs(song.duration) || Math.round(resolvedDuration * 1000),
+              mode: extMode,
+            });
+            // Drop if user already skipped ahead.
+            const cur = get().currentSong();
+            if (!cur || !sameSong(cur, playToken)) return;
+            if (ext && ext.lines.length >= 2) {
+              if (mode === "qq" || mode === "kugou" || get().lyrics.length < 2) {
+                set({ lyrics: ext.lines, lyricSourceLabel: ext.source });
+              }
+            }
+          } catch (e) {
+            console.warn("[lyrics] external match failed", e);
+          }
+        })();
+      }
+
+      if (coverNext && coverNext !== coverNow) {
+        extractAccent(coverNext).then((c) => {
+          // Drop stale accent work if user already skipped ahead.
+          if (c && sameSong(get().currentSong() ?? song, song)) set({ accent: c });
+        });
+      } else if (coverNext && !get().accent) {
+        extractAccent(coverNext).then((c) => {
+          if (c && sameSong(get().currentSong() ?? song, song)) set({ accent: c });
         });
       }
-    } catch (e: any) {
-      set({ loading: false, error: e?.message ? String(e.message) : "播放出错" });
+
+      void warmNextTrack();
+    } catch (e: unknown) {
+      const msg = formatPlayError(e, song);
+      set({ loading: false, isPlaying: false, error: msg });
+      setTimeout(() => {
+        if (get().error === msg) void get().next(true, { forceAdvance: true });
+      }, 3200);
     }
   },
 
   loadFavPlaylist: async () => {
     const pid = getFavPlaylistId();
     if (!pid) return; // not configured — stays empty, user searches manually
+    await get().loadPlaylist(pid, "favorites");
+  },
+
+  loadPlaylist: async (pid, source = "playlist") => {
     try {
       // Paginated: fetch only the first page (100 tracks) for a fast initial
-      // load (~1.4s vs ~12s for all 1786). More pages load on demand via
-      // loadMoreFav() when the queue drawer scrolls near the bottom.
+      // load. More pages load on demand when the queue drawer scrolls near the bottom.
       const page = await getPlaylistPage(pid, FAV_PAGE_SIZE, 0);
       if (page.songs.length === 0) {
-        set({ error: "「我喜欢」歌单为空或读取失败，请检查 API 服务" });
+        set({ error: "歌单为空或读取失败，请稍后重试" });
         return;
       }
       set({
         queue: page.songs,
+        queueSource: source,
+        activePlaylistId: pid,
         index: 0,
         isPlaying: false,
         currentTime: 0,
         duration: 0,
         error: null,
+        playlistTotal: page.total,
+        playlistLoaded: page.songs.length,
+        playlistLoadingMore: false,
+        shuffleHistory: [],
+        shuffleFuture: [],
         favTotal: page.total,
         favLoaded: page.songs.length,
         favLoadingMore: false,
+        favSongIds: source === "favorites" ? page.songs.map((song) => String(song.id)) : get().favSongIds,
       });
       // Pre-fetch first track metadata (cover + lyrics) — don't play.
       const first = page.songs[0];
@@ -223,32 +652,183 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     } catch (e: any) {
       set({
         error: e?.message
-          ? `加载「我喜欢」失败：${e.message}`
-          : "加载「我喜欢」失败，请确认 API 服务在运行",
+          ? `加载歌单失败：${e.message}`
+          : "加载歌单失败，请稍后重试",
       });
     }
   },
 
-  loadMoreFav: async () => {
-    const { favLoadingMore, favLoaded, favTotal, queue } = get();
-    // already loading, or nothing more to load
-    if (favLoadingMore || favLoaded >= favTotal) return;
-    const pid = getFavPlaylistId();
-    if (!pid) return;
-    set({ favLoadingMore: true });
+  playFromPlaylist: async (playlistId, songs, song, source = "playlist", total) => {
+    if (songs.length === 0) {
+      set({ error: "歌单为空或无法播放" });
+      return;
+    }
+    // locate the picked song within the provided list
+    let idx = songs.findIndex((s) => s.id === song.id);
+    let q = songs;
+    if (idx < 0) {
+      // song not in the list (e.g. partially loaded) — prepend it
+      q = [song, ...songs];
+      idx = 0;
+    }
+    const isFav = source === "favorites";
+    // true total may be larger than loaded when browsing only fetched page 1;
+    // pass it so loadMorePlaylist can still fetch the remaining pages.
+    const realTotal = total ?? q.length;
+    // Commit the whole playlist as the live queue with full pagination state,
+    // then play the picked song. This makes next/prev/shuffle operate over the
+    // entire playlist (the "play queue"), not just the single track.
+    set({
+      queue: q,
+      queueSource: source,
+      activePlaylistId: playlistId,
+      index: idx,
+      isPlaying: false, // playSong below will set it true on audio.play()
+      currentTime: 0,
+      duration: 0,
+      loading: true,
+      error: null,
+      lyrics: [],
+      accent: null,
+      playlistTotal: realTotal,
+      playlistLoaded: q.length,
+      playlistLoadingMore: false,
+      favTotal: realTotal,
+      favLoaded: q.length,
+      favLoadingMore: false,
+      favSongIds: isFav ? q.map((s) => String(s.id)) : get().favSongIds,
+      shuffleHistory: [],
+      shuffleFuture: [],
+    });
+    // clear any active browse list (we've just committed it as the live queue)
+    set({
+      browseList: [],
+      browsePlaylistId: null,
+      browseSource: null,
+      browseTotal: 0,
+      browseLoaded: 0,
+      browseLoadingMore: false,
+    });
+    // If the playlist has more pages than we loaded, fetch the rest in the
+    // background so shuffle/next cover the full playlist.
+    if (realTotal > q.length) {
+      void get().loadMorePlaylist();
+    }
+    await get().playSong(song);
+  },
+
+  browsePlaylist: async (pid, source = "netease") => {
+    const cur = get();
+    // already browsing this exact platform playlist? no-op (avoid refetch flicker)
+    if (
+      cur.browsePlaylistId === pid &&
+      cur.browseSource === source &&
+      cur.browseList.length > 0
+    ) {
+      return;
+    }
+    // Clear first so the UI doesn't keep showing the previous platform's tracks.
+    set({
+      browseList: [],
+      browsePlaylistId: pid,
+      browseSource: source,
+      browseTotal: 0,
+      browseLoaded: 0,
+      browseLoadingMore: true,
+      error: null,
+    });
     try {
-      const page = await getPlaylistPage(pid, FAV_PAGE_SIZE, favLoaded);
+      const page = await getPlaylistPage(pid, FAV_PAGE_SIZE, 0);
+      // NOTE: deliberately does NOT touch index / isPlaying / currentTime /
+      // currentCover / lyrics — playback keeps running undisturbed.
+      set({
+        browseList: page.songs,
+        browsePlaylistId: pid,
+        browseSource: source,
+        browseTotal: page.total,
+        browseLoaded: page.songs.length,
+        browseLoadingMore: false,
+        error:
+          page.songs.length === 0 ? "歌单为空或读取失败，请稍后重试" : null,
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "加载歌单失败";
+      set({
+        browseList: [],
+        browsePlaylistId: pid,
+        browseSource: source,
+        browseTotal: 0,
+        browseLoaded: 0,
+        browseLoadingMore: false,
+        error: msg,
+      });
+    }
+  },
+
+  browseMore: async () => {
+    const { browsePlaylistId, browseList, browseLoadingMore, browseLoaded, browseTotal } = get();
+    if (browsePlaylistId == null || browseLoadingMore) return;
+    if (browseLoaded >= browseTotal) return;
+    set({ browseLoadingMore: true });
+    try {
+      const page = await getPlaylistPage(browsePlaylistId, FAV_PAGE_SIZE, browseLoaded);
+      set({
+        browseList: [...browseList, ...page.songs],
+        browseLoaded: browseLoaded + page.songs.length,
+        browseLoadingMore: false,
+      });
+    } catch {
+      set({ browseLoadingMore: false });
+    }
+  },
+
+  clearBrowse: () => {
+    set({
+      browseList: [],
+      browsePlaylistId: null,
+      browseSource: null,
+      browseTotal: 0,
+      browseLoaded: 0,
+      browseLoadingMore: false,
+    });
+  },
+
+  loadMoreFav: async () => {
+    await get().loadMorePlaylist();
+  },
+
+  loadMorePlaylist: async () => {
+    const {
+      activePlaylistId,
+      playlistLoadingMore,
+      playlistLoaded,
+      playlistTotal,
+      favSongIds,
+      queue,
+      queueSource,
+    } = get();
+    // already loading, or nothing more to load
+    if (!activePlaylistId || playlistLoadingMore || playlistLoaded >= playlistTotal) return;
+    set({ playlistLoadingMore: true, favLoadingMore: true });
+    try {
+      const page = await getPlaylistPage(activePlaylistId, FAV_PAGE_SIZE, playlistLoaded);
       if (page.songs.length > 0) {
+        const nextFavSongIds = Array.from(
+          new Set([...favSongIds, ...page.songs.map((song) => String(song.id))])
+        );
         set({
           queue: [...queue, ...page.songs],
-          favLoaded: favLoaded + page.songs.length,
-          favTotal: page.total || favTotal,
+          playlistLoaded: playlistLoaded + page.songs.length,
+          playlistTotal: page.total || playlistTotal,
+          favLoaded: playlistLoaded + page.songs.length,
+          favTotal: page.total || playlistTotal,
+          favSongIds: queueSource === "favorites" ? nextFavSongIds : favSongIds,
         });
       }
     } catch {
       /* load-more is best-effort; don't surface a hard error */
     } finally {
-      set({ favLoadingMore: false });
+      set({ playlistLoadingMore: false, favLoadingMore: false });
     }
   },
 
@@ -272,40 +852,91 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     }
   },
 
-  next: async (auto) => {
-    const { queue, index, repeat, shuffle } = get();
+  next: async (auto, opts) => {
+    const { queue, index, repeat, shuffle, shuffleHistory, shuffleFuture } = get();
     if (queue.length === 0) return;
-    if (repeat === "one" && auto) {
+    const forceAdvance = Boolean(opts?.forceAdvance);
+
+    // Single-loop only on natural track end — never when skipping a failed/VIP track.
+    if (repeat === "one" && auto && !forceAdvance) {
       const s = queue[index];
-      if (s) await get().playSong(s);
+      if (s) {
+        await get().playSong(s, undefined, {
+          keepShuffleTrail: true,
+          shuffleHistory,
+          shuffleFuture,
+        });
+      }
       return;
     }
+
     let ni: number;
     if (shuffle && queue.length > 1) {
-      do {
-        ni = Math.floor(Math.random() * queue.length);
-      } while (ni === index);
-    } else {
-      ni = index + 1;
-      if (ni >= queue.length) {
-        if (repeat === "all" || !auto) ni = 0;
-        else {
-          // stop at end
-          set({ isPlaying: false });
-          return;
-        }
+      const nextFuture = shuffleFuture.slice();
+      const nextHistory = index >= 0
+        ? [...shuffleHistory, index].slice(-SHUFFLE_TRAIL_LIMIT)
+        : shuffleHistory.slice();
+
+      if (nextFuture.length > 0) {
+        ni = nextFuture.pop()!;
+      } else {
+        let guard = 0;
+        do {
+          ni = Math.floor(Math.random() * queue.length);
+          guard += 1;
+        } while (ni === index && queue.length > 1 && guard < 32);
+        if (ni === index) ni = (index + 1) % queue.length;
       }
+      // When force-skipping a broken track, never re-pick the same index.
+      if (forceAdvance && ni === index && queue.length > 1) {
+        ni = (index + 1) % queue.length;
+      }
+      const target = queue[ni];
+      if (!target) return;
+      await get().playSong(target, undefined, {
+        keepShuffleTrail: true,
+        shuffleHistory: nextHistory,
+        shuffleFuture: nextFuture,
+      });
+      return;
     }
-    await get().playSong(queue[ni]);
+
+    // List loop (and forced advance from single-loop on failure): always wrap.
+    // There is no "off / stop at end" mode anymore.
+    if (queue.length === 1) {
+      const only = queue[0];
+      if (only) await get().playSong(only);
+      return;
+    }
+    ni = index + 1;
+    if (ni >= queue.length) ni = 0;
+    if (ni < 0) ni = 0;
+    const target = queue[ni];
+    if (!target) return;
+    await get().playSong(target);
   },
 
   prev: () => {
-    const { queue, index } = get();
+    const { queue, index, shuffle, shuffleHistory, shuffleFuture } = get();
     if (queue.length === 0) return;
     // if more than 3s in, restart current
     const audio = getAudio();
     if (audio.currentTime > 3) {
       audio.currentTime = 0;
+      return;
+    }
+    if (shuffle && shuffleHistory.length > 0) {
+      const nextHistory = shuffleHistory.slice();
+      const pi = nextHistory.pop();
+      if (pi == null || !queue[pi]) return;
+      const nextFuture = index >= 0
+        ? [...shuffleFuture, index].slice(-SHUFFLE_TRAIL_LIMIT)
+        : shuffleFuture.slice();
+      void get().playSong(queue[pi], undefined, {
+        keepShuffleTrail: true,
+        shuffleHistory: nextHistory,
+        shuffleFuture: nextFuture,
+      });
       return;
     }
     let pi = index - 1;
@@ -337,34 +968,97 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   },
 
   cycleRepeat: () => {
-    const order: RepeatMode[] = ["off", "all", "one"];
-    const i = order.indexOf(get().repeat);
-    set({ repeat: order[(i + 1) % order.length] });
+    // Legacy API: only list loop ↔ single loop (shuffle is via cyclePlayMode / toggleShuffle).
+    const repeat: RepeatMode = get().repeat === "one" ? "all" : "one";
+    saveRepeatMode(repeat);
+    saveShuffle(false);
+    set({ repeat, shuffle: false, shuffleHistory: [], shuffleFuture: [] });
   },
 
-  toggleShuffle: () => set({ shuffle: !get().shuffle }),
+  toggleShuffle: () => {
+    const shuffle = !get().shuffle;
+    saveShuffle(shuffle);
+    // Turning shuffle on keeps list-loop semantics underneath.
+    if (shuffle) {
+      saveRepeatMode("all");
+      set({ shuffle: true, repeat: "all", shuffleHistory: [], shuffleFuture: [] });
+    } else {
+      set({ shuffle: false, shuffleHistory: [], shuffleFuture: [] });
+    }
+  },
 
   cyclePlayMode: () => {
-    // unified cycle: sequence → list loop → single loop → shuffle → sequence
-    const { repeat, shuffle } = get();
-    let mode: "sequence" | "list" | "one" | "shuffle";
-    if (shuffle) mode = "shuffle";
-    else if (repeat === "one") mode = "one";
-    else if (repeat === "all") mode = "list";
-    else mode = "sequence";
-    const order: typeof mode[] = ["sequence", "list", "one", "shuffle"];
-    const next = order[(order.indexOf(mode) + 1) % order.length];
-    set({
-      repeat: next === "list" ? "all" : next === "one" ? "one" : "off",
-      shuffle: next === "shuffle",
-    });
+    // Exactly three modes: list → one → shuffle → list (no off / sequence).
+    // Sync-only so the click never hangs on network work.
+    try {
+      const { repeat, shuffle } = get();
+      const next = nextPlayMode(repeat, shuffle);
+      const flags = playModeToFlags(next);
+      saveRepeatMode(flags.repeat);
+      saveShuffle(flags.shuffle);
+      set({
+        repeat: flags.repeat,
+        shuffle: flags.shuffle,
+        shuffleHistory: [],
+        shuffleFuture: [],
+      });
+    } catch {
+      const { repeat, shuffle } = get();
+      const next = nextPlayMode(repeat, shuffle);
+      const flags = playModeToFlags(next);
+      set({
+        repeat: flags.repeat,
+        shuffle: flags.shuffle,
+        shuffleHistory: [],
+        shuffleFuture: [],
+      });
+    }
   },
 
-  setLevel: (l) => set({ level: l }),
+  setLevel: (l) => {
+    const prev = get().level;
+    if (prev === l) return;
+    saveLevel(l);
+    set({ level: l });
+    // Re-resolve stream at the new quality if something is already loaded.
+    const song = get().currentSong();
+    if (!song) return;
+    const audio = getAudio();
+    const wasPlaying = !audio.paused;
+    const t = audio.currentTime;
+    void (async () => {
+      try {
+        const { url } = await resolvePlayback(song, l);
+        if (!url) {
+          set({
+            error: `「${song.name}」该音质不可用（可能需要会员），请尝试更低音质`,
+          });
+          return;
+        }
+        // Ignore if user switched quality again while we were resolving.
+        if (get().level !== l) return;
+        const cur = get().currentSong();
+        if (!cur || !sameSong(cur, song)) return;
+        audio.src = url;
+        audio.currentTime = t;
+        if (wasPlaying) {
+          await audio.play().catch(() => undefined);
+        }
+      } catch (e: unknown) {
+        set({
+          error:
+            e instanceof Error && e.message
+              ? `切换音质失败：${e.message.slice(0, 80)}`
+              : "切换音质失败，已保持原音质",
+        });
+      }
+    })();
+  },
   setSpeed: (s) => {
     const speed = Math.min(2, Math.max(0.5, s));
     const audio = getAudio();
     audio.playbackRate = speed;
+    saveSpeed(speed);
     set({ speed });
   },
 
@@ -372,4 +1066,5 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   _setDuration: (d) => set({ duration: d }),
   _setPlaying: (p) => set({ isPlaying: p }),
   _clearError: () => set({ error: null }),
+  _setErr: (msg) => set({ loading: false, isPlaying: false, error: msg }),
 }));

@@ -3,6 +3,8 @@ export type AudioBadge = 'Lossless' | 'Dolby Atmos';
 export interface LyricsLine {
   time: number; // in seconds
   text: string;
+  /** optional translated line shown beneath the original */
+  tr?: string;
 }
 
 export interface Song {
@@ -20,17 +22,14 @@ export interface Song {
 
 export type PlayerLayout = 'vertical' | 'mini' | 'lyrics';
 
+/**
+ * Lyric motion presets.
+ * Folia-major ports: monet (莫奈), fume (浮名), classic (流光).
+ * Lightweight: rail (默认滚动), dialogue (对话).
+ */
 export type LyricMotionStyle =
+  | 'monet'
+  | 'fume'
+  | 'classic'
   | 'rail'
-  | 'cascade'
-  | 'focus'
-  | 'typewriter'
-  | 'beam'
-  | 'dialogue'
-  | 'poster'
-  | 'tilt'
-  | 'ripple'
-  | 'float'
-  | 'stagger'
-  | 'solo'
-  | 'chorus';
+  | 'dialogue';
