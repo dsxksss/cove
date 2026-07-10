@@ -1,6 +1,6 @@
 [package]
 name = "netease-music-player"
-version = "1.2.0"
+version = "1.4.0"
 description = "Cove 可沃 — multi-source immersive desktop music player"
 authors = ["you"]
 edition = "2021"

@@ -636,7 +636,7 @@ export default function App() {
     const playlist = current.find((item) => item.id === id);
     if (result.added) {
       commitAppPlaylists(result.playlists);
-      toast(`已添加到「${playlist?.name ?? "应用歌单"}」`, { tone: "success" });
+      toast(`已添加到「${playlist?.name ?? "自建歌单"}」`, { tone: "success" });
     } else {
       toast(`「${song.name}」已在该歌单中`, { tone: "warning" });
     }
@@ -660,9 +660,8 @@ export default function App() {
   }, [commitAppPlaylists]);
 
   const handleOpenAppPlaylist = useCallback((id: string) => {
-    clearBrowse();
     setActiveAppPlaylistId(id);
-  }, [clearBrowse]);
+  }, []);
 
   const handlePlayFromAppPlaylist = useCallback((playlist: AppPlaylist, song: Song) => {
     void playSong(song, playlist.songs);
@@ -1139,10 +1138,7 @@ export default function App() {
         onPlaylistSortChange={setPlaylistSort}
         activePlaylistId={activePlaylistId}
         onRefreshPlaylists={handleRefreshPlaylists}
-        onBrowsePlaylist={(playlist) => {
-          setActiveAppPlaylistId(null);
-          handleBrowsePlaylist(playlist);
-        }}
+        onBrowsePlaylist={handleBrowsePlaylist}
         appPlaylists={appPlaylists}
         activeAppPlaylistId={activeAppPlaylistId}
         onOpenAppPlaylist={handleOpenAppPlaylist}
@@ -1795,7 +1791,7 @@ function SongActionDialog({
             </button>
 
             <div className="my-3 h-px bg-white/8" />
-            <p className="px-1 text-[10px] font-black tracking-[0.16em] text-white/35">添加到应用歌单</p>
+            <p className="px-1 text-[10px] font-black tracking-[0.16em] text-white/35">添加到自建歌单</p>
             <div className="mt-2 max-h-44 space-y-1 overflow-y-auto">
               {appPlaylists.map((playlist) => (
                 <button
@@ -1815,7 +1811,7 @@ function SongActionDialog({
                 </button>
               ))}
               {appPlaylists.length === 0 && (
-                <p className="py-3 text-center text-[11px] text-white/35">还没有应用歌单，可以直接在下方创建</p>
+                <p className="py-3 text-center text-[11px] text-white/35">还没有自建歌单，可以直接在下方创建</p>
               )}
             </div>
 
@@ -1930,6 +1926,9 @@ const CollectionDrawer = memo(function CollectionDrawer({
   // Virtualized-ish rendering: only render the first `limit` rows, grow on
   // scroll near the bottom. Avoids mounting 1785 <button>+<img> at once.
   const [limit, setLimit] = useState(60);
+  const [playlistLibrary, setPlaylistLibrary] = useState<"app" | "platform">(
+    activeAppPlaylistId ? "app" : "platform"
+  );
   const [sourceFilter, setSourceFilter] = useState<"all" | AuthPlatform>("all");
   const [playlistSearchOpen, setPlaylistSearchOpen] = useState(false);
   const [playlistSearchQuery, setPlaylistSearchQuery] = useState("");
@@ -1947,12 +1946,42 @@ const CollectionDrawer = memo(function CollectionDrawer({
 
   const isPlaylistMode = mode === "playlists";
   const activeAppPlaylist = appPlaylists.find((playlist) => playlist.id === activeAppPlaylistId) ?? null;
-  const isAppBrowsing = isPlaylistMode && activeAppPlaylist != null;
-  const isBrowsing = isPlaylistMode && (isAppBrowsing || browsePlaylistId != null);
-  const list = isAppBrowsing ? activeAppPlaylist.songs : isPlaylistMode ? browseList : queue;
-  const listTotal = isAppBrowsing ? list.length : isPlaylistMode ? browseTotal : playlistTotal;
-  const listLoaded = isAppBrowsing ? list.length : isPlaylistMode ? browseLoaded : playlistLoaded;
-  const listLoadingMore = isAppBrowsing ? false : isPlaylistMode ? browseLoadingMore : playlistLoadingMore;
+  const isAppLibrary = isPlaylistMode && playlistLibrary === "app";
+  const isPlatformLibrary = isPlaylistMode && playlistLibrary === "platform";
+  const isAppBrowsing = isAppLibrary && activeAppPlaylist != null;
+  const isPlatformBrowsing = isPlatformLibrary && browsePlaylistId != null;
+  const isBrowsing = isAppBrowsing || isPlatformBrowsing;
+  const list = isAppBrowsing
+    ? activeAppPlaylist.songs
+    : isPlatformLibrary
+      ? browseList
+      : isPlaylistMode
+        ? []
+        : queue;
+  // App playlists are fully local — never reuse queue/platform pagination totals.
+  const listTotal = isAppBrowsing
+    ? list.length
+    : isPlatformBrowsing
+      ? browseTotal
+      : isPlaylistMode
+        ? 0
+        : playlistTotal;
+  const listLoaded = isAppBrowsing
+    ? list.length
+    : isPlatformBrowsing
+      ? browseLoaded
+      : isPlaylistMode
+        ? 0
+        : playlistLoaded;
+  const listLoadingMore = isAppBrowsing
+    ? false
+    : isPlatformBrowsing
+      ? browseLoadingMore
+      : isPlaylistMode
+        ? false
+        : playlistLoadingMore;
+  const showLoadMoreFooter =
+    !isAppLibrary && listTotal > 0 && listLoaded < listTotal;
   const listStagger = motionAllowsListStagger(motionLevel);
 
   // reset limit when reopening or when the browse list changes (switch playlist)
@@ -1967,7 +1996,24 @@ const CollectionDrawer = memo(function CollectionDrawer({
   useEffect(() => {
     setLimit(60);
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
-  }, [activeAppPlaylistId, browsePlaylistId, mode]);
+  }, [activeAppPlaylistId, browsePlaylistId, mode, playlistLibrary]);
+
+  useEffect(() => {
+    if (!isPlaylistMode || !open || playlistLibrary !== "app") return;
+    if (activeAppPlaylist || appPlaylists.length === 0) return;
+    onOpenAppPlaylist(appPlaylists[0].id);
+  }, [activeAppPlaylist, appPlaylists, isPlaylistMode, onOpenAppPlaylist, open, playlistLibrary]);
+
+  const previousActiveAppPlaylistIdRef = useRef(activeAppPlaylistId);
+  useEffect(() => {
+    if (
+      activeAppPlaylistId &&
+      activeAppPlaylistId !== previousActiveAppPlaylistIdRef.current
+    ) {
+      setPlaylistLibrary("app");
+    }
+    previousActiveAppPlaylistIdRef.current = activeAppPlaylistId;
+  }, [activeAppPlaylistId]);
 
   useEffect(() => {
     return () => {
@@ -2145,26 +2191,6 @@ const CollectionDrawer = memo(function CollectionDrawer({
                 </span>
               </div>
               <div className="flex items-center gap-1.5">
-                {isPlaylistMode && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setCreatingPlaylist((value) => !value);
-                      setNewPlaylistName("");
-                    }}
-                    className={`app-liquid-control grid h-8 w-8 place-items-center rounded-full transition-colors ${
-                      creatingPlaylist ? "bg-white text-slate-950" : "text-white/65 hover:text-white"
-                    }`}
-                    aria-label="新建应用歌单"
-                    aria-expanded={creatingPlaylist}
-                    title="新建应用歌单"
-                  >
-                    <Plus
-                      size={15}
-                      className={`transition-transform duration-200 ${creatingPlaylist ? "rotate-45" : ""}`}
-                    />
-                  </button>
-                )}
                 {!isPlaylistMode && queue.length > 0 && (
                   <button
                     type="button"
@@ -2199,280 +2225,313 @@ const CollectionDrawer = memo(function CollectionDrawer({
             <AnimatePresence initial={false}>
               {isPlaylistMode && creatingPlaylist && (
                 <motion.div
-                  initial={{ y: -8, opacity: 0, scale: 0.97 }}
-                  animate={{ y: 0, opacity: 1, scale: 1 }}
-                  exit={{ y: -6, opacity: 0, scale: 0.98 }}
-                  transition={{ type: "spring", stiffness: 360, damping: 28 }}
-                  className="app-liquid-popover absolute right-6 top-[5.25rem] z-[60] flex w-[320px] max-w-[calc(100%-3rem)] items-center gap-2 rounded-2xl p-3 no-drag"
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: 0.22, ease: [0.32, 0.72, 0, 1] }}
+                  className="context-panel-layer player-liquid-content shrink-0 overflow-hidden border-b border-white/6 no-drag"
+                  style={{ ["--context-layer" as string]: 0 }}
                 >
-                  <input
-                    autoFocus
-                    value={newPlaylistName}
-                    onChange={(event) => setNewPlaylistName(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") submitCreatePlaylist();
-                      if (event.key === "Escape") setCreatingPlaylist(false);
-                    }}
-                    maxLength={40}
-                    placeholder="输入歌单名称"
-                    className="app-liquid-input h-9 min-w-0 flex-1 rounded-xl px-3 text-sm text-white outline-none placeholder:text-white/30"
-                  />
-                  <button
-                    type="button"
-                    disabled={!newPlaylistName.trim()}
-                    onClick={submitCreatePlaylist}
-                    className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white text-slate-950 disabled:opacity-35"
-                    aria-label="确认创建歌单"
-                  >
-                    <Check size={15} />
-                  </button>
+                  <div className="px-6 py-3.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[12px] font-bold tracking-wide text-white/80">
+                          新建歌单
+                        </p>
+                        <p className="mt-0.5 text-[10px] text-white/35">
+                          保存在本机，仅此设备可见
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCreatingPlaylist(false);
+                          setNewPlaylistName("");
+                        }}
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-white/40 transition-colors hover:bg-white/8 hover:text-white/75"
+                        aria-label="取消新建"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                    <div className="mt-3 flex items-center gap-2">
+                      <div className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-full border border-white/10 bg-white/[0.06] px-3.5 focus-within:border-white/20 focus-within:bg-white/[0.09]">
+                        <Library size={14} className="shrink-0 text-white/35" />
+                        <input
+                          autoFocus
+                          value={newPlaylistName}
+                          onChange={(event) => setNewPlaylistName(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") submitCreatePlaylist();
+                            if (event.key === "Escape") {
+                              setCreatingPlaylist(false);
+                              setNewPlaylistName("");
+                            }
+                          }}
+                          maxLength={40}
+                          placeholder="歌单名称"
+                          className="h-full min-w-0 flex-1 bg-transparent text-[13px] font-medium text-white outline-none placeholder:text-white/30"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        disabled={!newPlaylistName.trim()}
+                        onClick={submitCreatePlaylist}
+                        className="h-10 shrink-0 rounded-full bg-white px-4 text-[12px] font-bold text-slate-950 transition-opacity disabled:cursor-not-allowed disabled:opacity-30"
+                      >
+                        创建
+                      </button>
+                    </div>
+                  </div>
                 </motion.div>
               )}
             </AnimatePresence>
             {isPlaylistMode && (
-            <section
-              className={`context-panel-layer player-liquid-content shrink-0 border-b border-white/6 no-drag ${
-                isBrowsing ? "px-6 py-2" : "px-6 py-4"
-              }`}
-              style={{ ["--context-layer" as string]: 1 }}
-            >
-              {!isBrowsing ? (
-                <>
-              <div className="mb-4 border-b border-white/8 pb-4">
-                <div className="mb-2.5">
-                  <div>
-                    <p className="text-sm font-bold text-white/85">应用歌单</p>
-                    <p className="text-[11px] text-white/35">本地保存，可混合不同音乐平台</p>
-                  </div>
+              <section
+                className="context-panel-layer player-liquid-content shrink-0 border-b border-white/6 px-6 py-3 no-drag"
+                style={{ ["--context-layer" as string]: 1 }}
+              >
+                <div className="app-liquid-segment grid grid-cols-2 gap-1 rounded-2xl p-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCreatingPlaylist(false);
+                      setPlaylistLibrary("platform");
+                    }}
+                    className={`flex h-11 items-center gap-2 rounded-xl px-3 text-left transition-colors ${
+                      playlistLibrary === "platform"
+                        ? "bg-white text-slate-950 shadow-sm"
+                        : "text-white/55 hover:bg-white/8 hover:text-white"
+                    }`}
+                    aria-pressed={playlistLibrary === "platform"}
+                  >
+                    <Server size={15} className="shrink-0" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[12px] font-black">平台歌单</span>
+                      <span className={`block text-[9px] ${playlistLibrary === "platform" ? "text-slate-500" : "text-white/30"}`}>
+                        已登录账号同步
+                      </span>
+                    </span>
+                    <span className={`text-[11px] font-bold ${playlistLibrary === "platform" ? "text-slate-500" : "text-white/30"}`}>
+                      {playlists.length}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPlaylistLibrary("app");
+                      if (!activeAppPlaylist && appPlaylists[0]) onOpenAppPlaylist(appPlaylists[0].id);
+                    }}
+                    className={`flex h-11 items-center gap-2 rounded-xl px-3 text-left transition-colors ${
+                      playlistLibrary === "app"
+                        ? "bg-white text-slate-950 shadow-sm"
+                        : "text-white/55 hover:bg-white/8 hover:text-white"
+                    }`}
+                    aria-pressed={playlistLibrary === "app"}
+                  >
+                    <Library size={15} className="shrink-0" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[12px] font-black">自建歌单</span>
+                      <span className={`block text-[9px] ${playlistLibrary === "app" ? "text-slate-500" : "text-white/30"}`}>
+                        本地混合收藏
+                      </span>
+                    </span>
+                    <span className={`text-[11px] font-bold ${playlistLibrary === "app" ? "text-slate-500" : "text-white/30"}`}>
+                      {appPlaylists.length}
+                    </span>
+                  </button>
                 </div>
 
-                <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none">
-                  {appPlaylists.map((playlist) => {
-                    const selected = playlist.id === activeAppPlaylistId;
-                    const renaming = playlist.id === renamingPlaylistId;
-                    const confirmingDelete = playlist.id === confirmDeletePlaylistId;
-                    return (
-                      <div
-                        key={playlist.id}
-                        className={`intent-surface flex h-14 min-w-[210px] items-center gap-2 rounded-2xl border px-2.5 transition-colors ${
-                          selected
-                            ? "border-white/20 bg-white/12"
-                            : "border-white/8 bg-white/[0.035] hover:bg-white/[0.065]"
-                        }`}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => onOpenAppPlaylist(playlist.id)}
-                          className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white/8 text-white/60"
-                          aria-label={`打开歌单 ${playlist.name}`}
+                {playlistLibrary === "app" ? (
+                  <div className="mt-3 flex gap-2 overflow-x-auto pb-1 scrollbar-none">
+                    {appPlaylists.map((playlist) => {
+                      const selected = playlist.id === activeAppPlaylistId;
+                      const renaming = playlist.id === renamingPlaylistId;
+                      const confirmingDelete = playlist.id === confirmDeletePlaylistId;
+                      return (
+                        <div
+                          key={playlist.id}
+                          className={`intent-surface flex h-12 min-w-[210px] items-center gap-2 rounded-xl border px-2.5 transition-colors ${
+                            selected
+                              ? "border-white/24 bg-white/12"
+                              : "border-white/8 bg-white/[0.035] hover:bg-white/[0.07]"
+                          }`}
                         >
-                          <Library size={15} />
-                        </button>
-                        <div className="min-w-0 flex-1">
+                          <button
+                            type="button"
+                            onClick={() => onOpenAppPlaylist(playlist.id)}
+                            className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg ${selected ? "bg-white text-slate-950" : "bg-white/8 text-white/55"}`}
+                            aria-label={`打开歌单 ${playlist.name}`}
+                          >
+                            <Library size={13} />
+                          </button>
+                          <div className="min-w-0 flex-1">
+                            {renaming ? (
+                              <input
+                                autoFocus
+                                value={renameValue}
+                                onChange={(event) => setRenameValue(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") submitRenamePlaylist(playlist.id);
+                                  if (event.key === "Escape") setRenamingPlaylistId(null);
+                                }}
+                                maxLength={40}
+                                className="h-6 w-full rounded-md border border-white/12 bg-white/8 px-1.5 text-[11px] text-white outline-none"
+                              />
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => onOpenAppPlaylist(playlist.id)}
+                                className="block w-full truncate text-left text-[11px] font-bold text-white/80"
+                              >
+                                {playlist.name}
+                              </button>
+                            )}
+                            <p className="text-[9px] text-white/30">{playlist.songs.length} 首</p>
+                          </div>
                           {renaming ? (
-                            <input
-                              autoFocus
-                              value={renameValue}
-                              onChange={(event) => setRenameValue(event.target.value)}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") submitRenamePlaylist(playlist.id);
-                                if (event.key === "Escape") setRenamingPlaylistId(null);
-                              }}
-                              maxLength={40}
-                              className="h-6 w-full rounded-md border border-white/12 bg-white/8 px-1.5 text-[11px] text-white outline-none"
-                            />
-                          ) : (
                             <button
                               type="button"
-                              onClick={() => onOpenAppPlaylist(playlist.id)}
-                              className="block w-full truncate text-left text-[12px] font-bold text-white/80"
+                              onClick={() => submitRenamePlaylist(playlist.id)}
+                              className="grid h-7 w-7 place-items-center rounded-full text-white/50 hover:bg-white/10 hover:text-white"
+                              aria-label="保存歌单名称"
                             >
-                              {playlist.name}
+                              <Check size={12} />
                             </button>
-                          )}
-                          <p className="mt-0.5 text-[10px] text-white/30">{playlist.songs.length} 首</p>
-                        </div>
-                        {renaming ? (
-                          <button
-                            type="button"
-                            onClick={() => submitRenamePlaylist(playlist.id)}
-                            className="grid h-7 w-7 place-items-center rounded-full text-white/50 hover:bg-white/10 hover:text-white"
-                            aria-label="保存歌单名称"
-                          >
-                            <Check size={12} />
-                          </button>
-                        ) : confirmingDelete ? (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              onDeleteAppPlaylist(playlist.id);
-                              setConfirmDeletePlaylistId(null);
-                            }}
-                            className="h-7 rounded-full bg-red-500/80 px-2 text-[10px] font-bold text-white"
-                          >
-                            确认
-                          </button>
-                        ) : (
-                          <div className="intent-controls flex shrink-0 items-center">
+                          ) : confirmingDelete ? (
                             <button
                               type="button"
                               onClick={() => {
-                                setRenamingPlaylistId(playlist.id);
-                                setRenameValue(playlist.name);
+                                onDeleteAppPlaylist(playlist.id);
+                                setConfirmDeletePlaylistId(null);
                               }}
-                              className="grid h-7 w-7 place-items-center rounded-full text-white/35 hover:bg-white/10 hover:text-white"
-                              aria-label="重命名歌单"
+                              className="h-7 rounded-full bg-red-500/80 px-2 text-[10px] font-bold text-white"
                             >
-                              <Pencil size={11} />
+                              确认
                             </button>
-                            <button
-                              type="button"
-                              onClick={() => setConfirmDeletePlaylistId(playlist.id)}
-                              className="grid h-7 w-7 place-items-center rounded-full text-white/35 hover:bg-red-500/15 hover:text-red-200"
-                              aria-label="删除歌单"
-                            >
-                              <Trash2 size={11} />
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                  {appPlaylists.length === 0 && (
-                    <p className="py-3 text-[11px] text-white/30">新建一个歌单，就可以添加任意平台的歌曲</p>
-                  )}
-                </div>
-              </div>
-
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-sm font-bold text-white/85">平台歌单</p>
-                  <p className="text-[11px] text-white/35">
-                    {playlistsLoading
-                      ? "读取中"
-                      : `${sortedPlaylists.length} 个${
-                          sourceFilter === "all" ? "（多平台）" : AUTH_PLATFORM_LABEL[sourceFilter]
-                        }歌单`}
-                  </p>
-                </div>
-                <div className="app-liquid-segment flex items-center gap-1 rounded-full p-1">
-                  {[
-                    ["updated", "最近"],
-                    ["count", "数量"],
-                    ["name", "名称"],
-                  ].map(([value, label]) => (
-                    <button
-                      key={value}
-                      onClick={() => onPlaylistSortChange(value as "updated" | "count" | "name")}
-                      className={`h-7 rounded-full px-2.5 text-[11px] font-bold transition-colors ${
-                        playlistSort === value
-                          ? "bg-white text-slate-950"
-                          : "text-white/45 hover:bg-white/10 hover:text-white"
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                  <button
-                    onClick={onRefreshPlaylists}
-                    className="grid h-7 w-7 place-items-center rounded-full text-white/45 transition-colors hover:bg-white/10 hover:text-white"
-                    title="刷新歌单"
-                  >
-                    <RefreshCw size={12} />
-                  </button>
-                </div>
-              </div>
-
-              {/* Platform filter — avoid mixing multi-source playlists */}
-              <div className="mb-3 flex flex-wrap items-center gap-1">
-                {(
-                  [
-                    ["all", "全部", sourceCounts.all],
-                    ["netease", "网易云音乐", sourceCounts.netease],
-                    ["qq", "QQ音乐", sourceCounts.qq],
-                    ["kugou", "酷狗音乐", sourceCounts.kugou],
-                  ] as const
-                ).map(([key, label, count]) => (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => setSourceFilter(key)}
-                    className={`h-7 rounded-full px-2.5 text-[11px] font-bold transition-colors border ${
-                      sourceFilter === key
-                        ? "bg-white text-slate-950 border-white"
-                        : "bg-white/[0.04] text-white/50 border-white/10 hover:bg-white/10 hover:text-white"
-                    }`}
-                  >
-                    {label}
-                    {count > 0 ? ` ${count}` : ""}
-                  </button>
-                ))}
-                <span className="ml-1">{renderPlaylistSearch()}</span>
-              </div>
-                </>
-              ) : isAppBrowsing ? (
-                <div className="flex gap-2 overflow-x-auto py-1 scrollbar-none">
-                  {appPlaylists.map((playlist) => (
-                    <button
-                      key={playlist.id}
-                      type="button"
-                      onClick={() => onOpenAppPlaylist(playlist.id)}
-                      className={`inline-flex h-8 shrink-0 items-center gap-2 rounded-full border px-3 text-[11px] font-bold transition-colors ${
-                        playlist.id === activeAppPlaylistId
-                          ? "border-white bg-white text-slate-950"
-                          : "border-white/10 bg-white/[0.04] text-white/55 hover:bg-white/10 hover:text-white"
-                      }`}
-                    >
-                      <Library size={12} />
-                      {playlist.name}
-                      <span className={playlist.id === activeAppPlaylistId ? "text-slate-500" : "text-white/30"}>
-                        {playlist.songs.length}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <div className="mb-1 flex items-center justify-between gap-3">
-                  <p className="shrink-0 text-[11px] font-bold text-white/55">切换平台歌单</p>
-                  <div className="flex min-w-0 items-center gap-1">
-                    <div className="app-liquid-segment flex min-w-0 items-center gap-1 rounded-full p-1">
-                    {(
-                      [
-                        ["all", "全部"],
-                        ["netease", "网易云"],
-                        ["qq", "QQ"],
-                        ["kugou", "酷狗"],
-                      ] as const
-                    ).map(([key, label]) => (
+                          ) : (
+                            <div className="intent-controls flex shrink-0 items-center">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setRenamingPlaylistId(playlist.id);
+                                  setRenameValue(playlist.name);
+                                }}
+                                className="grid h-7 w-7 place-items-center rounded-full text-white/35 hover:bg-white/10 hover:text-white"
+                                aria-label="重命名歌单"
+                              >
+                                <Pencil size={11} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeletePlaylistId(playlist.id)}
+                                className="grid h-7 w-7 place-items-center rounded-full text-white/35 hover:bg-red-500/15 hover:text-red-200"
+                                aria-label="删除歌单"
+                              >
+                                <Trash2 size={11} />
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {appPlaylists.length > 0 && !creatingPlaylist && (
                       <button
-                        key={key}
                         type="button"
-                        onClick={() => setSourceFilter(key)}
-                        className={`h-6 rounded-full px-2 text-[10px] font-bold transition-colors ${
-                          sourceFilter === key
-                            ? "bg-white text-slate-950"
-                            : "text-white/45 hover:bg-white/10 hover:text-white"
-                        }`}
+                        onClick={() => {
+                          setCreatingPlaylist(true);
+                          setNewPlaylistName("");
+                        }}
+                        className="flex h-12 min-w-[96px] shrink-0 items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-white/[0.03] text-[11px] font-semibold text-white/40 transition-colors hover:bg-white/[0.07] hover:text-white/70"
                       >
-                        {label}
+                        <Plus size={13} />
+                        新建
                       </button>
-                    ))}
-                    </div>
-                    {renderPlaylistSearch(true)}
+                    )}
+                    {appPlaylists.length === 0 && !creatingPlaylist && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCreatingPlaylist(true);
+                          setNewPlaylistName("");
+                        }}
+                        className="flex h-14 w-full flex-col items-center justify-center gap-1 rounded-2xl bg-white/[0.04] text-white/40 transition-colors hover:bg-white/[0.07] hover:text-white/70"
+                      >
+                        <span className="grid h-7 w-7 place-items-center rounded-full bg-white/10 text-white/70">
+                          <Plus size={14} />
+                        </span>
+                        <span className="text-[11px] font-semibold">新建第一个歌单</span>
+                      </button>
+                    )}
                   </div>
-                </div>
-              )}
-
-              {!isAppBrowsing && (
-                <PlaylistCoverFlow
-                  playlists={sortedPlaylists}
-                  loading={playlistsLoading}
-                  activePlaylistId={activePlaylistId}
-                  onOpenPlaylist={onBrowsePlaylist}
-                  compact={isBrowsing}
-                />
-              )}
-            </section>
+                ) : (
+                  <>
+                    <div className="mt-3 flex items-center justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-1 overflow-x-auto scrollbar-none">
+                        {(
+                          [
+                            ["all", "全部", sourceCounts.all],
+                            ["netease", "网易云", sourceCounts.netease],
+                            ["qq", "QQ", sourceCounts.qq],
+                            ["kugou", "酷狗", sourceCounts.kugou],
+                          ] as const
+                        ).map(([key, label, count]) => (
+                          <button
+                            key={key}
+                            type="button"
+                            onClick={() => setSourceFilter(key)}
+                            className={`h-7 shrink-0 rounded-full border px-2.5 text-[10px] font-bold transition-colors ${
+                              sourceFilter === key
+                                ? "border-white bg-white text-slate-950"
+                                : "border-white/10 bg-white/[0.04] text-white/45 hover:bg-white/10 hover:text-white"
+                            }`}
+                          >
+                            {label}{count > 0 ? ` ${count}` : ""}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {renderPlaylistSearch(true)}
+                        <span className="mx-0.5 text-[10px] font-bold text-white/30">排序</span>
+                        {[
+                          ["updated", "最近"],
+                          ["count", "歌曲数"],
+                          ["name", "名称"],
+                        ].map(([value, label]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            onClick={() => onPlaylistSortChange(value as "updated" | "count" | "name")}
+                            className={`h-6 shrink-0 rounded-full px-2 text-[10px] font-bold transition-colors ${
+                              playlistSort === value
+                                ? "bg-white/14 text-white"
+                                : "text-white/35 hover:bg-white/8 hover:text-white/70"
+                            }`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={onRefreshPlaylists}
+                          className="app-liquid-control grid h-6 w-6 place-items-center rounded-full text-white/45 hover:text-white"
+                          title="刷新平台歌单"
+                          aria-label="刷新平台歌单"
+                        >
+                          <RefreshCw size={11} />
+                        </button>
+                      </div>
+                    </div>
+                    <PlaylistCoverFlow
+                      playlists={sortedPlaylists}
+                      loading={playlistsLoading}
+                      activePlaylistId={activePlaylistId}
+                      onOpenPlaylist={onBrowsePlaylist}
+                      compact={isPlatformBrowsing}
+                    />
+                  </>
+                )}
+              </section>
             )}
             <div
               ref={scrollRef}
@@ -2485,7 +2544,7 @@ const CollectionDrawer = memo(function CollectionDrawer({
                   {isPlaylistMode
                     ? isBrowsing
                       ? isAppBrowsing
-                        ? "应用歌单为空，可从搜索或歌曲菜单中添加"
+                        ? "自建歌单为空，可从搜索或歌曲菜单中添加"
                         : browseLoadingMore
                         ? "正在读取歌单…"
                         : "歌单为空或读取失败"
@@ -2595,7 +2654,7 @@ const CollectionDrawer = memo(function CollectionDrawer({
                   </div>
                 );
               })}
-              {listTotal > 0 && listLoaded < listTotal && (
+              {showLoadMoreFooter && (
                 <div className="py-4 text-center text-xs text-white/30">
                   {listLoadingMore
                     ? "加载中…"
