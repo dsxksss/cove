@@ -7,17 +7,19 @@
 use aes::Aes128;
 use ecb::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyInit};
 use reqwest::{
-    header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, ORIGIN, REFERER, SET_COOKIE, USER_AGENT},
+    header::{
+        HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, ORIGIN, REFERER, SET_COOKIE, USER_AGENT,
+    },
     Client,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
-    path::PathBuf,
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -38,6 +40,50 @@ struct NeteaseState {
     client: Client,
     cookie_file: PathBuf,
     device_file: PathBuf,
+    playlist_cache: Mutex<HashMap<i64, CachedPlaylist>>,
+}
+
+#[derive(Clone)]
+struct CachedPlaylist {
+    track_ids: Vec<i64>,
+    total: i64,
+    cached_at_ms: u128,
+}
+
+struct HttpClients {
+    default: Client,
+    no_redirect: Client,
+    limited_redirect: Client,
+    kugou_android: Client,
+}
+
+static HTTP_CLIENTS: OnceLock<HttpClients> = OnceLock::new();
+
+fn build_http_clients() -> Result<HttpClients, reqwest::Error> {
+    let base = || {
+        Client::builder()
+            .user_agent(UA)
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(25))
+            .pool_idle_timeout(Duration::from_secs(90))
+    };
+    Ok(HttpClients {
+        default: base().build()?,
+        no_redirect: base().redirect(reqwest::redirect::Policy::none()).build()?,
+        limited_redirect: base()
+            .redirect(reqwest::redirect::Policy::limited(8))
+            .build()?,
+        kugou_android: Client::builder()
+            .user_agent("Android14-1070-11070-201-0-Play-wifi")
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(25))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()?,
+    })
+}
+
+fn http_clients() -> &'static HttpClients {
+    HTTP_CLIENTS.get_or_init(|| build_http_clients().expect("failed to build shared HTTP clients"))
 }
 
 #[derive(Serialize)]
@@ -121,7 +167,39 @@ fn kugou_session_file_path() -> PathBuf {
     app_data_dir().join("kugou_session.json")
 }
 
-fn ensure_parent(path: &PathBuf) -> Result<(), String> {
+fn app_playlists_file_path() -> PathBuf {
+    app_data_dir().join("app_playlists.v1.json")
+}
+
+fn write_json_atomically<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
+    ensure_parent(path)?;
+    let content = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    if content.len() > 16 * 1024 * 1024 {
+        return Err("自建歌单数据超过 16 MiB 限制".into());
+    }
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, content).map_err(|error| error.to_string())?;
+    if let Err(first_error) = fs::rename(&temporary, path) {
+        if path.exists() {
+            let backup = path.with_extension("json.bak");
+            if backup.exists() {
+                fs::remove_file(&backup).map_err(|error| error.to_string())?;
+            }
+            fs::rename(path, &backup).map_err(|error| error.to_string())?;
+            if let Err(replace_error) = fs::rename(&temporary, path) {
+                let _ = fs::rename(&backup, path);
+                let _ = fs::remove_file(&temporary);
+                return Err(replace_error.to_string());
+            }
+            let _ = fs::remove_file(backup);
+        } else {
+            return Err(first_error.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn ensure_parent(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -383,8 +461,8 @@ fn qq_gtk_from_cookie(cookie: &str) -> u32 {
 
 /// QQConnect / WeChat login type for tmeLoginType (1=WX, 2=QQ).
 fn qq_tme_login_type(cookie: &str) -> i64 {
-    if let Some(lt) = cookie_field(cookie, "login_type")
-        .or_else(|| cookie_field(cookie, "tmeLoginType"))
+    if let Some(lt) =
+        cookie_field(cookie, "login_type").or_else(|| cookie_field(cookie, "tmeLoginType"))
     {
         if let Ok(n) = lt.parse::<i64>() {
             if n > 0 {
@@ -409,19 +487,15 @@ fn qq_uin_digits(cookie: &str) -> String {
         .to_string()
 }
 
-fn qq_has_music_session(cookie: &str) -> bool {
-    cookie_field(cookie, "qm_keyst").is_some()
-        || cookie_field(cookie, "qqmusic_key").is_some()
-        || cookie_field(cookie, "skey").is_some()
-        || cookie_field(cookie, "login_type").is_some()
-}
-
 fn default_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(UA));
     headers.insert(REFERER, HeaderValue::from_static("https://music.163.com/"));
     headers.insert(ORIGIN, HeaderValue::from_static("https://music.163.com"));
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/plain, */*"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
     headers
 }
 
@@ -478,8 +552,12 @@ fn merge_response_cookies(existing: Option<String>, headers: &HeaderMap) -> Opti
 
     for value in headers.get_all(SET_COOKIE).iter() {
         let Ok(raw) = value.to_str() else { continue };
-        let Some(pair) = raw.split(';').next() else { continue };
-        let Some((name, val)) = pair.split_once('=') else { continue };
+        let Some(pair) = raw.split(';').next() else {
+            continue;
+        };
+        let Some((name, val)) = pair.split_once('=') else {
+            continue;
+        };
         if !name.trim().is_empty() {
             jar.insert(name.trim().to_string(), val.trim().to_string());
         }
@@ -513,7 +591,9 @@ fn merge_cookie_string(existing: Option<String>, next: &str) -> Option<String> {
 
     for part in next.split(';') {
         let pair = part.trim();
-        let Some((name, value)) = pair.split_once('=') else { continue };
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
         let name = name.trim();
         let value = value.trim();
         if name.is_empty() || value.is_empty() {
@@ -566,22 +646,40 @@ fn eapi_header(
     let buildver = now.chars().take(10).collect::<String>();
     let request_id = format!("{}_0001", timestamp_ms());
 
-    header.entry("__remember_me".to_string()).or_insert_with(|| "true".to_string());
-    header.entry("ntes_kaola_ad".to_string()).or_insert_with(|| "1".to_string());
-    header.entry("osver".to_string()).or_insert_with(|| "Microsoft-Windows-10-Professional-build-19045-64bit".to_string());
+    header
+        .entry("__remember_me".to_string())
+        .or_insert_with(|| "true".to_string());
+    header
+        .entry("ntes_kaola_ad".to_string())
+        .or_insert_with(|| "1".to_string());
+    header
+        .entry("osver".to_string())
+        .or_insert_with(|| "Microsoft-Windows-10-Professional-build-19045-64bit".to_string());
     header.entry("deviceId".to_string()).or_insert(device_id);
-    header.entry("os".to_string()).or_insert_with(|| "pc".to_string());
-    header.entry("appver".to_string()).or_insert_with(|| "3.1.17.204416".to_string());
-    header.entry("versioncode".to_string()).or_insert_with(|| "140".to_string());
-    header.entry("mobilename".to_string()).or_insert_with(String::new);
+    header
+        .entry("os".to_string())
+        .or_insert_with(|| "pc".to_string());
+    header
+        .entry("appver".to_string())
+        .or_insert_with(|| "3.1.17.204416".to_string());
+    header
+        .entry("versioncode".to_string())
+        .or_insert_with(|| "140".to_string());
+    header.entry("mobilename".to_string()).or_default();
     header.entry("buildver".to_string()).or_insert(buildver);
-    header.entry("resolution".to_string()).or_insert_with(|| "1920x1080".to_string());
-    header.entry("__csrf".to_string()).or_insert_with(String::new);
-    header.entry("channel".to_string()).or_insert_with(|| "netease".to_string());
+    header
+        .entry("resolution".to_string())
+        .or_insert_with(|| "1920x1080".to_string());
+    header.entry("__csrf".to_string()).or_default();
+    header
+        .entry("channel".to_string())
+        .or_insert_with(|| "netease".to_string());
     header.insert("requestId".to_string(), request_id);
 
     if !api_path.contains("login") {
-        header.entry("NMTID".to_string()).or_insert_with(|| timestamp_ms().to_string());
+        header
+            .entry("NMTID".to_string())
+            .or_insert_with(|| timestamp_ms().to_string());
     }
     header
 }
@@ -591,8 +689,8 @@ fn eapi_params(api_path: &str, payload: Value) -> Result<String, String> {
     let message = format!("nobody{api_path}use{text}md5forencrypt");
     let digest = format!("{:x}", md5::compute(message.as_bytes()));
     let data = format!("{api_path}-36cd479b6b5-{text}-36cd479b6b5-{digest}");
-    let encrypted = Aes128EcbEnc::new(EAPI_KEY.into())
-        .encrypt_padded_vec_mut::<Pkcs7>(data.as_bytes());
+    let encrypted =
+        Aes128EcbEnc::new(EAPI_KEY.into()).encrypt_padded_vec_mut::<Pkcs7>(data.as_bytes());
     Ok(encrypted.iter().map(|byte| format!("{byte:02X}")).collect())
 }
 
@@ -601,13 +699,20 @@ async fn post_eapi_json(
     api_path: &str,
     mut payload: Value,
 ) -> Result<(Value, HeaderMap), String> {
-    let header = eapi_header(load_cookie(state), api_path, load_or_create_device_id(state));
+    let header = eapi_header(
+        load_cookie(state),
+        api_path,
+        load_or_create_device_id(state),
+    );
     payload["e_r"] = Value::Bool(false);
     payload["header"] = json!(header);
     let params = eapi_params(api_path, payload)?;
     let response = state
         .client
-        .post(format!("{NETEASE_EAPI_BASE}/eapi/{}", api_path.trim_start_matches("/api/")))
+        .post(format!(
+            "{NETEASE_EAPI_BASE}/eapi/{}",
+            api_path.trim_start_matches("/api/")
+        ))
         .headers(default_headers())
         .header(USER_AGENT, NETEASE_APP_UA)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -684,8 +789,14 @@ fn artist_name(value: &Value) -> String {
 }
 
 fn map_song(raw: &Value) -> Value {
-    let album = raw.get("album").or_else(|| raw.get("al")).unwrap_or(&Value::Null);
-    let artists = raw.get("artists").or_else(|| raw.get("ar")).unwrap_or(&Value::Null);
+    let album = raw
+        .get("album")
+        .or_else(|| raw.get("al"))
+        .unwrap_or(&Value::Null);
+    let artists = raw
+        .get("artists")
+        .or_else(|| raw.get("ar"))
+        .unwrap_or(&Value::Null);
     json!({
         "id": raw.get("id").and_then(Value::as_i64).unwrap_or_default(),
         "name": raw.get("name").and_then(Value::as_str).unwrap_or("未知歌曲"),
@@ -706,7 +817,10 @@ fn map_song(raw: &Value) -> Value {
 
 fn map_playlist(raw: &Value, owner_uid: i64) -> Value {
     let creator = raw.get("creator").unwrap_or(&Value::Null);
-    let creator_uid = creator.get("userId").and_then(Value::as_i64).unwrap_or_default();
+    let creator_uid = creator
+        .get("userId")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
     json!({
         "id": raw.get("id").and_then(Value::as_i64).unwrap_or_default(),
         "name": raw.get("name").and_then(Value::as_str).unwrap_or("未命名歌单"),
@@ -722,6 +836,87 @@ fn map_playlist(raw: &Value, owner_uid: i64) -> Value {
     })
 }
 
+fn slice_track_ids(track_ids: &[i64], offset: u32, limit: u32) -> Vec<i64> {
+    track_ids
+        .iter()
+        .skip(offset as usize)
+        .take(limit.min(100) as usize)
+        .copied()
+        .collect()
+}
+
+async fn playlist_track_ids(
+    state: &NeteaseState,
+    playlist_id: i64,
+) -> Result<CachedPlaylist, String> {
+    const CACHE_TTL_MS: u128 = 5 * 60 * 1000;
+    if let Ok(cache) = state.playlist_cache.lock() {
+        if let Some(item) = cache.get(&playlist_id) {
+            if timestamp_ms().saturating_sub(item.cached_at_ms) < CACHE_TTL_MS {
+                return Ok(item.clone());
+            }
+        }
+    }
+
+    let env = get_json(
+        state,
+        &format!("/api/v6/playlist/detail?id={playlist_id}&n=0&s=0"),
+        true,
+    )
+    .await?;
+    let playlist = env.get("playlist").unwrap_or(&Value::Null);
+    let track_ids = playlist
+        .get("trackIds")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_i64))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let item = CachedPlaylist {
+        total: playlist
+            .get("trackCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(track_ids.len() as i64),
+        track_ids,
+        cached_at_ms: timestamp_ms(),
+    };
+    if !item.track_ids.is_empty() {
+        if let Ok(mut cache) = state.playlist_cache.lock() {
+            cache.insert(playlist_id, item.clone());
+        }
+    }
+    Ok(item)
+}
+
+async fn batch_song_details(state: &NeteaseState, ids: &[i64]) -> Result<Vec<Value>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids_json = serde_json::to_string(ids).map_err(|error| error.to_string())?;
+    let env = get_json(
+        state,
+        &format!("/api/song/detail?ids={}", urlencoding_encode(&ids_json)),
+        true,
+    )
+    .await?;
+    let songs = env
+        .get("songs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let by_id = songs
+        .iter()
+        .filter_map(|song| song.get("id").and_then(Value::as_i64).map(|id| (id, song)))
+        .collect::<HashMap<_, _>>();
+    Ok(ids
+        .iter()
+        .filter_map(|id| by_id.get(id).map(|song| map_song(song)))
+        .collect())
+}
+
 fn lyric_text(value: &Value, key: &str) -> String {
     value
         .get(key)
@@ -733,7 +928,10 @@ fn lyric_text(value: &Value, key: &str) -> String {
 
 fn value_i64(value: Option<&Value>) -> i64 {
     value
-        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        })
         .unwrap_or_default()
 }
 
@@ -806,7 +1004,9 @@ fn parse_timed_text_seconds(value: &str) -> Option<f64> {
     }
     let parts = trimmed.split(':').collect::<Vec<_>>();
     match parts.as_slice() {
-        [minutes, seconds] => Some(minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?),
+        [minutes, seconds] => {
+            Some(minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?)
+        }
         [hours, minutes, seconds] => Some(
             hours.parse::<f64>().ok()? * 3600.0
                 + minutes.parse::<f64>().ok()? * 60.0
@@ -898,7 +1098,10 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
     Some(output)
 }
 
-fn signed_kugou_params(mut params: BTreeMap<String, String>, module: &str) -> BTreeMap<String, String> {
+fn signed_kugou_params(
+    mut params: BTreeMap<String, String>,
+    module: &str,
+) -> BTreeMap<String, String> {
     if module != "Lyric" {
         let now = timestamp_ms();
         params.insert("userid".to_string(), "0".to_string());
@@ -907,7 +1110,10 @@ fn signed_kugou_params(mut params: BTreeMap<String, String>, module: &str) -> BT
         params.insert("clienttime".to_string(), (now / 1000).to_string());
         params.insert("iscorrection".to_string(), "1".to_string());
         params.insert("uuid".to_string(), "-".to_string());
-        params.insert("mid".to_string(), format!("{:x}", md5::compute(now.to_string())));
+        params.insert(
+            "mid".to_string(),
+            format!("{:x}", md5::compute(now.to_string())),
+        );
         params.insert("dfid".to_string(), "-".to_string());
         params.insert("clientver".to_string(), "11070".to_string());
         params.insert("platform".to_string(), "AndroidFilter".to_string());
@@ -942,7 +1148,10 @@ async fn get_kugou_json(
         .map_err(|e| e.to_string())?;
     let mut req = client
         .get(url)
-        .header(USER_AGENT, format!("Android14-1070-11070-201-0-{module}-wifi"))
+        .header(
+            USER_AGENT,
+            format!("Android14-1070-11070-201-0-{module}-wifi"),
+        )
         .header("KG-Rec", "1")
         .header("KG-RC", "1");
     for (key, value) in extra_headers {
@@ -996,7 +1205,12 @@ async fn search_kugou_candidates(
                         .collect::<Vec<_>>()
                         .join(", ")
                 })
-                .unwrap_or_else(|| item.get("SingerName").and_then(Value::as_str).unwrap_or("").to_string());
+                .unwrap_or_else(|| {
+                    item.get("SingerName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                });
             Some(KugouCandidate {
                 id: value_i64(item.get("ID").or_else(|| item.get("AlbumAudioID"))),
                 name: item
@@ -1012,7 +1226,12 @@ async fn search_kugou_candidates(
         .collect())
 }
 
-fn kugou_candidate_matches(candidate: &KugouCandidate, title: &str, artist: &str, duration_ms: i64) -> bool {
+fn kugou_candidate_matches(
+    candidate: &KugouCandidate,
+    title: &str,
+    artist: &str,
+    duration_ms: i64,
+) -> bool {
     let target_title = normalize_match_text(title);
     let candidate_title = normalize_match_text(&candidate.name);
     if target_title.is_empty()
@@ -1177,7 +1396,12 @@ async fn search_qq_candidates(
         .collect())
 }
 
-fn qq_candidate_matches(candidate: &QqCandidate, title: &str, artist: &str, duration_ms: i64) -> bool {
+fn qq_candidate_matches(
+    candidate: &QqCandidate,
+    title: &str,
+    artist: &str,
+    duration_ms: i64,
+) -> bool {
     let target_title = normalize_match_text(title);
     let candidate_title = normalize_match_text(&candidate.name);
     if target_title.is_empty()
@@ -1296,12 +1520,7 @@ async fn fetch_fallback_lyric(
 }
 
 async fn song_detail(state: &NeteaseState, id: i64) -> Result<Value, String> {
-    let detail = get_json(
-        state,
-        &format!("/api/song/detail?ids=%5B{id}%5D"),
-        true,
-    )
-    .await?;
+    let detail = get_json(state, &format!("/api/song/detail?ids=%5B{id}%5D"), true).await?;
     Ok(detail
         .get("songs")
         .and_then(Value::as_array)
@@ -1327,12 +1546,8 @@ async fn song_url_value(state: &NeteaseState, id: i64, br: i64) -> Result<Value,
 
 #[tauri::command]
 async fn netease_qr_key(state: State<'_, NeteaseState>) -> Result<QrKey, String> {
-    let (env, headers) = post_eapi_json(
-        &state,
-        "/api/login/qrcode/unikey",
-        json!({ "type": 3 }),
-    )
-    .await?;
+    let (env, headers) =
+        post_eapi_json(&state, "/api/login/qrcode/unikey", json!({ "type": 3 })).await?;
     if let Some(cookie) = merge_response_cookies(load_cookie(&state), &headers) {
         save_cookie(&state, &cookie)?;
     }
@@ -1381,7 +1596,11 @@ async fn netease_qr_check(
     } else if let Some(cookie) = header_cookie {
         save_cookie(&state, &cookie)?;
     }
-    Ok(QrStatus { code, status, saved })
+    Ok(QrStatus {
+        code,
+        status,
+        saved,
+    })
 }
 
 async fn netease_login_status_inner(state: &NeteaseState) -> Result<LoginStatus, String> {
@@ -1573,7 +1792,6 @@ fn base64_encode(data: &[u8]) -> String {
 ///
 /// Note: poll with u1=y.qq.com often returns HTTP 403; graph u1 works and still
 /// yields uin/p_skey/superkey after confirm. Playlist APIs need music cookies when available.
-
 const QQ_APPID: &str = "716027609";
 const QQ_DAID: &str = "383";
 const QQ_PT_3RD_AID: &str = "100497308";
@@ -1727,12 +1945,11 @@ fn parse_uin_from_url(jump_url: &str) -> Option<String> {
 /// 1) check_sig with ptsigx → p_skey  
 /// 2) graph oauth authorize (code)  
 /// 3) QQConnectLogin.LoginServer/QQLogin(code) → musickey
-async fn qq_authorize_from_ptsigx(uin: &str, ptsigx: &str) -> Result<BTreeMap<String, String>, String> {
-    let client = Client::builder()
-        .user_agent(UA)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
+async fn qq_authorize_from_ptsigx(
+    uin: &str,
+    ptsigx: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let client = http_clients().no_redirect.clone();
 
     // 1) check_sig (empty cookie jar, as in upstream)
     let check_url = reqwest::Url::parse_with_params(
@@ -1850,10 +2067,7 @@ async fn qq_authorize_from_ptsigx(uin: &str, ptsigx: &str) -> Result<BTreeMap<St
             "param": { "code": code }
         }
     });
-    let client2 = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client2 = http_clients().default.clone();
     let resp = client2
         .post("https://u.y.qq.com/cgi-bin/musicu.fcg")
         .header(CONTENT_TYPE, "application/json")
@@ -1886,7 +2100,11 @@ async fn qq_authorize_from_ptsigx(uin: &str, ptsigx: &str) -> Result<BTreeMap<St
                 .map(|n| n.to_string())
                 .or_else(|| x.as_str().map(|s| s.to_string()))
         })
-        .or_else(|| data.get("str_musicid").and_then(Value::as_str).map(|s| s.to_string()))
+        .or_else(|| {
+            data.get("str_musicid")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| uin.to_string());
 
     jar.insert("qm_keyst".into(), musickey.clone());
@@ -1904,25 +2122,30 @@ async fn qq_authorize_from_ptsigx(uin: &str, ptsigx: &str) -> Result<BTreeMap<St
             jar.insert("psrf_qqopenid".into(), oid.to_string());
         }
     }
-    eprintln!("[qq] authorize OK musicid={musicid} musickey_len={}", jar.get("qm_keyst").map(|s| s.len()).unwrap_or(0));
+    eprintln!(
+        "[qq] authorize OK musicid={musicid} musickey_len={}",
+        jar.get("qm_keyst").map(|s| s.len()).unwrap_or(0)
+    );
     Ok(jar)
 }
 
 fn classify_ptui(text: &str) -> (&'static str, i64) {
     // Prefer Chinese messages — code numbers have shifted across versions.
-    if text.contains("登录成功") || parse_ptui_code(text) == Some(0) {
-        if text.contains("ptuiCB('0'") || text.contains("ptuiCB(\"0\"") || text.contains("登录成功")
-        {
-            // ensure it's really success (has jump url or code 0)
-            if parse_ptui_code(text) == Some(0) || text.contains("check_sig") {
-                return ("success", 803);
-            }
-        }
+    let code = parse_ptui_code(text);
+    let has_success_marker =
+        text.contains("ptuiCB('0'") || text.contains("ptuiCB(\"0\"") || text.contains("登录成功");
+    if (text.contains("登录成功") || code == Some(0))
+        && has_success_marker
+        && (code == Some(0) || text.contains("check_sig"))
+    {
+        return ("success", 803);
     }
-    if text.contains("已经失效") || text.contains("二维码已失效") || text.contains("已失效") {
+    if text.contains("已经失效") || text.contains("二维码已失效") || text.contains("已失效")
+    {
         return ("expired", 800);
     }
-    if text.contains("认证中") || text.contains("扫描成功") || text.contains("正在验证") {
+    if text.contains("认证中") || text.contains("扫描成功") || text.contains("正在验证")
+    {
         return ("scanned", 802);
     }
     if text.contains("未失效") || text.contains("尚未被扫描") {
@@ -1943,11 +2166,7 @@ async fn follow_and_collect_cookies(
     start_url: &str,
     initial: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
-    let client = Client::builder()
-        .user_agent(UA)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().no_redirect.clone();
     let mut url = start_url.to_string();
     let mut jar = initial.clone();
     for _ in 0..16 {
@@ -1997,7 +2216,6 @@ async fn follow_and_collect_cookies(
     }
     Ok(jar)
 }
-
 
 /// Pull musickey-like fields from a musicu JSON body into the cookie jar.
 fn qq_absorb_music_keys_from_json(jar: &mut BTreeMap<String, String>, v: &Value) {
@@ -2120,11 +2338,7 @@ fn qq_normalize_music_aliases(jar: &mut BTreeMap<String, String>) {
 /// After QQ OAuth cookies, best-effort bootstrap y.qq.com music cookies (qm_keyst).
 /// Without qm_keyst / qqmusic_key, GetVkey returns empty purl for nearly all tracks.
 async fn enrich_qq_music_cookies(jar: &mut BTreeMap<String, String>) {
-    let client = Client::builder()
-        .user_agent(UA)
-        .redirect(reqwest::redirect::Policy::none())
-        .build();
-    let Ok(client) = client else { return };
+    let client = http_clients().no_redirect.clone();
 
     let uin = jar
         .get("uin")
@@ -2188,8 +2402,7 @@ async fn enrich_qq_music_cookies(jar: &mut BTreeMap<String, String>) {
     }
 
     // 2) Graph authorize (implicit token) with official redirect_uri
-    let redirect =
-        "https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/";
+    let redirect = "https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/";
     if let Ok(auth_url) = reqwest::Url::parse_with_params(
         "https://graph.qq.com/oauth2.0/authorize",
         &[
@@ -2251,14 +2464,7 @@ async fn enrich_qq_music_cookies(jar: &mut BTreeMap<String, String>) {
     }
 
     // 3) Site pages that may Set-Cookie music session
-    let client2 = Client::builder()
-        .user_agent(UA)
-        .redirect(reqwest::redirect::Policy::limited(8))
-        .build();
-    let Ok(client2) = client2 else {
-        qq_normalize_music_aliases(jar);
-        return;
-    };
+    let client2 = http_clients().limited_redirect.clone();
     for page in [
         QQ_YQQ_URL,
         "https://i.y.qq.com/n2/m/index.html",
@@ -2375,10 +2581,7 @@ async fn qq_qr_key(state: State<'_, QqLoginState>) -> Result<PlatformQrKey, Stri
     if let Ok(mut g) = state.pending.lock() {
         *g = None;
     }
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
     let mut jar: BTreeMap<String, String> = BTreeMap::new();
 
     // 1) xlogin — graph OAuth style (poll is reliable with this session)
@@ -2500,10 +2703,7 @@ async fn qq_qr_check(
     )
     .map_err(|e| e.to_string())?;
 
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
     let resp = client
         .get(poll_url)
         .header(USER_AGENT, UA)
@@ -2518,10 +2718,7 @@ async fn qq_qr_check(
         if let Ok(mut g) = state.pending.lock() {
             *g = Some(pending);
         }
-        return Err(format!(
-            "QQ 扫码轮询 HTTP {}（将自动重试）",
-            resp.status()
-        ));
+        return Err(format!("QQ 扫码轮询 HTTP {}（将自动重试）", resp.status()));
     }
     merge_cookies_into(&mut pending.cookies, resp.headers());
     let text = resp.text().await.map_err(|e| e.to_string())?;
@@ -2576,17 +2773,21 @@ async fn qq_qr_check(
 
             // Official path (L-1124/QQMusicApi): ptsigx → check_sig → OAuth code → musickey
             let mut jar = pending.cookies;
-            let mut got_music_key = false;
-            if let (Some(sigx), Some(uin)) = (parse_ptsigx(&jump), parse_uin_from_url(&jump).or_else(|| {
-                jar.get("uin")
-                    .or_else(|| jar.get("p_uin"))
-                    .map(|u| u.trim_start_matches('o').to_string())
-                    .filter(|u| !u.is_empty() && u != "0")
-            })) {
+            let got_music_key;
+            if let (Some(sigx), Some(uin)) = (
+                parse_ptsigx(&jump),
+                parse_uin_from_url(&jump).or_else(|| {
+                    jar.get("uin")
+                        .or_else(|| jar.get("p_uin"))
+                        .map(|u| u.trim_start_matches('o').to_string())
+                        .filter(|u| !u.is_empty() && u != "0")
+                }),
+            ) {
                 match qq_authorize_from_ptsigx(&uin, &sigx).await {
                     Ok(auth_jar) => {
                         jar = auth_jar;
-                        got_music_key = jar.contains_key("qm_keyst") || jar.contains_key("qqmusic_key");
+                        got_music_key =
+                            jar.contains_key("qm_keyst") || jar.contains_key("qqmusic_key");
                     }
                     Err(e) => {
                         eprintln!("[qq] authorize_from_ptsigx failed: {e}");
@@ -2602,7 +2803,10 @@ async fn qq_qr_check(
                     }
                 }
             } else {
-                eprintln!("[qq] success jump missing ptsigx/uin, jump={}", &jump[..jump.len().min(120)]);
+                eprintln!(
+                    "[qq] success jump missing ptsigx/uin, jump={}",
+                    &jump[..jump.len().min(120)]
+                );
                 if !jump.is_empty() {
                     if let Ok(extra) = follow_and_collect_cookies(&jump, &jar).await {
                         jar = extra;
@@ -2680,10 +2884,7 @@ const KUGOU_SRCAPPID: &str = "2919";
 const KUGOU_CLIENTVER: &str = "20489";
 
 fn kugou_signature_web(params: &BTreeMap<String, String>) -> String {
-    let mut parts: Vec<String> = params
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
+    let mut parts: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
     parts.sort();
     let joined = parts.join("");
     format!(
@@ -2696,7 +2897,10 @@ fn kugou_web_params(extra: BTreeMap<String, String>) -> BTreeMap<String, String>
     let clienttime = (timestamp_ms() / 1000).to_string();
     let mut params = BTreeMap::new();
     params.insert("dfid".into(), "-".into());
-    params.insert("mid".into(), format!("{:x}", md5::compute(clienttime.as_bytes())));
+    params.insert(
+        "mid".into(),
+        format!("{:x}", md5::compute(clienttime.as_bytes())),
+    );
     params.insert("uuid".into(), "-".into());
     params.insert("appid".into(), KUGOU_APPID.into());
     params.insert("clientver".into(), KUGOU_CLIENTVER.into());
@@ -2720,10 +2924,7 @@ fn map_to_query(params: &BTreeMap<String, String>) -> String {
 
 #[tauri::command]
 async fn kugou_qr_key() -> Result<PlatformQrKey, String> {
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
     let mut extra = BTreeMap::new();
     extra.insert("type".into(), "1".into());
     extra.insert("plat".into(), "4".into());
@@ -2776,10 +2977,7 @@ async fn kugou_qr_check(args: PlatformQrCheckArgs) -> Result<PlatformQrStatus, S
     if key.is_empty() {
         return Err("missing qrcode".into());
     }
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
     let mut extra = BTreeMap::new();
     extra.insert("plat".into(), "4".into());
     extra.insert("qrcode".into(), key.to_string());
@@ -2963,10 +3161,7 @@ async fn qq_user_playlists() -> Result<Value, String> {
         return Err("QQ Cookie 缺少 uin，请重新扫码登录".into());
     }
     let gtk = qq_gtk_from_cookie(&cookie);
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
 
     // Verified working API (with skey/p_skey + g_tk):
     // music.musicasset.PlaylistBaseRead / GetPlaylistByUin → data.v_playlist
@@ -3087,10 +3282,7 @@ async fn qq_playlist_page(args: QqPlaylistPageArgs) -> Result<Value, String> {
     if disstid <= 0 {
         return Err("无效的 QQ 歌单 ID".into());
     }
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
 
     let song_begin = (page - 1) * pagesize;
 
@@ -3198,15 +3390,14 @@ async fn qq_playlist_page(args: QqPlaylistPageArgs) -> Result<Value, String> {
 const KUGOU_ANDROID_SALT: &str = "OIlwieks28dk2k092lksi2UIkp";
 
 fn kugou_signature_android(params: &BTreeMap<String, String>, body: &str) -> String {
-    let mut parts: Vec<String> = params
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
+    let mut parts: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
     parts.sort();
     let joined = parts.join("");
     format!(
         "{:x}",
-        md5::compute(format!("{KUGOU_ANDROID_SALT}{joined}{body}{KUGOU_ANDROID_SALT}"))
+        md5::compute(format!(
+            "{KUGOU_ANDROID_SALT}{joined}{body}{KUGOU_ANDROID_SALT}"
+        ))
     )
 }
 
@@ -3239,20 +3430,11 @@ async fn kugou_gateway_json(
     body: Option<Value>,
     session: &KugouSession,
 ) -> Result<Value, String> {
-    let client = Client::builder()
-        .user_agent("Android14-1070-11070-201-0-Play-wifi")
-        .build()
-        .map_err(|e| e.to_string())?;
-    let body_str = body
-        .as_ref()
-        .map(|v| v.to_string())
-        .unwrap_or_default();
+    let client = http_clients().kugou_android.clone();
+    let body_str = body.as_ref().map(|v| v.to_string()).unwrap_or_default();
     let sig = kugou_signature_android(&params, &body_str);
     params.insert("signature".into(), sig);
-    let url = format!(
-        "https://gateway.kugou.com{path}?{}",
-        map_to_query(&params)
-    );
+    let url = format!("https://gateway.kugou.com{path}?{}", map_to_query(&params));
     let mut req = match method {
         "POST" | "post" => client.post(&url),
         _ => client.get(&url),
@@ -3372,9 +3554,11 @@ async fn kugou_user_playlists() -> Result<Value, String> {
                 listid
             } else {
                 // stable synthetic id from global collection id
-                (global.chars().take(12).fold(0u32, |a, c| {
-                    a.wrapping_mul(31).wrapping_add(c as u32)
-                })) as i64
+                (global
+                    .chars()
+                    .take(12)
+                    .fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c as u32)))
+                    as i64
             };
             Some(json!({
                 "id": id,
@@ -3408,7 +3592,7 @@ fn kugou_api_ok(data: &Value) -> bool {
     true
 }
 
-fn kugou_song_array<'a>(data: &'a Value) -> Option<&'a Vec<Value>> {
+fn kugou_song_array(data: &Value) -> Option<&Vec<Value>> {
     const PATHS: &[&str] = &[
         "/data/info",
         "/data/songs",
@@ -3427,7 +3611,9 @@ fn kugou_song_array<'a>(data: &'a Value) -> Option<&'a Vec<Value>> {
         }
     }
     // last resort: data itself is array
-    data.get("data").and_then(Value::as_array).filter(|a| !a.is_empty())
+    data.get("data")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
 }
 
 fn kugou_pick_hash(item: &Value) -> Option<String> {
@@ -3443,7 +3629,12 @@ fn kugou_pick_hash(item: &Value) -> Option<String> {
         "filehash",
     ];
     for k in KEYS {
-        if let Some(h) = item.get(*k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(h) = item
+            .get(*k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             return Some(h.to_string());
         }
     }
@@ -3483,7 +3674,7 @@ fn map_kugou_playlist_songs(data: &Value) -> Vec<Value> {
                 (a.trim().to_string(), t.trim().to_string())
             } else if let Some((a, t)) = raw_name.split_once('-') {
                 // some use "artist-song" without spaces
-                if a.len() < 40 && t.len() > 0 {
+                if a.len() < 40 && !t.is_empty() {
                     (a.trim().to_string(), t.trim().to_string())
                 } else {
                     let ar = item
@@ -3715,7 +3906,13 @@ async fn kugou_playlist_page(args: KugouPlaylistPageArgs) -> Result<Value, Strin
             }
             Ok((_, _, raw)) => {
                 last_raw = raw.clone();
-                last_err = format!("listid 接口异常: {}", raw.get("error_msg").or_else(|| raw.get("errmsg")).and_then(Value::as_str).unwrap_or("unknown"));
+                last_err = format!(
+                    "listid 接口异常: {}",
+                    raw.get("error_msg")
+                        .or_else(|| raw.get("errmsg"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                );
             }
             Err(e) => last_err = e,
         }
@@ -3737,10 +3934,7 @@ async fn kugou_playlist_page(args: KugouPlaylistPageArgs) -> Result<Value, Strin
 
     // 3) Alternate mobile endpoint for collection id
     if let Some(ref g) = gid {
-        let client = Client::builder()
-            .user_agent(UA)
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = http_clients().default.clone();
         let url = reqwest::Url::parse_with_params(
             "https://mobileservice.kugou.com/api/v5/special/song",
             &[
@@ -3828,21 +4022,24 @@ async fn netease_song_url(
 }
 
 #[tauri::command]
-async fn netease_song_json(state: State<'_, NeteaseState>, id: i64) -> Result<Value, String> {
-    let detail = song_detail(&state, id).await?;
-    let lyrics = get_json(
-        &state,
-        &format!("/api/song/lyric?id={id}&lv=-1&kv=-1&tv=-1"),
-        true,
-    )
-    .await
-    .unwrap_or_else(|_| json!({}));
-    let url_data = song_url_value(&state, id, 320000)
-        .await
-        .unwrap_or_else(|_| json!({ "url": null }));
-    let album = detail.get("album").or_else(|| detail.get("al")).unwrap_or(&Value::Null);
-    let artists = detail.get("artists").or_else(|| detail.get("ar")).unwrap_or(&Value::Null);
-    let name = detail.get("name").and_then(Value::as_str).unwrap_or("未知歌曲");
+async fn netease_song_metadata(state: State<'_, NeteaseState>, id: i64) -> Result<Value, String> {
+    let lyric_path = format!("/api/song/lyric?id={id}&lv=-1&kv=-1&tv=-1");
+    let (detail_result, lyrics_result) =
+        tokio::join!(song_detail(&state, id), get_json(&state, &lyric_path, true),);
+    let detail = detail_result?;
+    let lyrics = lyrics_result.unwrap_or_else(|_| json!({}));
+    let album = detail
+        .get("album")
+        .or_else(|| detail.get("al"))
+        .unwrap_or(&Value::Null);
+    let artists = detail
+        .get("artists")
+        .or_else(|| detail.get("ar"))
+        .unwrap_or(&Value::Null);
+    let name = detail
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("未知歌曲");
     let artist = artist_name(artists);
     let mut lyric = lyric_text(&lyrics, "lrc");
     let mut lyric_source = "netease";
@@ -3852,7 +4049,9 @@ async fn netease_song_json(state: State<'_, NeteaseState>, id: i64) -> Result<Va
             .or_else(|| detail.get("dt"))
             .and_then(Value::as_i64)
             .unwrap_or_default();
-        if let Some(fallback) = fetch_fallback_lyric(&state.client, id, name, &artist, duration_ms).await {
+        if let Some(fallback) =
+            fetch_fallback_lyric(&state.client, id, name, &artist, duration_ms).await
+        {
             lyric = fallback.lyric;
             lyric_source = fallback.source;
         }
@@ -3865,12 +4064,7 @@ async fn netease_song_json(state: State<'_, NeteaseState>, id: i64) -> Result<Va
             "pic": album.get("picUrl").and_then(Value::as_str).unwrap_or(""),
             "lyric": lyric,
             "tlyric": lyric_text(&lyrics, "tlyric"),
-            "lyric_source": lyric_source,
-            "url": url_data.get("url").cloned().unwrap_or(Value::Null),
-            "level": url_data.get("level").and_then(Value::as_str).unwrap_or("standard"),
-            "quality_name": url_data.get("level").and_then(Value::as_str).unwrap_or("standard"),
-            "size": url_data.get("size").and_then(Value::as_i64).unwrap_or_default(),
-            "type": url_data.get("type").and_then(Value::as_str).unwrap_or("")
+            "lyric_source": lyric_source
         }
     }))
 }
@@ -3880,9 +4074,32 @@ async fn netease_playlist_page(
     state: State<'_, NeteaseState>,
     args: PlaylistPageArgs,
 ) -> Result<Value, String> {
+    let limit = args.limit.clamp(1, 100);
+    if let Ok(cached) = playlist_track_ids(&state, args.id).await {
+        if !cached.track_ids.is_empty() {
+            let ids = slice_track_ids(&cached.track_ids, args.offset, limit);
+            let tracks = batch_song_details(&state, &ids).await?;
+            return Ok(json!({
+                "data": {
+                    "playlist": {
+                        "tracks": tracks,
+                        "trackTotal": cached.total,
+                        "trackOffset": args.offset,
+                        "trackLimit": limit
+                    }
+                }
+            }));
+        }
+    }
+
+    // Compatibility fallback for accounts/endpoints that omit trackIds.
     let env = get_json(
         &state,
-        &format!("/api/v6/playlist/detail?id={}&n={}&s=8", args.id, args.limit + args.offset),
+        &format!(
+            "/api/v6/playlist/detail?id={}&n={}&s=8",
+            args.id,
+            limit + args.offset
+        ),
         true,
     )
     .await?;
@@ -3898,7 +4115,7 @@ async fn netease_playlist_page(
             tracks
                 .iter()
                 .skip(args.offset as usize)
-                .take(args.limit as usize)
+                .take(limit as usize)
                 .map(map_song)
                 .collect::<Vec<_>>()
         })
@@ -3909,7 +4126,7 @@ async fn netease_playlist_page(
                 "tracks": tracks,
                 "trackTotal": total,
                 "trackOffset": args.offset,
-                "trackLimit": args.limit
+                "trackLimit": limit
             }
         }
     }))
@@ -3939,18 +4156,23 @@ struct QqPlayArgs {
 /// otherwise       → `{prefix}{songmid}{songmid}{ext}`
 /// ```
 /// Extra legacy shapes waste tries and can surface noise codes like 104009.
-fn qq_filename_candidates(level: &str, songmid: &str, media_mid: &str) -> Vec<(String, &'static str)> {
+fn qq_filename_candidates(
+    level: &str,
+    songmid: &str,
+    media_mid: &str,
+) -> Vec<(String, &'static str)> {
     let media = media_mid.trim();
     let mid = songmid.trim();
     let mut files: Vec<(String, &'static str)> = Vec::new();
-    let push = |out: &mut Vec<(String, &'static str)>, prefix: &str, ext: &str, label: &'static str| {
-        let name = if !media.is_empty() && media != mid {
-            format!("{prefix}{media}{ext}")
-        } else {
-            format!("{prefix}{mid}{mid}{ext}")
+    let push =
+        |out: &mut Vec<(String, &'static str)>, prefix: &str, ext: &str, label: &'static str| {
+            let name = if !media.is_empty() && media != mid {
+                format!("{prefix}{media}{ext}")
+            } else {
+                format!("{prefix}{mid}{mid}{ext}")
+            };
+            out.push((name, label));
         };
-        out.push((name, label));
-    };
 
     match level {
         "hires" | "lossless" | "jyeffect" | "sky" | "jymaster" => {
@@ -4185,14 +4407,16 @@ async fn qq_try_vkey(
     // 3) Legacy CgiGetVkey
     let legacy = qq_try_vkey_legacy(
         client,
-        mid,
-        filename,
-        cookie,
-        guid,
-        songtype,
-        &uin,
-        gtk,
-        loginflag,
+        QqLegacyVkeyParams {
+            mid,
+            filename,
+            cookie,
+            guid,
+            songtype,
+            uin: &uin,
+            gtk,
+            loginflag,
+        },
     )
     .await;
     if let Ok((p, d)) = legacy {
@@ -4205,35 +4429,39 @@ async fn qq_try_vkey(
     Ok((String::new(), last_data))
 }
 
-async fn qq_try_vkey_legacy(
-    client: &Client,
-    mid: &str,
-    filename: Option<&str>,
-    cookie: Option<&str>,
-    guid: &str,
+struct QqLegacyVkeyParams<'a> {
+    mid: &'a str,
+    filename: Option<&'a str>,
+    cookie: Option<&'a str>,
+    guid: &'a str,
     songtype: i64,
-    uin: &str,
+    uin: &'a str,
     gtk: u32,
     loginflag: i32,
+}
+
+async fn qq_try_vkey_legacy(
+    client: &Client,
+    args: QqLegacyVkeyParams<'_>,
 ) -> Result<(String, Value), String> {
     let mut param = json!({
-        "guid": guid,
-        "songmid": [mid],
-        "songtype": [songtype],
-        "uin": uin,
-        "loginflag": loginflag,
+        "guid": args.guid,
+        "songmid": [args.mid],
+        "songtype": [args.songtype],
+        "uin": args.uin,
+        "loginflag": args.loginflag,
         "platform": "20",
     });
-    if let Some(f) = filename {
+    if let Some(f) = args.filename {
         param["filename"] = json!([f]);
     }
     // Desktop-ish legacy — cookies only, no authst (same 104009 trap)
     let comm = json!({
-        "uin": uin,
+        "uin": args.uin,
         "format": "json",
         "ct": 19,
         "cv": 2201,
-        "g_tk": gtk,
+        "g_tk": args.gtk,
         "platform": "yqq.json",
         "needNewCode": 1,
         "chid": "0",
@@ -4246,7 +4474,7 @@ async fn qq_try_vkey_legacy(
             "param": param
         }
     });
-    let data = qq_post_musicu(client, body, cookie).await?;
+    let data = qq_post_musicu(client, body, args.cookie).await?;
     Ok((qq_extract_purl(&data), data))
 }
 
@@ -4266,10 +4494,7 @@ fn qq_pick_sip(data: &Value) -> String {
         }
     });
     preferred
-        .or_else(|| {
-            sips.iter()
-                .find_map(|v| v.as_str().map(|s| s.to_string()))
-        })
+        .or_else(|| sips.iter().find_map(|v| v.as_str().map(|s| s.to_string())))
         .unwrap_or_else(|| "https://ws.stream.qqmusic.qq.com/".into())
 }
 
@@ -4297,10 +4522,7 @@ async fn qq_post_musicu(
 
 #[tauri::command]
 async fn qq_search(args: QqSearchArgs) -> Result<Value, String> {
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
     let limit = args.limit.unwrap_or(30).clamp(1, 50);
     let keyword = args.keyword.trim();
     if keyword.is_empty() {
@@ -4392,10 +4614,7 @@ fn qq_cookie_to_jar(raw: &str) -> BTreeMap<String, String> {
 
 #[tauri::command]
 async fn qq_song_play(args: QqPlayArgs) -> Result<Value, String> {
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
     let mid = args.songmid.trim();
     if mid.is_empty() {
         return Err("missing songmid".into());
@@ -4500,14 +4719,19 @@ async fn qq_song_play(args: QqPlayArgs) -> Result<Value, String> {
 
     let Some((purl, data, qlabel)) = got else {
         let has_auth = cookie_ref.and_then(qq_authst_from_cookie).is_some();
-        let uin = cookie_ref.map(qq_uin_from_cookie).unwrap_or_else(|| "0".into());
+        let uin = cookie_ref
+            .map(qq_uin_from_cookie)
+            .unwrap_or_else(|| "0".into());
         let code = last_data
             .as_ref()
             .and_then(|d| d.pointer("/req_0/code").and_then(Value::as_i64))
             .unwrap_or(-1);
         let info_code = last_data
             .as_ref()
-            .and_then(|d| d.pointer("/req_0/data/midurlinfo/0/subcode").or_else(|| d.pointer("/req_0/data/midurlinfo/0/code")))
+            .and_then(|d| {
+                d.pointer("/req_0/data/midurlinfo/0/subcode")
+                    .or_else(|| d.pointer("/req_0/data/midurlinfo/0/code"))
+            })
             .and_then(Value::as_i64)
             .unwrap_or(-1);
         let errmsg = last_data
@@ -4524,7 +4748,8 @@ async fn qq_song_play(args: QqPlayArgs) -> Result<Value, String> {
             "未登录 QQ 音乐，请先扫码登录后再播放".to_string()
         } else if !has_auth {
             // Root cause we diagnosed: ptlogin only left skey/uin, no qm_keyst.
-            "QQ 登录缺少播放凭证(qm_keyst)。请退出后重新用手机 QQ 扫码登录，确认授权完成".to_string()
+            "QQ 登录缺少播放凭证(qm_keyst)。请退出后重新用手机 QQ 扫码登录，确认授权完成"
+                .to_string()
         } else if code == 1000 || code == 104401 || code == 104009 {
             // 104009: login/param mismatch (was triggered by authst on Web profile)
             "QQ 登录态失效或鉴权参数错误，请退出后重新扫码登录".to_string()
@@ -4573,7 +4798,10 @@ async fn qq_song_play(args: QqPlayArgs) -> Result<Value, String> {
     if url.starts_with("http://") {
         url = url.replacen("http://", "https://", 1);
     }
-    eprintln!("[qq_song_play] OK mid={mid} q={qlabel} url={}", &url[..url.len().min(96)]);
+    eprintln!(
+        "[qq_song_play] OK mid={mid} q={qlabel} url={}",
+        &url[..url.len().min(96)]
+    );
     Ok(json!({
         "data": {
             "url": url,
@@ -4653,7 +4881,10 @@ fn kugou_hash_ladder(args: &KugouPlayArgs) -> Vec<(String, &'static str)> {
     };
     // Always put the explicitly requested hash first if not already
     if !primary.is_empty() {
-        ordered.insert(0, (primary, ordered.first().map(|x| x.1).unwrap_or("standard")));
+        ordered.insert(
+            0,
+            (primary, ordered.first().map(|x| x.1).unwrap_or("standard")),
+        );
     }
     // de-dupe while preserving order
     let mut seen = std::collections::HashSet::new();
@@ -4665,7 +4896,10 @@ fn kugou_hash_ladder(args: &KugouPlayArgs) -> Vec<(String, &'static str)> {
 
 /// Tracker CDN key — modern free/preview streams use salt `kgcloud` (not kgcloudv2).
 fn kugou_tracker_key(hash: &str) -> String {
-    format!("{:x}", md5::compute(format!("{}kgcloud", hash.to_ascii_lowercase())))
+    format!(
+        "{:x}",
+        md5::compute(format!("{}kgcloud", hash.to_ascii_lowercase()))
+    )
 }
 
 fn kugou_pick_url_field(v: &Value) -> Option<String> {
@@ -4720,10 +4954,7 @@ async fn kugou_tracker_url(
         if !s.cookie.is_empty() {
             req = req.header("Cookie", s.cookie.as_str());
         } else if !s.token.is_empty() {
-            req = req.header(
-                "Cookie",
-                format!("token={}; userid={}", s.token, s.userid),
-            );
+            req = req.header("Cookie", format!("token={}; userid={}", s.token, s.userid));
         }
     }
     let data = req
@@ -4795,15 +5026,9 @@ async fn kugou_fetch_play_url(
         if !sess.token.is_empty() {
             match kugou_get_res_privilege(sess, hash, album_audio_id, album_id).await {
                 Ok(priv_data) => {
-                    let item = priv_data
-                        .pointer("/data/0")
-                        .cloned()
-                        .unwrap_or(Value::Null);
+                    let item = priv_data.pointer("/data/0").cloned().unwrap_or(Value::Null);
                     // Free / owned full track
-                    let privilege = item
-                        .get("privilege")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(-1);
+                    let privilege = item.get("privilege").and_then(Value::as_i64).unwrap_or(-1);
                     let status = item.get("status").and_then(Value::as_i64).unwrap_or(0);
                     let full_hash = item
                         .get("hash")
@@ -4813,8 +5038,7 @@ async fn kugou_fetch_play_url(
 
                     // privilege 0 (or status==1) usually means free to play full song
                     if privilege == 0 || status == 1 {
-                        let (url, data) =
-                            kugou_tracker_url(client, &full_hash, Some(sess)).await?;
+                        let (url, data) = kugou_tracker_url(client, &full_hash, Some(sess)).await?;
                         if url.is_some() {
                             return Ok((url, data, false));
                         }
@@ -4827,8 +5051,7 @@ async fn kugou_fetch_play_url(
                         .and_then(Value::as_str)
                         .map(|s| s.to_string());
                     if let Some(clip_hash) = clip {
-                        let (url, data) =
-                            kugou_tracker_url(client, &clip_hash, Some(sess)).await?;
+                        let (url, data) = kugou_tracker_url(client, &clip_hash, Some(sess)).await?;
                         if url.is_some() {
                             eprintln!(
                                 "[kugou] preview clip hash={} for full={}",
@@ -4866,10 +5089,7 @@ async fn kugou_fetch_play_url(
         if !s.cookie.is_empty() {
             req = req.header("Cookie", s.cookie.as_str());
         } else if !s.token.is_empty() {
-            req = req.header(
-                "Cookie",
-                format!("token={}; userid={}", s.token, s.userid),
-            );
+            req = req.header("Cookie", format!("token={}; userid={}", s.token, s.userid));
         }
     }
     let data = req
@@ -4898,10 +5118,7 @@ async fn kugou_fetch_play_url(
 
 #[tauri::command]
 async fn kugou_search(args: KugouSearchArgs) -> Result<Value, String> {
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
     let limit = args.limit.unwrap_or(30).clamp(1, 50);
     let keyword = args.keyword.trim();
     if keyword.is_empty() {
@@ -5049,10 +5266,7 @@ async fn kugou_search(args: KugouSearchArgs) -> Result<Value, String> {
 
 #[tauri::command]
 async fn kugou_song_play(args: KugouPlayArgs) -> Result<Value, String> {
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_clients().default.clone();
     if args.hash.trim().is_empty() {
         return Err("missing hash".into());
     }
@@ -5188,22 +5402,87 @@ struct HttpProxyArgs {
     binary: Option<bool>,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAppSong {
+    id: i64,
+    name: String,
+    artist: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAppPlaylist {
+    id: String,
+    name: String,
+    songs: Vec<StoredAppSong>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Deserialize)]
+struct SaveAppPlaylistsArgs {
+    playlists: Vec<StoredAppPlaylist>,
+}
+
+#[derive(Serialize)]
+struct LoadAppPlaylistsResult {
+    exists: bool,
+    playlists: Vec<StoredAppPlaylist>,
+}
+
+fn proxy_url_allowed(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some(
+                "u.y.qq.com" | "complexsearch.kugou.com" | "mobiles.kugou.com" | "lyrics.kugou.com"
+            )
+        )
+}
+
+#[tauri::command]
+fn load_app_playlists() -> Result<LoadAppPlaylistsResult, String> {
+    let path = app_playlists_file_path();
+    if !path.exists() {
+        return Ok(LoadAppPlaylistsResult {
+            exists: false,
+            playlists: Vec::new(),
+        });
+    }
+    let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let playlists = serde_json::from_str::<Vec<StoredAppPlaylist>>(&raw)
+        .map_err(|error| format!("自建歌单文件格式无效: {error}"))?;
+    Ok(LoadAppPlaylistsResult {
+        exists: true,
+        playlists,
+    })
+}
+
+#[tauri::command]
+fn save_app_playlists(args: SaveAppPlaylistsArgs) -> Result<(), String> {
+    write_json_atomically(&app_playlists_file_path(), &args.playlists)
+}
+
 #[tauri::command]
 async fn http_proxy(args: HttpProxyArgs) -> Result<Value, String> {
-    let method = args
-        .method
-        .as_deref()
-        .unwrap_or("GET")
-        .to_ascii_uppercase();
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let method = args.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+    if !matches!(method.as_str(), "GET" | "POST") {
+        return Err("proxy method must be GET or POST".into());
+    }
+    let url = reqwest::Url::parse(&args.url).map_err(|error| error.to_string())?;
+    if !proxy_url_allowed(&url) {
+        return Err("proxy host is not allowed".into());
+    }
+    let client = http_clients().no_redirect.clone();
 
     let mut builder = match method.as_str() {
-        "POST" => client.post(&args.url),
-        "PUT" => client.put(&args.url),
-        _ => client.get(&args.url),
+        "POST" => client.post(url),
+        _ => client.get(url),
     };
 
     if let Some(headers) = &args.headers {
@@ -5221,7 +5500,10 @@ async fn http_proxy(args: HttpProxyArgs) -> Result<Value, String> {
         builder = builder.body(body.clone());
     }
 
-    let res = builder.send().await.map_err(|e| format!("proxy request failed: {e}"))?;
+    let mut res = builder
+        .send()
+        .await
+        .map_err(|e| format!("proxy request failed: {e}"))?;
     let status = res.status().as_u16();
     let content_type = res
         .headers()
@@ -5229,15 +5511,33 @@ async fn http_proxy(args: HttpProxyArgs) -> Result<Value, String> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = res
-        .bytes()
+    const MAX_PROXY_BYTES: u64 = 4 * 1024 * 1024;
+    if res
+        .content_length()
+        .is_some_and(|length| length > MAX_PROXY_BYTES)
+    {
+        return Err("proxy response exceeds 4 MiB".into());
+    }
+    let mut bytes = Vec::with_capacity(
+        res.content_length()
+            .unwrap_or_default()
+            .min(MAX_PROXY_BYTES) as usize,
+    );
+    while let Some(chunk) = res
+        .chunk()
         .await
-        .map_err(|e| format!("proxy read body failed: {e}"))?;
+        .map_err(|e| format!("proxy read body failed: {e}"))?
+    {
+        if bytes.len() + chunk.len() > MAX_PROXY_BYTES as usize {
+            return Err("proxy response exceeds 4 MiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
 
     if args.binary.unwrap_or(false) {
         // Minimal base64 encoder (no extra crate).
         const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut body_b64 = String::with_capacity((bytes.len() + 2) / 3 * 4);
+        let mut body_b64 = String::with_capacity(bytes.len().div_ceil(3) * 4);
         let mut i = 0;
         while i < bytes.len() {
             let b0 = bytes[i] as u32;
@@ -5315,10 +5615,7 @@ async fn netease_user_playlists(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let client = Client::builder()
-        .user_agent(UA)
-        .build()
-        .expect("failed to build NetEase HTTP client");
+    let client = http_clients().default.clone();
     let cookie_file = cookie_file_path();
     let device_file = cookie_file.with_file_name("device_id.txt");
 
@@ -5327,11 +5624,11 @@ pub fn run() {
             client,
             cookie_file,
             device_file,
+            playlist_cache: Mutex::new(HashMap::new()),
         })
         .manage(QqLoginState {
             pending: Mutex::new(None),
         })
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // focus the existing window when a second instance is launched
             if let Some(w) = app.get_webview_window("main") {
@@ -5349,14 +5646,9 @@ pub fn run() {
                 // Workaround for Tauri #8632: transparent window shows a white
                 // background until the first resize. Nudge size +1px then back.
                 if let Ok(size) = window.outer_size() {
-                    let _ = window.set_size(tauri::PhysicalSize::new(
-                        size.width + 1,
-                        size.height + 1,
-                    ));
-                    let _ = window.set_size(tauri::PhysicalSize::new(
-                        size.width,
-                        size.height,
-                    ));
+                    let _ =
+                        window.set_size(tauri::PhysicalSize::new(size.width + 1, size.height + 1));
+                    let _ = window.set_size(tauri::PhysicalSize::new(size.width, size.height));
                 }
             }
 
@@ -5419,7 +5711,7 @@ pub fn run() {
             netease_logout,
             netease_search,
             netease_song_url,
-            netease_song_json,
+            netease_song_metadata,
             netease_playlist_page,
             netease_user_playlists,
             auth_status,
@@ -5440,7 +5732,9 @@ pub fn run() {
             qq_search,
             qq_song_play,
             kugou_search,
-            kugou_song_play
+            kugou_song_play,
+            load_app_playlists,
+            save_app_playlists
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -5448,7 +5742,73 @@ pub fn run() {
 
 #[cfg(test)]
 mod qq_tests {
-    use super::{qq_guid_from_cookie, qq_search, qq_song_play, QqPlayArgs, QqSearchArgs};
+    use super::{
+        proxy_url_allowed, qq_guid_from_cookie, qq_search, qq_song_play, slice_track_ids,
+        write_json_atomically, QqPlayArgs, QqSearchArgs,
+    };
+    use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn playlist_pages_only_slice_the_requested_hundred_ids() {
+        let ids = (1..=2_000).collect::<Vec<_>>();
+        assert_eq!(
+            slice_track_ids(&ids, 100, 100),
+            (101..=200).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            slice_track_ids(&ids, 900, 100),
+            (901..=1_000).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            slice_track_ids(&ids, 1_950, 100),
+            (1_951..=2_000).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn proxy_allows_only_the_lyric_hosts() {
+        for url in [
+            "https://u.y.qq.com/cgi-bin/musicu.fcg",
+            "https://complexsearch.kugou.com/v2/search/song",
+            "https://mobiles.kugou.com/api/v3/lyric/search",
+            "https://lyrics.kugou.com/download",
+        ] {
+            assert!(proxy_url_allowed(&reqwest::Url::parse(url).unwrap()));
+        }
+        for url in [
+            "http://u.y.qq.com/cgi-bin/musicu.fcg",
+            "https://evil.example/",
+            "https://u.y.qq.com.evil.example/",
+        ] {
+            assert!(!proxy_url_allowed(&reqwest::Url::parse(url).unwrap()));
+        }
+    }
+
+    #[test]
+    fn atomic_playlist_write_replaces_and_preserves_old_data_on_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "cove-playlist-test-{}-{}",
+            std::process::id(),
+            super::timestamp_ms()
+        ));
+        let path = root.join("playlists.json");
+        write_json_atomically(&path, &json!([{"id": "first"}])).unwrap();
+        write_json_atomically(&path, &json!([{"id": "second"}])).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            json!([{"id": "second"}]).to_string()
+        );
+
+        let temporary = path.with_extension("json.tmp");
+        fs::create_dir_all(&temporary).unwrap();
+        assert!(write_json_atomically(&path, &json!([{"id": "third"}])).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            json!([{"id": "second"}]).to_string()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn qq_guid_is_uuid_style_and_unique() {

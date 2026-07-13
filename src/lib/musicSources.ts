@@ -5,10 +5,12 @@
 
 import type { MusicSource, Song, SongJson } from "./types";
 import {
-  getSongJson as neteaseSongJson,
+  getSongMetadata as neteaseSongMetadata,
   getSongUrl as neteaseSongUrl,
   search as neteaseSearch,
 } from "./api";
+import { AsyncTtlLru } from "./asyncTtlLru";
+import { invokeNative } from "./native";
 
 export const MUSIC_SOURCE_OPTIONS: Array<{ value: MusicSource; label: string }> = [
   { value: "netease", label: "网易云音乐" },
@@ -36,22 +38,7 @@ export function saveMusicSource(source: MusicSource) {
   }
 }
 
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
-async function invokeNative<T>(
-  command: string,
-  args?: Record<string, unknown>
-): Promise<T> {
-  if (!isTauriRuntime()) {
-    throw new Error("QQ / 酷狗流媒体需要桌面端（Tauri）运行");
-  }
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<T>(command, args);
-}
-
-function songKey(s: Pick<Song, "id" | "source" | "qqMid" | "kgHash">): string {
+export function getSongKey(s: Pick<Song, "id" | "source" | "qqMid" | "kgHash">): string {
   const src = s.source ?? "netease";
   if (src === "qq") return `qq:${s.qqMid ?? s.id}`;
   if (src === "kugou") return `kugou:${s.kgHash ?? s.id}`;
@@ -59,7 +46,7 @@ function songKey(s: Pick<Song, "id" | "source" | "qqMid" | "kgHash">): string {
 }
 
 export function sameSong(a: Song, b: Song): boolean {
-  return songKey(a) === songKey(b);
+  return getSongKey(a) === getSongKey(b);
 }
 
 /** Search tracks from the selected music source. */
@@ -139,7 +126,7 @@ function pickKugouHash(song: Song, level: string): string | undefined {
 }
 
 /** Resolve playable URL + metadata for any source. */
-export async function resolvePlayback(song: Song, level = "exhigh"): Promise<{
+export type PlaybackResolution = {
   url: string | null;
   meta: Partial<SongJson> & {
     name?: string;
@@ -150,13 +137,28 @@ export async function resolvePlayback(song: Song, level = "exhigh"): Promise<{
     tlyric?: string;
     lyric_source?: string;
   };
-}> {
+};
+
+const playbackCache = new AsyncTtlLru<PlaybackResolution>(8, 3 * 60_000);
+const neteaseUrlCache = new AsyncTtlLru<string | null>(8, 3 * 60_000);
+
+function playbackCacheKey(song: Song, level: string): string {
+  return `${getSongKey(song)}:${level}`;
+}
+
+async function resolvePlaybackUncached(
+  song: Song,
+  level = "exhigh",
+): Promise<PlaybackResolution> {
   const source = song.source ?? "netease";
 
   if (source === "netease") {
-    const json = await neteaseSongJson(song.id);
-    // Always prefer URL at the user-selected quality (song_json defaults to 320k).
-    const leveled = await neteaseSongUrl(song.id, level);
+    const [json, leveled] = await Promise.all([
+      neteaseSongMetadata(song.id),
+      neteaseUrlCache.getOrCreate(playbackCacheKey(song, level), () =>
+        neteaseSongUrl(song.id, level),
+      ),
+    ]);
     const url = leveled ?? json?.url ?? null;
     return {
       url,
@@ -251,4 +253,32 @@ export async function resolvePlayback(song: Song, level = "exhigh"): Promise<{
       quality_name: env.data?.quality_name ?? level,
     },
   };
+}
+
+/** Resolve a playable stream and metadata with in-flight de-duplication. */
+export function resolvePlayback(
+  song: Song,
+  level = "exhigh",
+): Promise<PlaybackResolution> {
+  return playbackCache.getOrCreate(playbackCacheKey(song, level), () =>
+    resolvePlaybackUncached(song, level),
+  );
+}
+
+/** Resolve only the URL needed by next-track preloading. */
+export async function resolvePlaybackUrl(
+  song: Song,
+  level = "exhigh",
+): Promise<string | null> {
+  if ((song.source ?? "netease") === "netease") {
+    return neteaseUrlCache.getOrCreate(playbackCacheKey(song, level), () =>
+      neteaseSongUrl(song.id, level),
+    );
+  }
+  return (await resolvePlayback(song, level)).url;
+}
+
+export function clearPlaybackResolutionCache(): void {
+  playbackCache.clear();
+  neteaseUrlCache.clear();
 }

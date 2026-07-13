@@ -4,10 +4,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { Check, Info, Loader2, Minus, RefreshCw, Smartphone, X } from "lucide-react";
 import QRCode from "qrcode";
 import {
-  getApiBase,
   getLoginStatus,
-  setApiBase,
-  usesBuiltInNeteaseApi,
   type LoginStatus,
 } from "../lib/api";
 import {
@@ -50,14 +47,12 @@ export function LoginPanel({
   const [qrImg, setQrImg] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("loading");
   const [err, setErr] = useState<string | null>(null);
-  const [apiBase, setApiBaseInput] = useState(getApiBase);
   const [infoOpen, setInfoOpen] = useState(false);
   const [infoBox, setInfoBox] = useState<{
     left: number;
     bottom: number;
     maxW: number;
   } | null>(null);
-  const useBuiltInApi = usesBuiltInNeteaseApi();
   const pollRef = useRef<AbortController | null>(null);
   /** Bumps on every startLogin / platform switch so stale async cannot overwrite UI. */
   const genRef = useRef(0);
@@ -77,7 +72,6 @@ export function LoginPanel({
   useEffect(() => {
     if (!open) return;
     setPlatform(initialPlatform);
-    setApiBaseInput(getApiBase());
     setErr(null);
     setInfoOpen(false);
     void refreshAuth();
@@ -149,18 +143,26 @@ export function LoginPanel({
     };
   }, [infoOpen]);
 
-  async function startLogin(p: AuthPlatform) {
+  async function startLogin(p: AuthPlatform, replaceExisting = false) {
     const gen = ++genRef.current;
     pollRef.current?.abort();
     setErr(null);
     setPhase("loading");
     setQrImg(null);
     try {
-      // Re-scan while already logged in: wipe old session first so residual
-      // cookies cannot keep showing the previous account as still online.
-      const prev =
-        p === "netease" ? auth.netease : p === "qq" ? auth.qq : auth.kugou;
-      if (prev.logged_in) {
+      // Opening the panel or switching tabs must never destroy an existing
+      // platform session. Only the explicit “重新扫码” action may replace it.
+      const latest = await getMultiAuthStatus().catch(() => auth);
+      if (gen !== genRef.current || platformRef.current !== p) return;
+      setAuth(latest);
+      onAuthChange?.(latest);
+      const existing =
+        p === "netease" ? latest.netease : p === "qq" ? latest.qq : latest.kugou;
+      if (existing.logged_in && !replaceExisting) {
+        setPhase("waiting");
+        return;
+      }
+      if (existing.logged_in && replaceExisting) {
         await logoutPlatform(p).catch(() => {});
         const st = await getMultiAuthStatus().catch(() => emptyMultiAuth());
         setAuth(st);
@@ -168,7 +170,6 @@ export function LoginPanel({
       }
       if (gen !== genRef.current || platformRef.current !== p) return;
 
-      if (p === "netease" && !useBuiltInApi) setApiBase(apiBase);
       const key = await getPlatformQrKey(p);
       // Stale: user switched tab or reopened
       if (gen !== genRef.current || platformRef.current !== p) return;
@@ -424,21 +425,6 @@ export function LoginPanel({
               </AnimatePresence>
 
               {/* 1) QR / logged-in card */}
-              {!useBuiltInApi && platform === "netease" && (
-                <label className="w-full block order-first">
-                  <span className="mb-1 block text-[10px] font-semibold text-white/45">API 地址</span>
-                  <input
-                    value={apiBase}
-                    onChange={(e) => setApiBaseInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void startLogin("netease");
-                    }}
-                    className="app-liquid-input h-9 w-full rounded-xl px-3 text-xs text-white outline-none"
-                    placeholder="http://127.0.0.1:5000"
-                  />
-                </label>
-              )}
-
               {currentAuth.logged_in && phase !== "success" && phase !== "loading" ? (
                 <div className="flex w-full flex-col items-center gap-2 rounded-2xl border border-emerald-400/20 bg-emerald-500/10 px-4 py-4">
                   <div className="grid h-10 w-10 place-items-center rounded-full bg-emerald-400/20 text-emerald-300">
@@ -449,7 +435,7 @@ export function LoginPanel({
                   </p>
                   <button
                     type="button"
-                    onClick={() => void startLogin(platform)}
+                    onClick={() => void startLogin(platform, true)}
                     className="text-[11px] text-white/45 underline-offset-2 hover:text-white hover:underline"
                   >
                     重新扫码

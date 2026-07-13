@@ -19,6 +19,7 @@ export function useAudioEngine() {
 
     let rafId = 0;
     let lastPublishedTime = -1;
+    let lastMediaPositionTime = -1;
 
     const publishTime = (force = false) => {
       const t = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
@@ -26,12 +27,17 @@ export function useAudioEngine() {
       if (!force && Math.abs(t - lastPublishedTime) < 1 / 30) return;
       lastPublishedTime = t;
       store()._setTime(t);
-      const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
-      setMediaPositionState({
-        duration: dur > 0 && dur < Infinity ? dur : 0,
-        playbackRate: audio.playbackRate || 1,
-        position: t,
-      });
+      // OS media-session synchronization does not need a frame-rate clock and
+      // may cross the WebView/native boundary. Once per second is sufficient.
+      if (force || Math.abs(t - lastMediaPositionTime) >= 1) {
+        lastMediaPositionTime = t;
+        const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
+        setMediaPositionState({
+          duration: dur > 0 && dur < Infinity ? dur : 0,
+          playbackRate: audio.playbackRate || 1,
+          position: t,
+        });
+      }
     };
 
     const stopRaf = () => {
@@ -64,6 +70,7 @@ export function useAudioEngine() {
       // New media → force a fresh clock so progress/lyrics don't stick on the
       // previous track's lastPublishedTime throttle window.
       lastPublishedTime = -1;
+      lastMediaPositionTime = -1;
       publishTime(true);
     };
     const onPlay = () => {

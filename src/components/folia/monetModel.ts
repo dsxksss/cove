@@ -4,6 +4,7 @@
 import type { LyricsLine } from "../playerTypes";
 import type { LyricMotionStyle } from "../playerTypes";
 import { buildTimedLine, type TimedLine } from "../../lib/lyricTiming";
+import { layoutWithLines, prepareWithSegments } from "@chenglou/pretext";
 
 export type LineStatus = "waiting" | "active" | "passed";
 
@@ -38,6 +39,12 @@ export type MonetMeasuredLineLayout = {
   isTextClipped: boolean;
 };
 
+/** The WebView's final line boxes can differ from Pretext's estimate. */
+export type MonetDomLineMeasurement = Pick<
+  MonetMeasuredLineLayout,
+  "textHeightPx" | "translationHeightPx"
+>;
+
 export type PositionedMonetLineEntry = MonetVisibleLineEntry & {
   y: number;
   tone: MonetLineTone;
@@ -63,8 +70,11 @@ export const MONET_ACTIVE_TEXT_LINE_LIMIT = 3;
 export const MONET_INACTIVE_TEXT_LINE_LIMIT = 2;
 
 export const MONET_SCROLL_TRANSITION = {
-  y: { type: "spring" as const, stiffness: 142, damping: 28, mass: 0.82 },
-  scale: { type: "spring" as const, stiffness: 150, damping: 30, mass: 0.78 },
+  // Position and scale must share the exact same progress curve. Different
+  // springs can temporarily compress two otherwise non-overlapping line boxes
+  // into each other while the active line changes size.
+  y: { duration: 0.34, ease: [0.32, 0.72, 0, 1] as [number, number, number, number] },
+  scale: { duration: 0.34, ease: [0.32, 0.72, 0, 1] as [number, number, number, number] },
   opacity: { duration: 0.28, ease: [0.32, 0.72, 0, 1] as [number, number, number, number] },
   filter: { duration: 0.32, ease: [0.32, 0.72, 0, 1] as [number, number, number, number] },
 };
@@ -206,54 +216,63 @@ export function resolveTone(
   return resolveMonetLineTone(offset, status, inactiveScale);
 }
 
-let measureCanvas: HTMLCanvasElement | null = null;
+const MONET_MIN_MEASURE_WIDTH_PX = 180;
 
-function measureTextWidth(text: string, fontSpec: string): number {
-  if (typeof document === "undefined") return text.length * 12;
-  if (!measureCanvas) measureCanvas = document.createElement("canvas");
-  const ctx = measureCanvas.getContext("2d");
-  if (!ctx) return text.length * 12;
-  ctx.font = fontSpec;
-  return ctx.measureText(text || " ").width;
+function fallbackTextLineCount(text: string, fontSpec: string, maxWidthPx: number): number {
+  const fontPx = Number(fontSpec.match(/([\d.]+)px/)?.[1] ?? 16);
+  const widthOf = (value: string) =>
+    Array.from(value).reduce(
+      (sum, char) => sum + (/\s/.test(char) ? fontPx * 0.32 : /[\u3000-\u9fff]/.test(char) ? fontPx : fontPx * 0.58),
+      0,
+    );
+  const width = Math.max(maxWidthPx, MONET_MIN_MEASURE_WIDTH_PX);
+  let lines = 1;
+  let rowWidth = 0;
+  const tokens = /[\u3000-\u9fff]/.test(text)
+    ? Array.from(text)
+    : (text || " ").split(/(\s+)/);
+  for (const token of tokens) {
+    const tokenWidth = widthOf(token);
+    if (rowWidth > 0 && rowWidth + tokenWidth > width) {
+      lines += 1;
+      rowWidth = tokenWidth;
+    } else {
+      rowWidth += tokenWidth;
+    }
+  }
+  return lines;
 }
 
-/** Approximate wrap line count (Folia uses pretext; canvas is close enough). */
+/** Exact Folia wrapping path, using the same segmented pretext layout engine. */
 export function measureTextLineCount(
   text: string,
   fontSpec: string,
-  maxWidthPx: number
+  maxWidthPx: number,
+  lineHeightPx: number,
 ): number {
-  const width = Math.max(maxWidthPx, 40);
-  const raw = text || " ";
-  // CJK: break by grapheme-ish char
-  const isCjk = /[\u4e00-\u9fff]/.test(raw);
-  if (isCjk) {
-    let lines = 1;
-    let row = "";
-    for (const ch of Array.from(raw)) {
-      const next = row + ch;
-      if (measureTextWidth(next, fontSpec) > width && row) {
-        lines += 1;
-        row = ch;
-      } else {
-        row = next;
-      }
-    }
-    return lines;
+  try {
+    const prepared = prepareWithSegments(text || " ", fontSpec);
+    const layout = layoutWithLines(
+      prepared,
+      Math.max(maxWidthPx, MONET_MIN_MEASURE_WIDTH_PX),
+      lineHeightPx,
+    );
+    return Math.max(layout.lines.length, 1);
+  } catch {
+    // Node-only test environments have no canvas. Production WebView2 always
+    // uses the exact Folia/pretext branch above.
+    return fallbackTextLineCount(text || " ", fontSpec, maxWidthPx);
   }
-  const words = raw.split(/(\s+)/);
-  let lines = 1;
-  let row = "";
-  for (const w of words) {
-    const next = row + w;
-    if (measureTextWidth(next, fontSpec) > width && row.trim()) {
-      lines += 1;
-      row = w;
-    } else {
-      row = next;
-    }
+}
+
+function measureTextWidthAtPx(text: string, fontPx: number, fontSpec: string): number {
+  try {
+    const prepared = prepareWithSegments(text || " ", fontSpec);
+    const layout = layoutWithLines(prepared, 99999, fontPx * 1.2);
+    return layout.lines[0]?.width ?? Math.max(text.length, 1) * fontPx * 0.6;
+  } catch {
+    return Math.max(Array.from(text).length, 1) * fontPx * 0.6;
   }
-  return Math.max(lines, 1);
 }
 
 export function measureMonetLineLayout(options: {
@@ -261,6 +280,7 @@ export function measureMonetLineLayout(options: {
   translation?: string;
   status: LineStatus;
   fontPx: number;
+  fontWeight?: number;
   translationFontPx: number;
   fontStack: string;
   maxWidthPx: number;
@@ -269,8 +289,8 @@ export function measureMonetLineLayout(options: {
   const {
     text,
     translation,
-    status,
     fontPx,
+    fontWeight = 600,
     translationFontPx,
     fontStack,
     maxWidthPx,
@@ -279,21 +299,27 @@ export function measureMonetLineLayout(options: {
   const lineHeightPx = fontPx * 1.18;
   const translationLineHeightPx = translationFontPx * 1.28;
   const textPaddingTopPx = Math.max(fontPx * 0.16, 8);
-  const textPaddingBottomPx = Math.max(fontPx * 0.34, 14);
-  const translationPaddingTopPx = Math.max(translationFontPx * 0.45, 7);
-  const translationPaddingBottomPx = Math.max(translationFontPx * 0.18, 5);
-  const fontSpec = `600 ${fontPx}px ${fontStack}`;
+  // Keep the translation visually attached to its source line. The previous
+  // combined bottom/top padding created a conspicuous ~20 px gap.
+  const textPaddingBottomPx = Math.max(fontPx * 0.12, 4);
+  const translationPaddingTopPx = Math.max(translationFontPx * 0.12, 2);
+  const translationPaddingBottomPx = Math.max(translationFontPx * 0.16, 3);
+  const fontSpec = `${fontWeight} ${fontPx}px ${fontStack}`;
   const translationFontSpec = `500 ${translationFontPx}px ${fontStack}`;
-  const textLineCount = measureTextLineCount(text, fontSpec, maxWidthPx);
-  const textLimit =
-    status === "active" ? MONET_ACTIVE_TEXT_LINE_LIMIT : MONET_INACTIVE_TEXT_LINE_LIMIT;
-  const visibleTextLineCount = Math.min(textLineCount, textLimit);
-  const hasActiveTranslation =
-    showSubtitleTranslation && status === "active" && Boolean(translation?.trim());
-  const rawTrCount = hasActiveTranslation
-    ? measureTextLineCount(translation ?? "", translationFontSpec, maxWidthPx)
+  const textLineCount = measureTextLineCount(text, fontSpec, maxWidthPx, lineHeightPx);
+  // Unlike Folia's compact poster rail, the desktop player must never clip a
+  // lyric into the translation or its neighbour. Reserve every measured line.
+  const visibleTextLineCount = textLineCount;
+  const hasTranslation = showSubtitleTranslation && Boolean(translation?.trim());
+  const rawTrCount = hasTranslation
+    ? measureTextLineCount(
+        translation ?? "",
+        translationFontSpec,
+        maxWidthPx,
+        translationLineHeightPx,
+      )
     : 0;
-  const translationLineCount = Math.min(rawTrCount, 2);
+  const translationLineCount = rawTrCount;
   const textContentHeightPx = visibleTextLineCount * lineHeightPx;
   const textHeightPx = textContentHeightPx + textPaddingTopPx + textPaddingBottomPx;
   const translationContentHeightPx = translationLineCount * translationLineHeightPx;
@@ -363,23 +389,35 @@ export function buildPositionedEntries(
   translationFontPx: number,
   fontStack: string,
   glowBufferPx: number,
-  showSubtitleTranslation: boolean
+  showSubtitleTranslation: boolean,
+  domMeasurements?: ReadonlyMap<string, MonetDomLineMeasurement>
 ): PositionedMonetLineEntry[] {
   const inactiveScale = clamp(inactiveFontPx / Math.max(lyricFontPx, 1), 0.72, 0.92);
   const contentWidthPx = Math.max(railWidth - glowBufferPx * 2, 80);
 
   const measured: PositionedMonetLineEntry[] = entries.map((entry) => {
     const tone = resolveTone(style, entry.offset, entry.status, inactiveScale);
-    const layout = measureMonetLineLayout({
+    const estimatedLayout = measureMonetLineLayout({
       text: entry.line.fullText,
       translation: entry.line.translation,
       status: entry.status,
       fontPx: lyricFontPx,
+      fontWeight: tone.fontWeight,
       translationFontPx,
       fontStack,
       maxWidthPx: contentWidthPx - 8,
       showSubtitleTranslation,
     });
+    const domMeasurement = domMeasurements?.get(entry.key);
+    const layout = domMeasurement
+      ? {
+          ...estimatedLayout,
+          textHeightPx: domMeasurement.textHeightPx,
+          translationHeightPx: domMeasurement.translationHeightPx,
+          visualHeightPx:
+            domMeasurement.textHeightPx + domMeasurement.translationHeightPx,
+        }
+      : estimatedLayout;
     return {
       ...entry,
       y: 0,
@@ -422,7 +460,7 @@ export function buildPositionedEntries(
 
 export function measureGraphemeOffsets(
   text: string,
-  _fontPx: number,
+  fontPx: number,
   fontSpec: string
 ): number[] {
   const graphemes = Array.from(
@@ -452,10 +490,8 @@ export function measureGraphemeOffsets(
       : Array.from(text)
   );
   const offsets = new Array(graphemes.length + 1).fill(0);
-  let acc = 0;
-  for (let i = 0; i < graphemes.length; i++) {
-    acc += measureTextWidth(graphemes[i], fontSpec);
-    offsets[i + 1] = acc;
+  for (let i = 1; i <= graphemes.length; i++) {
+    offsets[i] = measureTextWidthAtPx(graphemes.slice(0, i).join(""), fontPx, fontSpec);
   }
   return offsets;
 }

@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import {
@@ -32,7 +32,7 @@ import { getLyricLineMotion, isFoliaAbsoluteStyle } from './lyricMotion';
 import FoliaLyricsRail from './FoliaLyricsRail';
 import { LEVEL_OPTIONS } from '../lib/playbackPrefs';
 import type { LyricSourceMode } from '../lib/lyrics/matchLyrics';
-import { useScrollEdgeFriction } from '../hooks/useScrollEdgeFriction';
+import { usePlayerStore } from '../store/playerStore';
 
 const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
 
@@ -51,10 +51,150 @@ const LYRIC_SOURCE_OPTIONS: Array<{ value: LyricSourceMode; label: string }> = [
   { value: "kugou", label: "酷狗音乐" },
 ];
 
+function formatTime(secs: number) {
+  const safe = Number.isFinite(secs) ? Math.max(0, secs) : 0;
+  const minutes = Math.floor(safe / 60);
+  const seconds = Math.floor(safe % 60).toString().padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function findActiveLyricIndex(lines: Song["lyrics"], time: number) {
+  let low = 0;
+  let high = lines.length - 1;
+  let active = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (lines[mid].time <= time) {
+      active = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return active;
+}
+
+function useActiveLyricIndex(
+  lines: Song["lyrics"],
+  offsetSeconds: number,
+  enabled = true,
+) {
+  const calculate = () =>
+    findActiveLyricIndex(
+      lines,
+      Math.max(0, usePlayerStore.getState().currentTime + offsetSeconds),
+    );
+  const [activeIndex, setActiveIndex] = useState(calculate);
+  const activeIndexRef = useRef(activeIndex);
+
+  useEffect(() => {
+    if (!enabled) return;
+    const update = (currentTime: number) => {
+      const next = findActiveLyricIndex(lines, Math.max(0, currentTime + offsetSeconds));
+      if (activeIndexRef.current === next) return;
+      activeIndexRef.current = next;
+      setActiveIndex(next);
+    };
+    update(usePlayerStore.getState().currentTime);
+    return usePlayerStore.subscribe((state) => update(state.currentTime));
+  }, [enabled, lines, offsetSeconds]);
+
+  return activeIndex;
+}
+
+function PlaybackProgress({
+  duration,
+  compact,
+  onSeek,
+  motionLevel,
+}: {
+  duration: number;
+  compact: boolean;
+  onSeek: (time: number) => void;
+  motionLevel: "off" | "light" | "full";
+}) {
+  // Keep the 30 Hz playback clock inside this tiny subtree. The large player,
+  // drawers and lyric layout now render only when their actual state changes.
+  const [currentTime, setCurrentTime] = useState(
+    () => usePlayerStore.getState().currentTime,
+  );
+  useEffect(() => {
+    setCurrentTime(usePlayerStore.getState().currentTime);
+    return usePlayerStore.subscribe((state) => setCurrentTime(state.currentTime));
+  }, []);
+  const progressBarRef = useRef<HTMLDivElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [seekPop, setSeekPop] = useState(false);
+  const progressPercent =
+    duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
+
+  useEffect(() => {
+    if (!isDragging) return;
+    const stopDragging = () => setIsDragging(false);
+    window.addEventListener("mouseup", stopDragging);
+    window.addEventListener("mouseleave", stopDragging);
+    return () => {
+      window.removeEventListener("mouseup", stopDragging);
+      window.removeEventListener("mouseleave", stopDragging);
+    };
+  }, [isDragging]);
+
+  const seekFromClientX = (clientX: number, pop = false) => {
+    const track = progressBarRef.current;
+    if (!track || duration <= 0) return;
+    const rect = track.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    onSeek(ratio * duration);
+    if (pop && motionLevel !== "off") {
+      setSeekPop(true);
+      window.setTimeout(() => setSeekPop(false), 320);
+    }
+  };
+
+  const track = (
+    <div
+      ref={progressBarRef}
+      onMouseDown={(event) => {
+        setIsDragging(true);
+        seekFromClientX(event.clientX, true);
+      }}
+      onMouseMove={(event) => {
+        if (isDragging && event.buttons === 1) seekFromClientX(event.clientX);
+      }}
+      className={`progress-track ${compact ? "h-4 flex-1" : "h-6 w-full"} ${
+        isDragging ? "is-dragging" : ""
+      } ${seekPop ? "is-seek-pop" : ""}`}
+    >
+      <div className="progress-track__rail" />
+      <div className="progress-track__fill" style={{ width: `${progressPercent}%` }} />
+      <div className="progress-track__thumb" style={{ left: `${progressPercent}%` }} />
+    </div>
+  );
+
+  if (compact) {
+    return (
+      <div className="flex items-center gap-2 text-[10px] font-bold text-white/50 font-mono tracking-wider">
+        <span className="w-8 text-right">{formatTime(currentTime)}</span>
+        {track}
+        <span className="w-8 text-left">{formatTime(duration)}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2 no-drag">
+      {track}
+      <div className="flex items-center justify-between text-[11px] font-semibold text-white/50 tracking-wider font-mono">
+        <span>{formatTime(currentTime)}</span>
+        <span>{formatTime(duration)}</span>
+      </div>
+    </div>
+  );
+}
+
 interface GlassPlayerProps {
   song: Song;
   isPlaying: boolean;
-  currentTime: number;
   onPlayPause: () => void;
   onNext: () => void;
   onPrev: () => void;
@@ -90,12 +230,13 @@ interface GlassPlayerProps {
   onCyclePlayMode: () => void;
   /** jh3yy-style motion intensity */
   motionLevel?: "off" | "light" | "full";
+  /** Pause expensive lyric rendering while an opaque full-window panel is open. */
+  suspendVisuals?: boolean;
 }
 
 export default function GlassPlayer({
   song,
   isPlaying,
-  currentTime,
   onPlayPause,
   onNext,
   onPrev,
@@ -128,9 +269,8 @@ export default function GlassPlayer({
   playMode,
   onCyclePlayMode,
   motionLevel = "light",
+  suspendVisuals = false,
 }: GlassPlayerProps) {
-  const progressBarRef = useRef<HTMLDivElement>(null);
-  const [seekPop, setSeekPop] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const moreBtnRef = useRef<HTMLButtonElement>(null);
   const morePanelRef = useRef<HTMLDivElement>(null);
@@ -147,7 +287,6 @@ export default function GlassPlayer({
     | "source";
 
   // State
-  const [isDraggingProgress, setIsDraggingProgress] = useState(false);
   const [isMoreOpen, setIsMoreOpen] = useState(false);
   const [morePage, setMorePage] = useState<MorePage>("root");
   /** Volume slider is toggled by its own button (not the More menu). */
@@ -310,54 +449,8 @@ export default function GlassPlayer({
     };
   }, [isMoreOpen, morePage, volumeOpen]);
 
-  useEffect(() => {
-    if (!isDraggingProgress) return;
-    const stopDragging = () => setIsDraggingProgress(false);
-    window.addEventListener('mouseup', stopDragging);
-    window.addEventListener('mouseleave', stopDragging);
-    return () => {
-      window.removeEventListener('mouseup', stopDragging);
-      window.removeEventListener('mouseleave', stopDragging);
-    };
-  }, [isDraggingProgress]);
-
-  // Formatting utilities
-  const formatTime = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = Math.floor(secs % 60).toString().padStart(2, '0');
-    return `${m}:${s}`;
-  };
-
   // Guard against duration=0 (NaN/Infinity width freezes the bar visually).
   const safeDuration = Number.isFinite(song.duration) && song.duration > 0 ? song.duration : 0;
-  const progressPercent =
-    safeDuration > 0
-      ? Math.min(100, Math.max(0, (currentTime / safeDuration) * 100))
-      : 0;
-
-  // Handles
-  const seekFromProgressClientX = (clientX: number, pop = false) => {
-    if (!progressBarRef.current || safeDuration <= 0) return;
-    const rect = progressBarRef.current.getBoundingClientRect();
-    const clickX = clientX - rect.left;
-    const width = rect.width;
-    const clickRatio = Math.max(0, Math.min(1, clickX / width));
-    onSeek(clickRatio * safeDuration);
-    if (pop && motionLevel !== "off") {
-      setSeekPop(true);
-      window.setTimeout(() => setSeekPop(false), 320);
-    }
-  };
-
-  const handleProgressMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    setIsDraggingProgress(true);
-    seekFromProgressClientX(e.clientX, true);
-  };
-
-  const handleProgressDrag = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!isDraggingProgress || e.buttons !== 1) return;
-    seekFromProgressClientX(e.clientX);
-  };
 
   const handleVolumeClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -373,26 +466,23 @@ export default function GlassPlayer({
     await navigator.clipboard?.writeText(info).catch(() => {});
   };
 
-  // Find active lyric index
-  const lyricCurrentTime = Math.max(0, currentTime + lyricOffsetSeconds);
-
-  const activeLyricIndex = song.lyrics.reduce((acc, line, idx) => {
-    if (lyricCurrentTime >= line.time) {
-      return idx;
-    }
-    return acc;
-  }, -1);
+  // Subscribe to the clock without propagating every tick through this large
+  // component. React updates only when playback crosses a lyric boundary.
+  const activeLyricIndex = useActiveLyricIndex(
+    song.lyrics,
+    lyricOffsetSeconds,
+    !suspendVisuals,
+  );
 
   const lyricAnchorIndex = useMemo(() => {
     if (activeLyricIndex >= 0) return activeLyricIndex;
-    const upcomingIndex = song.lyrics.findIndex((line) => line.time > lyricCurrentTime);
-    return upcomingIndex >= 0 ? upcomingIndex : 0;
-  }, [activeLyricIndex, lyricCurrentTime, song.lyrics]);
+    return 0;
+  }, [activeLyricIndex]);
 
   // ---- Manual lyric scrolling ----
   // null = follow the active line. number = user is browsing manually.
-  // Manual browsing remains locked until the user selects a line or taps
-  // "回到当前"; an idle timer must not pull the list away before they click.
+  // Manual browsing pauses following; after 2.5 seconds without wheel/touch/
+  // scrollbar activity it returns to the current playing line automatically.
   const [manualAnchor, setManualAnchor] = useState<number | null>(null);
   // Spotlight for blur/scale/opacity:
   //   auto-follow  → playing line (original rail effect)
@@ -402,13 +492,9 @@ export default function GlassPlayer({
   const lyricLineRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const programmaticScrollRef = useRef(false);
   const programmaticScrollTimerRef = useRef<number | null>(null);
+  const manualResumeTimerRef = useRef<number | null>(null);
   const ignoreUserScrollUntilRef = useRef(0);
   const focusRafRef = useRef<number | null>(null);
-
-  useScrollEdgeFriction(
-    lyricScrollRef,
-    layout === "lyrics" && !isFoliaAbsoluteStyle(lyricMotionStyle),
-  );
 
   const findLineNearestViewportCenter = () => {
     const container = lyricScrollRef.current;
@@ -477,12 +563,28 @@ export default function GlassPlayer({
     setVisualFocusIndex(Math.max(0, lyricAnchorIndex));
   }, [lyricAnchorIndex, manualAnchor]);
 
-  const resumeAutoFollow = () => {
+  const clearManualResumeTimer = useCallback(() => {
+    if (manualResumeTimerRef.current != null) {
+      clearTimeout(manualResumeTimerRef.current);
+      manualResumeTimerRef.current = null;
+    }
+  }, []);
+
+  const resumeAutoFollow = useCallback(() => {
+    clearManualResumeTimer();
     programmaticScrollRef.current = false;
     // Clearing manualAnchor re-enables the auto-scroll + spotlight effects
     // (see effects keyed on manualAnchor / lyricAnchorIndex).
     setManualAnchor(null);
-  };
+  }, [clearManualResumeTimer]);
+
+  const scheduleAutoFollowResume = useCallback(() => {
+    clearManualResumeTimer();
+    manualResumeTimerRef.current = window.setTimeout(() => {
+      manualResumeTimerRef.current = null;
+      resumeAutoFollow();
+    }, 2500);
+  }, [clearManualResumeTimer, resumeAutoFollow]);
 
   // Clear any pending programmatic scroll timer on unmount / song change.
   useEffect(() => {
@@ -495,16 +597,18 @@ export default function GlassPlayer({
         cancelAnimationFrame(focusRafRef.current);
         focusRafRef.current = null;
       }
+      clearManualResumeTimer();
       programmaticScrollRef.current = false;
     };
-  }, [song.id]);
+  }, [clearManualResumeTimer, song.id]);
 
   // Reset manual lock when switching songs
   useEffect(() => {
+    clearManualResumeTimer();
     setManualAnchor(null);
     programmaticScrollRef.current = false;
     setVisualFocusIndex(0);
-  }, [song.id]);
+  }, [clearManualResumeTimer, song.id]);
 
   const enterManualLyricScroll = () => {
     if (programmaticScrollRef.current) return;
@@ -523,10 +627,12 @@ export default function GlassPlayer({
     if (performance.now() < ignoreUserScrollUntilRef.current) return;
     enterManualLyricScroll();
     scheduleVisualFocusFromScroll();
+    scheduleAutoFollowResume();
   };
 
   const handleLyricWheel = () => {
     enterManualLyricScroll();
+    scheduleAutoFollowResume();
   };
 
   /** Folia absolute rail: wheel steps focus index (parent schedules auto-resume). */
@@ -534,6 +640,7 @@ export default function GlassPlayer({
     if (programmaticScrollRef.current) return;
     setManualAnchor(nextIndex);
     setVisualFocusIndex(nextIndex);
+    scheduleAutoFollowResume();
   };
 
   const lyricRenderStyle: LyricMotionStyle = lyricMotionStyle;
@@ -542,15 +649,6 @@ export default function GlassPlayer({
     // to make the clicked line become active at the exact destination.
     onSeek(Math.max(0, lineTime - lyricOffsetSeconds));
   };
-
-  const activeLyricProgress = useMemo(() => {
-    if (activeLyricIndex < 0) return 0;
-    const activeLine = song.lyrics[activeLyricIndex];
-    if (!activeLine) return 0;
-    const nextTime = song.lyrics[activeLyricIndex + 1]?.time ?? safeDuration;
-    const duration = Math.max(0.2, nextTime - activeLine.time);
-    return Math.min(1, Math.max(0, (lyricCurrentTime - activeLine.time) / duration));
-  }, [activeLyricIndex, lyricCurrentTime, safeDuration, song.lyrics]);
 
   // Adjust lyric sync offset. Positive values make lyrics advance earlier.
   const increaseLyricOffset = () => {
@@ -562,34 +660,13 @@ export default function GlassPlayer({
   };
 
   const backgroundImageUrl = song.backgroundUrl || song.coverUrl;
-  const glassTintOpacity = Math.min(80, Math.max(0, backgroundOpacity)) / 100;
+  const glassTintOpacity = Math.min(100, Math.max(0, backgroundOpacity)) / 100;
   const motionClass =
     motionLevel === "off"
       ? "motion-off"
       : motionLevel === "full"
         ? "motion-pop motion-full"
         : "motion-pop";
-
-  const progressTrack = (compact: boolean) => (
-    <div
-      ref={progressBarRef}
-      onMouseDown={handleProgressMouseDown}
-      onMouseMove={handleProgressDrag}
-      className={`progress-track ${compact ? "h-4 flex-1" : "h-6 w-full"} ${
-        isDraggingProgress ? "is-dragging" : ""
-      } ${seekPop ? "is-seek-pop" : ""}`}
-    >
-      <div className="progress-track__rail" />
-      <div
-        className="progress-track__fill"
-        style={{ width: `${progressPercent}%` }}
-      />
-      <div
-        className="progress-track__thumb"
-        style={{ left: `${progressPercent}%` }}
-      />
-    </div>
-  );
 
   return (
     <div
@@ -604,9 +681,11 @@ export default function GlassPlayer({
           /* Pure-CSS liquid glass — fast (WebView2 native backdrop-filter).
              No WebGL/Canvas, no cover background, no theme glow.
              Desktop wallpaper shows through, frosted + saturated by this. */
-          background: `rgba(8, 10, 14, ${glassTintOpacity})`,
-          backdropFilter: `blur(${backgroundBlur}px) saturate(180%) brightness(1.08)`,
-          WebkitBackdropFilter: `blur(${backgroundBlur}px) saturate(180%) brightness(1.08)`,
+           // Cheap transparency: alpha-only tint, with no desktop blur or
+           // full-window filter pass. At 0% the player surface is transparent.
+           background: `rgba(8, 10, 14, ${glassTintOpacity})`,
+           backdropFilter: "none",
+           WebkitBackdropFilter: "none",
           boxShadow:
             "inset 0 1px 1px rgba(255,255,255,0.55), inset 1px 0 1px rgba(255,255,255,0.20), inset -1px 0 1px rgba(255,255,255,0.08), inset 0 -1px 1px rgba(255,255,255,0.18), 0 0 0 1px rgba(255,255,255,0.14), 0 26px 64px -18px rgba(0,0,0,0.6)",
           ["--glow-hue" as string]: "210",
@@ -614,8 +693,6 @@ export default function GlassPlayer({
         } as React.CSSProperties
       }
     >
-      <div className="player-glow-spotlight" aria-hidden />
-      <div className="player-glow-rim" aria-hidden />
       {/* Titlebar drag — ABOVE panels (z-40) so the window is always movable.
           Interactive chrome is a higher sibling (z-50) with no-drag; only the
           actual button clusters use pointer-events-auto so empty gaps still drag. */}
@@ -670,8 +747,11 @@ export default function GlassPlayer({
             src={backgroundImageUrl}
             alt=""
             referrerPolicy="no-referrer"
-            className="w-full h-full object-cover scale-110 opacity-55 saturate-[1.18] brightness-75"
-            style={{ filter: `blur(${Math.max(0, backgroundBlur)}px)` }}
+            className="w-full h-full object-cover opacity-55"
+            style={{
+              filter: `blur(${Math.max(0, backgroundBlur)}px) saturate(1.18) brightness(0.75)`,
+              transform: `scale(${1 + Math.min(60, Math.max(0, backgroundBlur)) / 300})`,
+            }}
           />
           <div className="absolute inset-0 bg-black/35" />
         </div>
@@ -740,11 +820,12 @@ export default function GlassPlayer({
           </div>
 
           {/* Middle Row: Progress Slider */}
-          <div className="flex items-center gap-2 text-[10px] font-bold text-white/50 font-mono tracking-wider">
-            <span className="w-8 text-right">{formatTime(currentTime)}</span>
-            {progressTrack(true)}
-            <span className="w-8 text-left">{formatTime(safeDuration)}</span>
-          </div>
+          <PlaybackProgress
+            compact
+            duration={safeDuration}
+            onSeek={onSeek}
+            motionLevel={motionLevel}
+          />
 
           {/* Bottom Row: Compact Controls */}
           <div className="flex items-center justify-between mt-1 px-1">
@@ -1190,14 +1271,12 @@ export default function GlassPlayer({
                 </div>
 
               {/* Progress Track */}
-              <div className="flex flex-col gap-2 no-drag">
-                {progressTrack(false)}
-
-                <div className="flex items-center justify-between text-[11px] font-semibold text-white/50 tracking-wider font-mono">
-                  <span>{formatTime(currentTime)}</span>
-                  <span>{formatTime(safeDuration)}</span>
-                </div>
-              </div>
+              <PlaybackProgress
+                compact={false}
+                duration={safeDuration}
+                onSeek={onSeek}
+                motionLevel={motionLevel}
+              />
             </div>
 
             {/*
@@ -1353,13 +1432,13 @@ export default function GlassPlayer({
                   className="absolute inset-x-0 top-12 z-0 h-20"
                 />
                 {/* Synced Lyrics — Folia absolute rail (莫奈/浮名/流光) or scroll list */}
-                {isFoliaAbsoluteStyle(lyricRenderStyle) ? (
+                {suspendVisuals ? null : isFoliaAbsoluteStyle(lyricRenderStyle) ? (
                   <div className="relative flex-1 min-h-0 flex flex-col pb-14 pt-10">
                     <div className="relative flex-1 min-h-0 no-drag">
                       <FoliaLyricsRail
                         style={lyricRenderStyle}
                         lines={song.lyrics}
-                        currentTime={lyricCurrentTime}
+                        timeOffsetSeconds={lyricOffsetSeconds}
                         activeIndex={activeLyricIndex}
                         anchorIndex={lyricAnchorIndex}
                         showTranslation={showTranslation}
@@ -1367,6 +1446,7 @@ export default function GlassPlayer({
                         onSeek={seekToLyricTime}
                         manualAnchor={manualAnchor}
                         onManualStep={handleFoliaManualStep}
+                        onManualActivity={scheduleAutoFollowResume}
                         onResumeAuto={resumeAutoFollow}
                       />
                     </div>
@@ -1395,7 +1475,6 @@ export default function GlassPlayer({
                         isActive,
                         isPassed,
                         distance,
-                        lineProgress: isActive ? activeLyricProgress : 0,
                         text: line.text,
                       });
                       const {
@@ -1460,7 +1539,7 @@ export default function GlassPlayer({
                           style={{
                             color,
                             wordBreak: "break-word",
-                            willChange: "filter, opacity, transform",
+                            willChange: distance <= 2 ? "filter, opacity, transform" : undefined,
                             background:
                               rowVariant === "dialogue"
                                 ? isFocused

@@ -1,10 +1,9 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700;800&display=swap');
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
-  --font-display: "Outfit", var(--font-sans);
+  --font-sans: "Segoe UI Variable", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+  --font-display: "Segoe UI Variable Display", var(--font-sans);
   
   --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
@@ -36,6 +35,19 @@
     -webkit-app-region: no-drag !important;
     app-region: no-drag !important;
   }
+}
+
+/* Flat performance mode -----------------------------------------------------
+   Cove uses a transparent native window, but deliberately avoids every CSS
+   effect that resamples pixels behind an element. This applies to portals too,
+   so a newly added popover cannot accidentally reintroduce glass/compositor
+   stalls in playlist scrolling or window movement. */
+body *,
+body *::before,
+body *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  mix-blend-mode: normal !important;
 }
 
 /* Hide scrollbars for a premium, application-like feel */
@@ -114,7 +126,6 @@
 .app-liquid-control,
 .app-liquid-row {
   isolation: isolate;
-  transform: translateZ(0);
   background-clip: padding-box;
 }
 
@@ -134,8 +145,6 @@
     radial-gradient(90% 78% at 106% 108%, rgba(112, 165, 255, 0.10), transparent 52%),
     linear-gradient(145deg, rgba(255, 255, 255, 0.075), rgba(4, 7, 14, 0.70) 68%),
     var(--app-glass-fill);
-  backdrop-filter: blur(36px) saturate(205%) brightness(1.04);
-  -webkit-backdrop-filter: blur(36px) saturate(205%) brightness(1.04);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.32),
     inset 1px 0 0 rgba(255, 255, 255, 0.10),
@@ -161,8 +170,6 @@
 .app-liquid-bar {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025));
   border-color: rgba(255, 255, 255, 0.10) !important;
-  backdrop-filter: blur(24px) saturate(190%);
-  -webkit-backdrop-filter: blur(24px) saturate(190%);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10);
 }
 
@@ -172,8 +179,6 @@
   background:
     linear-gradient(145deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.025) 55%),
     rgba(7, 10, 18, 0.23);
-  backdrop-filter: blur(22px) saturate(185%) brightness(1.03);
-  -webkit-backdrop-filter: blur(22px) saturate(185%) brightness(1.03);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.17),
     inset 0 -1px 0 rgba(0, 0, 0, 0.16),
@@ -186,8 +191,6 @@
   background:
     linear-gradient(150deg, rgba(255, 255, 255, 0.105), rgba(5, 8, 15, 0.78) 62%),
     rgba(5, 8, 15, 0.76);
-  backdrop-filter: blur(30px) saturate(210%) brightness(1.04);
-  -webkit-backdrop-filter: blur(30px) saturate(210%) brightness(1.04);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.30),
     inset 1px 0 0 rgba(255, 255, 255, 0.09),
@@ -197,8 +200,6 @@
 .app-liquid-control {
   border: 1px solid rgba(255, 255, 255, 0.10);
   background: linear-gradient(155deg, rgba(255, 255, 255, 0.105), rgba(255, 255, 255, 0.045));
-  backdrop-filter: blur(16px) saturate(190%);
-  -webkit-backdrop-filter: blur(16px) saturate(190%);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.22),
     0 10px 24px -20px rgba(0, 0, 0, 0.75);
@@ -212,8 +213,6 @@
 .app-liquid-input {
   border: 1px solid rgba(255, 255, 255, 0.11) !important;
   background: rgba(255, 255, 255, 0.065) !important;
-  backdrop-filter: blur(14px) saturate(180%);
-  -webkit-backdrop-filter: blur(14px) saturate(180%);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.12),
     inset 0 0 0 1px rgba(0, 0, 0, 0.08);
@@ -232,13 +231,13 @@
 .app-liquid-segment {
   border: 1px solid rgba(255, 255, 255, 0.10);
   background: rgba(255, 255, 255, 0.045);
-  backdrop-filter: blur(16px) saturate(180%);
-  -webkit-backdrop-filter: blur(16px) saturate(180%);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
 }
 
 .app-liquid-row {
   border: 1px solid transparent;
+  transform: none;
+  contain: layout paint style;
 }
 
 .app-liquid-row:hover {
@@ -287,8 +286,6 @@
   background:
     radial-gradient(70% 48% at 50% 30%, rgba(115, 148, 210, 0.10), transparent 72%),
     rgba(2, 5, 11, 0.48);
-  backdrop-filter: blur(14px) saturate(145%);
-  -webkit-backdrop-filter: blur(14px) saturate(145%);
 }
 
 /* Right-edge hover rail. At rest it reads as a tiny refractive glass tab;
@@ -303,8 +300,6 @@
   background:
     radial-gradient(120% 48% at 0% 0%, rgba(255, 255, 255, 0.20), transparent 62%),
     linear-gradient(155deg, rgba(255, 255, 255, 0.105), rgba(5, 8, 15, 0.64));
-  backdrop-filter: blur(28px) saturate(220%) brightness(1.06);
-  -webkit-backdrop-filter: blur(28px) saturate(220%) brightness(1.06);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.34),
     inset 1px 0 0 rgba(255, 255, 255, 0.13),
@@ -343,8 +338,6 @@
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 19px;
   background: rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(18px) saturate(180%);
-  -webkit-backdrop-filter: blur(18px) saturate(180%);
   box-shadow: none;
 }
 
@@ -367,8 +360,6 @@
   transform: translateX(5px);
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(18px) saturate(185%);
-  -webkit-backdrop-filter: blur(18px) saturate(185%);
   box-shadow: none;
   text-shadow: none;
 }
@@ -384,8 +375,10 @@
   bottom: 12px !important;
   border-radius: 24px !important;
   clip-path: inset(0 round 24px) !important;
+  background: rgb(8, 11, 19) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
   transition:
-    backdrop-filter 0.16s ease,
     background 0.16s ease,
     box-shadow 0.2s ease;
 }
@@ -420,11 +413,6 @@
   width: min(420px, calc(100vw - 384px));
 }
 
-.context-panel--scrolling {
-  backdrop-filter: blur(14px) saturate(170%) brightness(1.04) !important;
-  -webkit-backdrop-filter: blur(14px) saturate(170%) brightness(1.04) !important;
-}
-
 .context-panel-layer {
   animation: context-panel-layer-in 0.44s cubic-bezier(0.23, 1, 0.32, 1) both;
   animation-delay: calc(var(--context-layer, 0) * 46ms);
@@ -449,8 +437,6 @@
   --nested-radius: 10px;
   border-radius: var(--player-radius);
   background: rgba(8, 10, 14, 0.76);
-  backdrop-filter: blur(30px) saturate(180%) brightness(1.08);
-  -webkit-backdrop-filter: blur(30px) saturate(180%) brightness(1.08);
   box-shadow:
     inset 0 1px 1px rgba(255, 255, 255, 0.48),
     inset 1px 0 1px rgba(255, 255, 255, 0.16),
@@ -473,8 +459,6 @@
   position: relative;
   border: 1px solid rgba(255, 255, 255, 0.075);
   background: rgba(255, 255, 255, 0.028);
-  backdrop-filter: blur(14px) saturate(165%);
-  -webkit-backdrop-filter: blur(14px) saturate(165%);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.10),
     0 18px 36px -34px rgba(0, 0, 0, 0.8);
@@ -532,7 +516,7 @@
 }
 
 /* Player shell: liquid-glass displacement filter is applied at runtime via the
-   useLiquidGlass hook (lib/liquidGlass.ts, ported from nikdelvin/liquid-glass).
+   Lightweight static surface: no shader, backdrop filter, or pointer tracking.
    The displacement map is size-aware + corner-shaped, so no corner spikes. */
 .player-liquid-glass {
   --player-radius: 20px;
@@ -542,8 +526,13 @@
   background-clip: padding-box;
   clip-path: inset(0 round var(--player-radius));
   isolation: isolate;
-  transform: translateZ(0);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+/* The full-card blend/highlight layers were visually subtle but forced extra
+   full-window composites. Keep the stable material and remove them entirely. */
+.player-liquid-glass::after {
+  display: none !important;
 }
 
 /* Nested surfaces (volume pill, menus) — jh3yy nested radius tip */
@@ -598,239 +587,6 @@
 
 .player-liquid-glow {
   z-index: 1;
-}
-
-.liquid-glass-studio-canvas {
-  inset: 0;
-  display: block;
-  width: 100%;
-  height: 100%;
-  z-index: 1;
-  border-radius: var(--player-radius);
-}
-
-.liquid-glass-panel,
-.liquid-glass-control {
-  backdrop-filter: blur(18px) saturate(210%) brightness(1.06);
-  -webkit-backdrop-filter: blur(18px) saturate(210%) brightness(1.06);
-}
-
-.liquid-glass-panel {
-  box-shadow:
-    inset 1px 0 rgba(255, 255, 255, 0.08),
-    inset 0 1px rgba(255, 255, 255, 0.08);
-}
-
-.liquid-glass-control {
-  box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.42),
-    inset 1px 0 rgba(255, 255, 255, 0.16),
-    inset 0 -1px rgba(0, 0, 0, 0.18),
-    0 8px 18px -12px rgba(0, 0, 0, 0.65);
-}
-
-/* ============================================================
-   expo-liquid-glass-view visual language (web approximation)
-   Mirrors: clear / tint / regular / interactive / identity
-            continuous vs circular corners
-            GlassEffectContainer morph dock
-   ============================================================ */
-
-.liquid-glass-filters {
-  position: absolute;
-  width: 0;
-  height: 0;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.liquid-glass {
-  --lg-radius: 16px;
-  --lg-blur: 20px;
-  --lg-sat: 200%;
-  --lg-fill: rgba(255, 255, 255, 0.1);
-  position: relative;
-  display: inline-flex;
-  align-items: stretch;
-  justify-content: stretch;
-  border: 0;
-  padding: 0;
-  margin: 0;
-  color: inherit;
-  cursor: default;
-  isolation: isolate;
-  overflow: hidden;
-  border-radius: var(--lg-radius);
-  background: var(--lg-fill);
-  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(1.06);
-  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(1.06);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.48),
-    inset 1px 0 0 rgba(255, 255, 255, 0.16),
-    inset -1px 0 0 rgba(255, 255, 255, 0.06),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.16),
-    0 10px 28px -14px rgba(0, 0, 0, 0.55),
-    0 0 0 1px rgba(255, 255, 255, 0.08);
-  transform: translateZ(0);
-  transition:
-    background 0.22s ease,
-    box-shadow 0.22s ease,
-    filter 0.22s ease;
-}
-
-/* continuous ≈ iOS continuous corner (squircle-ish soft edge) */
-.liquid-glass--corner-continuous {
-  border-radius: var(--lg-radius);
-  /* soft specular rim */
-}
-.liquid-glass--corner-continuous::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  background:
-    radial-gradient(120% 80% at 20% 0%, rgba(255, 255, 255, 0.28), transparent 42%),
-    radial-gradient(90% 70% at 100% 100%, rgba(255, 255, 255, 0.08), transparent 50%);
-  mix-blend-mode: screen;
-  opacity: 0.9;
-}
-
-/* circular = perfect circle / capsule */
-.liquid-glass--corner-circular {
-  border-radius: 9999px;
-}
-
-.liquid-glass--clear {
-  --lg-fill: rgba(255, 255, 255, 0.055);
-  --lg-blur: 14px;
-  --lg-sat: 180%;
-}
-
-.liquid-glass--tint {
-  --lg-blur: 22px;
-  --lg-sat: 210%;
-}
-
-.liquid-glass--regular {
-  --lg-fill: rgba(255, 255, 255, 0.1);
-  --lg-blur: 20px;
-}
-
-.liquid-glass--interactive {
-  --lg-fill: rgba(255, 255, 255, 0.12);
-  --lg-blur: 22px;
-  --lg-sat: 220%;
-}
-
-.liquid-glass--identity {
-  --lg-fill: transparent;
-  --lg-blur: 0px;
-  --lg-sat: 100%;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  box-shadow: none;
-}
-
-.liquid-glass-is-interactive {
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-  will-change: transform;
-}
-
-.liquid-glass-is-interactive:hover {
-  background: color-mix(in srgb, var(--lg-fill) 70%, rgba(255, 255, 255, 0.22));
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.58),
-    inset 1px 0 0 rgba(255, 255, 255, 0.22),
-    inset -1px 0 0 rgba(255, 255, 255, 0.1),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
-    0 14px 32px -12px rgba(0, 0, 0, 0.6),
-    0 0 0 1px rgba(255, 255, 255, 0.14);
-}
-
-.liquid-glass-is-interactive:active {
-  background: color-mix(in srgb, var(--lg-fill) 55%, rgba(255, 255, 255, 0.28));
-}
-
-.liquid-glass-is-interactive:disabled,
-.liquid-glass:disabled {
-  cursor: not-allowed;
-  opacity: 0.4;
-  transform: none !important;
-}
-
-.liquid-glass__content {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-}
-
-/* GlassEffectContainer morph dock — shared liquid rail under children */
-.liquid-glass-container {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--lg-spacing, 12px);
-  isolation: isolate;
-}
-
-.liquid-glass-container--horizontal {
-  flex-direction: row;
-}
-
-.liquid-glass-container--vertical {
-  flex-direction: column;
-}
-
-.liquid-glass-container__morph {
-  position: absolute;
-  z-index: 0;
-  inset: -6px;
-  border-radius: 9999px;
-  pointer-events: none;
-  background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(18px) saturate(190%) brightness(1.05);
-  -webkit-backdrop-filter: blur(18px) saturate(190%) brightness(1.05);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.28),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.14),
-    0 12px 36px -16px rgba(0, 0, 0, 0.55),
-    0 0 0 1px rgba(255, 255, 255, 0.06);
-  transition:
-    inset 0.28s cubic-bezier(0.32, 0.72, 0, 1),
-    opacity 0.22s ease,
-    transform 0.28s cubic-bezier(0.32, 0.72, 0, 1);
-}
-
-.liquid-glass-container > .liquid-glass {
-  z-index: 1;
-  /* Nested glass sits on morph rail — slightly clearer so layers read as one material */
-  background: rgba(255, 255, 255, 0.08);
-}
-
-/* Circular control orb — ComplexVideo 50×50 glass buttons */
-.liquid-glass-orb {
-  flex-shrink: 0;
-}
-
-.liquid-glass-orb--active {
-  background: rgba(255, 255, 255, 0.2) !important;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.62),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
-    0 0 0 1px rgba(255, 255, 255, 0.2),
-    0 10px 24px -10px rgba(0, 0, 0, 0.55) !important;
-}
-
-.liquid-glass-orb .liquid-glass__content {
-  color: rgba(255, 255, 255, 0.92);
 }
 
 /* Primary play / skip orbs — solid white (same family for transport cluster) */
@@ -974,83 +730,6 @@
   }
 }
 
-/* List enter stagger (IO sets data-shown) */
-.list-enter {
-  --i: 0;
-  opacity: 0;
-  transform: translateY(10px) scale(0.985);
-  transition:
-    opacity 0.38s cubic-bezier(0.32, 0.72, 0, 1),
-    transform 0.42s cubic-bezier(0.32, 0.72, 0, 1);
-  transition-delay: calc(min(var(--i), 16) * 22ms);
-}
-
-.list-enter[data-shown="1"] {
-  opacity: 1;
-  transform: translateY(0) scale(1);
-}
-
-.motion-off .list-enter {
-  opacity: 1;
-  transform: none;
-  transition: none;
-}
-
-/* Pointer glow shell — full motion only (spotlight + rim light) */
-.player-glow-spotlight {
-  display: none;
-  pointer-events: none;
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  border-radius: inherit;
-  background-image: radial-gradient(
-    220px 220px at
-      calc(var(--ptr-x, -9999) * 1px)
-      calc(var(--ptr-y, -9999) * 1px),
-    hsl(var(--glow-hue, 210) 85% 72% / 0.12),
-    transparent 72%
-  );
-  background-attachment: fixed;
-  mix-blend-mode: screen;
-}
-
-.motion-full .player-glow-spotlight {
-  display: block;
-}
-
-/* Rim light follows pointer (mask keeps only the border ring) */
-.player-glow-rim {
-  display: none;
-  pointer-events: none;
-  position: absolute;
-  inset: 0;
-  z-index: 5;
-  border-radius: inherit;
-  padding: 1.5px;
-  background: radial-gradient(
-    160px 160px at
-      calc(var(--ptr-x, -9999) * 1px)
-      calc(var(--ptr-y, -9999) * 1px),
-    rgba(255, 255, 255, 0.85),
-    hsl(var(--glow-hue, 210) 90% 70% / 0.35) 35%,
-    transparent 70%
-  );
-  background-attachment: fixed;
-  -webkit-mask:
-    linear-gradient(#fff 0 0) content-box,
-    linear-gradient(#fff 0 0);
-  -webkit-mask-composite: xor;
-  mask:
-    linear-gradient(#fff 0 0) content-box,
-    linear-gradient(#fff 0 0);
-  mask-composite: exclude;
-}
-
-.motion-full .player-glow-rim {
-  display: block;
-}
-
 /* White play button — conic glow on hover (paused when idle) */
 .liquid-glass-play {
   position: relative;
@@ -1116,15 +795,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .player-liquid-glass,
-  .liquid-glass,
-  .liquid-glass-container__morph {
+  .player-liquid-glass {
     transition: none !important;
   }
-  .liquid-glass-is-interactive {
-    transform: none !important;
-  }
-  .list-enter,
   .song-meta-enter,
   .progress-track__fill,
   .progress-track__rail,
@@ -1134,8 +807,6 @@
     opacity: 1 !important;
     transform: none !important;
   }
-  .player-glow-rim,
-  .player-glow-spotlight,
   .play-glow {
     display: none !important;
   }

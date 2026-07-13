@@ -2,6 +2,8 @@
  * Multi-platform auth (NetEase / QQ / Kugou) — QR scan only.
  * Sessions live in the Tauri backend (AppData cookie files).
  */
+import { checkQrLogin, getQrKey } from "./api";
+import { invokeNative } from "./native";
 
 export type AuthPlatform = "netease" | "qq" | "kugou";
 
@@ -50,20 +52,17 @@ export function emptyMultiAuth(): MultiAuthStatus {
   };
 }
 
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
+type NativePlatformAuth = Partial<PlatformAuth>;
+type NativeMultiAuth = {
+  any_logged_in?: boolean;
+  anyLoggedIn?: boolean;
+  netease?: NativePlatformAuth;
+  qq?: NativePlatformAuth;
+  kugou?: NativePlatformAuth;
+};
+type NativeQr = Partial<PlatformQrKey & PlatformQrStatus>;
 
-async function invokeNative<T>(
-  command: string,
-  args?: Record<string, unknown>
-): Promise<T | null> {
-  if (!isTauriRuntime()) return null;
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<T>(command, args);
-}
-
-function mapPlatform(raw: any, fallback: AuthPlatform): PlatformAuth {
+function mapPlatform(raw: NativePlatformAuth | undefined, fallback: AuthPlatform): PlatformAuth {
   return {
     platform: (raw?.platform as AuthPlatform) || fallback,
     logged_in: Boolean(raw?.logged_in),
@@ -73,7 +72,7 @@ function mapPlatform(raw: any, fallback: AuthPlatform): PlatformAuth {
   };
 }
 
-function mapMulti(raw: any): MultiAuthStatus {
+function mapMulti(raw: NativeMultiAuth): MultiAuthStatus {
   const netease = mapPlatform(raw?.netease, "netease");
   const qq = mapPlatform(raw?.qq, "qq");
   const kugou = mapPlatform(raw?.kugou, "kugou");
@@ -87,7 +86,7 @@ function mapMulti(raw: any): MultiAuthStatus {
   };
 }
 
-function mapQrStatus(raw: any): PlatformQrStatus {
+function mapQrStatus(raw: NativeQr): PlatformQrStatus {
   const code = Number(raw?.code ?? 0);
   let status = String(raw?.status ?? "unknown") as PlatformQrStatus["status"];
   if (code === 803) status = "success";
@@ -105,27 +104,7 @@ function mapQrStatus(raw: any): PlatformQrStatus {
 /** Full multi-platform auth snapshot. */
 export async function getMultiAuthStatus(): Promise<MultiAuthStatus> {
   try {
-    const native = await invokeNative<any>("auth_status");
-    if (native) return mapMulti(native);
-  } catch {
-    /* fall through */
-  }
-  try {
-    const { getLoginStatus } = await import("./api");
-    const st = await getLoginStatus();
-    const netease: PlatformAuth = {
-      platform: "netease",
-      logged_in: st.logged_in,
-      nickname: st.nickname,
-      uid: st.uid != null ? String(st.uid) : undefined,
-      vip: st.vip_type != null ? st.vip_type > 0 : undefined,
-    };
-    return {
-      anyLoggedIn: netease.logged_in,
-      netease,
-      qq: EMPTY_PLATFORM("qq"),
-      kugou: EMPTY_PLATFORM("kugou"),
-    };
+    return mapMulti(await invokeNative<NativeMultiAuth>("auth_status"));
   } catch {
     return emptyMultiAuth();
   }
@@ -134,13 +113,11 @@ export async function getMultiAuthStatus(): Promise<MultiAuthStatus> {
 /** Fetch a QR key for the given platform. */
 export async function getPlatformQrKey(platform: AuthPlatform): Promise<PlatformQrKey> {
   if (platform === "netease") {
-    const { getQrKey } = await import("./api");
     const key = await getQrKey();
     return { unikey: key.unikey, url: key.url, image_base64: null };
   }
   if (platform === "qq") {
-    const res = await invokeNative<any>("qq_qr_key");
-    if (!res) throw new Error("QQ 扫码需要桌面端");
+    const res = await invokeNative<NativeQr>("qq_qr_key");
     const image = res.image_base64 ? String(res.image_base64) : null;
     const url = String(res.url ?? "");
     // Never accept a NetEase-shaped payload on the QQ path
@@ -154,8 +131,7 @@ export async function getPlatformQrKey(platform: AuthPlatform): Promise<Platform
       image_base64: image,
     };
   }
-  const res = await invokeNative<any>("kugou_qr_key");
-  if (!res) throw new Error("酷狗扫码需要桌面端");
+  const res = await invokeNative<NativeQr>("kugou_qr_key");
   return {
     unikey: String(res.unikey ?? ""),
     url: String(res.url ?? ""),
@@ -170,7 +146,6 @@ export async function checkPlatformQr(
   signal?: AbortSignal
 ): Promise<PlatformQrStatus> {
   if (platform === "netease") {
-    const { checkQrLogin } = await import("./api");
     const s = await checkQrLogin(unikey, signal);
     return {
       code: s.code,
@@ -184,8 +159,7 @@ export async function checkPlatformQr(
     throw err;
   }
   const cmd = platform === "qq" ? "qq_qr_check" : "kugou_qr_check";
-  const res = await invokeNative<any>(cmd, { args: { unikey } });
-  if (!res) throw new Error("扫码轮询需要桌面端");
+  const res = await invokeNative<NativeQr>(cmd, { args: { unikey } });
   return mapQrStatus(res);
 }
 
@@ -198,12 +172,7 @@ export async function logoutKugou(): Promise<void> {
 }
 
 export async function logoutNetease(): Promise<void> {
-  if (isTauriRuntime()) {
-    await invokeNative<void>("netease_logout");
-    return;
-  }
-  const { logout } = await import("./api");
-  await logout();
+  await invokeNative<void>("netease_logout");
 }
 
 export async function logoutPlatform(platform: AuthPlatform): Promise<void> {
@@ -213,13 +182,7 @@ export async function logoutPlatform(platform: AuthPlatform): Promise<void> {
 }
 
 export async function logoutAll(): Promise<void> {
-  // Tauri commands returning `()` resolve to null. Runtime detection must be
-  // explicit or the slow web /logout fallback runs after native cleanup.
-  if (isTauriRuntime()) {
-    await invokeNative<void>("auth_logout_all");
-    return;
-  }
-  await logoutNetease().catch(() => {});
+  await invokeNative<void>("auth_logout_all");
 }
 
 export const AUTH_PLATFORM_LABEL: Record<AuthPlatform, string> = {

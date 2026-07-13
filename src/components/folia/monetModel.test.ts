@@ -5,7 +5,9 @@ import {
   MONET_SCROLL_IDLE_RESET_MS,
   MONET_SCROLL_STEP_PX,
   MONET_SCROLL_TRANSITION,
+  buildPositionedEntries,
   buildScrollableRailEntries,
+  measureMonetLineLayout,
   resolveClassicLineTone,
   resolveFumeLineTone,
   resolveMonetLineTone,
@@ -19,8 +21,13 @@ describe("Folia Monet constants (1:1 with MonetLyricsRail)", () => {
     expect(MONET_INACTIVE_GAP_PX).toBe(10);
     expect(MONET_SCROLL_IDLE_RESET_MS).toBe(1800);
     expect(MONET_SCROLL_STEP_PX).toBe(72);
-    expect(MONET_SCROLL_TRANSITION.y.stiffness).toBe(142);
-    expect(MONET_SCROLL_TRANSITION.scale.stiffness).toBe(150);
+    expect(MONET_SCROLL_TRANSITION.y.duration).toBe(0.34);
+    expect(MONET_SCROLL_TRANSITION.scale.duration).toBe(
+      MONET_SCROLL_TRANSITION.y.duration,
+    );
+    expect(MONET_SCROLL_TRANSITION.scale.ease).toEqual(
+      MONET_SCROLL_TRANSITION.y.ease,
+    );
   });
 });
 
@@ -69,5 +76,81 @@ describe("buildScrollableRailEntries + toTimedLines", () => {
     expect(entries.find((e) => e.offset === 0)?.status).toBe("active");
     expect(resolveRailLineStatus(3, 5)).toBe("passed");
     expect(resolveRailLineStatus(7, 5)).toBe("waiting");
+  });
+});
+
+describe("measureMonetLineLayout", () => {
+  it("reserves translation space below a wrapped active lyric", () => {
+    const layout = measureMonetLineLayout({
+      text: "Hate you hate you don’t come back again",
+      translation: "我恨你！你不要再回来了！",
+      status: "active",
+      fontPx: 28,
+      fontWeight: 600,
+      translationFontPx: 15,
+      fontStack: "sans-serif",
+      maxWidthPx: 360,
+      showSubtitleTranslation: true,
+    });
+    expect(layout.textHeightPx).toBeGreaterThan(28 * 1.18);
+    expect(layout.translationHeightPx).toBeGreaterThan(0);
+    expect(layout.textPaddingBottomPx + layout.translationPaddingTopPx).toBeLessThan(9);
+    expect(layout.visualHeightPx).toBe(
+      layout.textHeightPx + layout.translationHeightPx
+    );
+  });
+
+  it("uses final DOM heights when browser wrapping differs from the estimate", () => {
+    const source = [
+      {
+        time: 0,
+        text: "A long main lyric that WebView wraps differently",
+        tr: "翻译歌词",
+      },
+    ];
+    const entries = buildScrollableRailEntries(
+      toTimedLines(source, 10),
+      source,
+      0,
+      0,
+      0,
+      0,
+    );
+    const domMeasurements = new Map([
+      [entries[0].key, { textHeightPx: 100, translationHeightPx: 30 }],
+    ]);
+
+    const [positioned] = buildPositionedEntries(
+      entries,
+      340,
+      680,
+      "monet",
+      28,
+      22,
+      15,
+      "sans-serif",
+      34,
+      true,
+      domMeasurements,
+    );
+
+    expect(positioned.layout.textHeightPx).toBe(100);
+    expect(positioned.layout.translationHeightPx).toBe(30);
+    expect(positioned.layout.visualHeightPx).toBe(130);
+    expect(positioned.scaledHeight).toBe(130);
+  });
+
+  it("reserves translation space for inactive lyrics too", () => {
+    const layout = measureMonetLineLayout({
+      text: "Waiting lyric",
+      translation: "等待中的翻译",
+      status: "waiting",
+      fontPx: 24,
+      translationFontPx: 14,
+      fontStack: "sans-serif",
+      maxWidthPx: 420,
+      showSubtitleTranslation: true,
+    });
+    expect(layout.translationHeightPx).toBeGreaterThan(0);
   });
 });

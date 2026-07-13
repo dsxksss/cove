@@ -1,5 +1,6 @@
 import type { Song } from "./types";
 import { sameSong } from "./musicSources";
+import { invokeNative } from "./native";
 
 export const APP_PLAYLISTS_STORAGE_KEY = "nmp.appPlaylists.v1";
 
@@ -41,13 +42,19 @@ function normalizePlaylist(value: unknown): AppPlaylist | null {
   return { id: playlist.id, name, songs, createdAt, updatedAt };
 }
 
+export function normalizeAppPlaylists(value: unknown): AppPlaylist[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(normalizePlaylist)
+    .filter((item): item is AppPlaylist => item != null);
+}
+
 export function loadAppPlaylists(): AppPlaylist[] {
   try {
     const raw = localStorage.getItem(APP_PLAYLISTS_STORAGE_KEY);
     if (!raw) return [];
     const value: unknown = JSON.parse(raw);
-    if (!Array.isArray(value)) return [];
-    return value.map(normalizePlaylist).filter((item): item is AppPlaylist => item != null);
+    return normalizeAppPlaylists(value);
   } catch {
     return [];
   }
@@ -58,6 +65,56 @@ export function saveAppPlaylists(playlists: AppPlaylist[]): void {
     localStorage.setItem(APP_PLAYLISTS_STORAGE_KEY, JSON.stringify(playlists));
   } catch {
     /* local persistence is best-effort */
+  }
+}
+
+export async function loadNativeAppPlaylists(): Promise<{
+  exists: boolean;
+  playlists: AppPlaylist[];
+}> {
+  const result = await invokeNative<{ exists: boolean; playlists: unknown }>(
+    "load_app_playlists",
+  );
+  return {
+    exists: result.exists,
+    playlists: normalizeAppPlaylists(result.playlists),
+  };
+}
+
+let nativePlaylistWriteTail: Promise<void> = Promise.resolve();
+
+export async function persistAppPlaylists(playlists: AppPlaylist[]): Promise<void> {
+  // Journal immediately, then serialize native writes so an older disk write
+  // can never finish after a newer edit and overwrite it.
+  saveAppPlaylists(playlists);
+  const write = nativePlaylistWriteTail
+    .catch(() => undefined)
+    .then(async () => {
+      await invokeNative<void>("save_app_playlists", { args: { playlists } });
+      removeMigrationJournalIfCurrent(playlists);
+    });
+  nativePlaylistWriteTail = write;
+  return write;
+}
+
+export async function persistAppPlaylistsWith(
+  playlists: AppPlaylist[],
+  saveNative: (playlists: AppPlaylist[]) => Promise<void>,
+): Promise<void> {
+  // Keep a synchronous migration journal until the atomic native write succeeds.
+  saveAppPlaylists(playlists);
+  await saveNative(playlists);
+  removeMigrationJournalIfCurrent(playlists);
+}
+
+function removeMigrationJournalIfCurrent(playlists: AppPlaylist[]): void {
+  try {
+    const current = localStorage.getItem(APP_PLAYLISTS_STORAGE_KEY);
+    if (current === JSON.stringify(playlists)) {
+      localStorage.removeItem(APP_PLAYLISTS_STORAGE_KEY);
+    }
+  } catch {
+    /* native file is already durable */
   }
 }
 

@@ -30,5 +30,18 @@ export default defineConfig({
     target: "es2021",
     minify: "esbuild",
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/react") || id.includes("node_modules\\react")) {
+            return "vendor-react";
+          }
+          if (id.includes("node_modules/motion") || id.includes("node_modules\\motion")) {
+            return "vendor-motion";
+          }
+          if (id.includes("@chenglou/pretext")) return "vendor-pretext";
+        },
+      },
+    },
   },
 });

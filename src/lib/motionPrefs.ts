@@ -10,7 +10,7 @@ const MOTION_KEY = "nmp.motionLevel";
 export const MOTION_LEVEL_OPTIONS: Array<{ value: MotionLevel; label: string; hint: string }> = [
   { value: "off", label: "关闭", hint: "无额外动效" },
   { value: "light", label: "轻量", hint: "列表与进度反馈" },
-  { value: "full", label: "完整", hint: "指针光晕 + 按钮高光" },
+  { value: "full", label: "完整", hint: "歌词动效 + 按钮反馈" },
 ];
 
 function prefersReducedMotion(): boolean {

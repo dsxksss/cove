@@ -1,7 +1,9 @@
 import {
   useEffect,
   useCallback,
+  lazy,
   memo,
+  Suspense,
   useMemo,
   useRef,
   useState,
@@ -15,7 +17,6 @@ import {
   ListMusic,
   Library,
   RefreshCw,
-  Save,
   Settings,
   LogOut,
   Minus,
@@ -36,27 +37,18 @@ import {
   Check,
 } from "lucide-react";
 import GlassPlayer from "./components/GlassPlayer";
-import { LoginPanel } from "./components/LoginPanel";
 import { ToastHost } from "./components/ToastHost";
 import type { LyricMotionStyle, PlayerLayout, Song as PlayerSong } from "./components/playerTypes";
 import { getAudio } from "./lib/audio";
 import { useAudioEngine } from "./hooks/useAudioEngine";
-import { usePointerCssVars } from "./hooks/usePointerCssVars";
-import { useListEnter } from "./hooks/useListEnter";
-import { useScrollEdgeFriction } from "./hooks/useScrollEdgeFriction";
 import { usePlayerStore } from "./store/playerStore";
 import {
   loadMotionLevel,
   saveMotionLevel,
-  motionAllowsListStagger,
-  motionAllowsPointer,
   MOTION_LEVEL_OPTIONS,
   type MotionLevel,
 } from "./lib/motionPrefs";
 import {
-  getApiBase,
-  setApiBase,
-  usesBuiltInNeteaseApi,
   getFavPlaylistId,
   setFavPlaylistId,
   getUserPlaylists,
@@ -86,6 +78,7 @@ import {
 } from "./lib/lyrics/matchLyrics";
 import {
   loadMusicSource,
+  getSongKey,
   MUSIC_SOURCE_OPTIONS,
   saveMusicSource,
   sameSong,
@@ -98,13 +91,20 @@ import {
   createAppPlaylist,
   deleteAppPlaylist,
   loadAppPlaylists,
+  loadNativeAppPlaylists,
   moveSongInAppPlaylist,
   removeSongFromAppPlaylist,
   renameAppPlaylist,
-  saveAppPlaylists,
+  persistAppPlaylists,
   type AppPlaylist,
 } from "./lib/appPlaylists";
 import { toast } from "./store/toastStore";
+import { getVirtualListRange } from "./lib/virtualList";
+import { getCoverFlowRange } from "./lib/coverFlow";
+
+const LoginPanel = lazy(() =>
+  import("./components/LoginPanel").then((module) => ({ default: module.LoginPanel })),
+);
 
 /** Default "My Favorites" playlist id detected for this account.
  *  Overridable via localStorage "nmp.favPlaylistId". */
@@ -116,7 +116,7 @@ const LYRIC_OFFSET_KEY = "nmp.lyricOffsetSeconds";
 const USE_COVER_BACKGROUND_KEY = "nmp.useCoverBackground";
 const SHOW_TRANSLATION_KEY = "nmp.showTranslation";
 const DEFAULT_BACKGROUND_BLUR = 30;
-const DEFAULT_BACKGROUND_OPACITY = 0;
+const DEFAULT_BACKGROUND_OPACITY = 80;
 const DEFAULT_LYRIC_OFFSET_SECONDS = 0;
 const DEFAULT_LYRIC_MOTION_STYLE: LyricMotionStyle = "monet";
 const LYRIC_MOTION_STYLE_OPTIONS: Array<{ value: LyricMotionStyle; label: string }> = [
@@ -129,7 +129,9 @@ const LYRIC_MOTION_STYLE_OPTIONS: Array<{ value: LyricMotionStyle; label: string
 
 function loadBackgroundBlur(): number {
   try {
-    const value = Number(localStorage.getItem(BACKGROUND_BLUR_KEY));
+    const stored = localStorage.getItem(BACKGROUND_BLUR_KEY);
+    if (stored == null) return DEFAULT_BACKGROUND_BLUR;
+    const value = Number(stored);
     return Number.isFinite(value) ? Math.min(60, Math.max(0, value)) : DEFAULT_BACKGROUND_BLUR;
   } catch {
     return DEFAULT_BACKGROUND_BLUR;
@@ -146,8 +148,10 @@ function saveBackgroundBlur(value: number) {
 
 function loadBackgroundOpacity(): number {
   try {
-    const value = Number(localStorage.getItem(BACKGROUND_OPACITY_KEY));
-    return Number.isFinite(value) ? Math.min(80, Math.max(0, value)) : DEFAULT_BACKGROUND_OPACITY;
+    const stored = localStorage.getItem(BACKGROUND_OPACITY_KEY);
+    if (stored == null) return DEFAULT_BACKGROUND_OPACITY;
+    const value = Number(stored);
+    return Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : DEFAULT_BACKGROUND_OPACITY;
   } catch {
     return DEFAULT_BACKGROUND_OPACITY;
   }
@@ -238,7 +242,6 @@ export default function App() {
   const queue = usePlayerStore((s) => s.queue);
   const index = usePlayerStore((s) => s.index);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
-  const currentTime = usePlayerStore((s) => s.currentTime);
   const duration = usePlayerStore((s) => s.duration);
   const cover = usePlayerStore((s) => s.currentCover);
   const lyrics = usePlayerStore((s) => s.lyrics);
@@ -292,7 +295,6 @@ export default function App() {
   const [loginOpen, setLoginOpen] = useState(false);
   const [loginPlatform, setLoginPlatform] = useState<AuthPlatform>("netease");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [lyricsPanelHovered, setLyricsPanelHovered] = useState(false);
   /** null while bootstrapping auth */
   const [multiAuth, setMultiAuth] = useState<MultiAuthStatus | null>(null);
   /** NetEase-shaped status for playlist/favorites (derived from multiAuth) */
@@ -320,7 +322,24 @@ export default function App() {
   const [activeAppPlaylistId, setActiveAppPlaylistId] = useState<string | null>(null);
   const [songActionTarget, setSongActionTarget] = useState<Song | null>(null);
 
-  usePointerCssVars(motionAllowsPointer(motionLevel));
+  useEffect(() => {
+    let cancelled = false;
+    void loadNativeAppPlaylists()
+      .then(async (native) => {
+        if (cancelled) return;
+        if (native.exists) {
+          appPlaylistsRef.current = native.playlists;
+          setAppPlaylists(native.playlists);
+          return;
+        }
+        const legacy = appPlaylistsRef.current;
+        if (legacy.length > 0) await persistAppPlaylists(legacy);
+      })
+      .catch((error) => console.warn("[playlists] native persistence unavailable", error));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // hide the hint after 6s
   useEffect(() => {
@@ -360,44 +379,30 @@ export default function App() {
 
   /** Currently opened playlist meta (for multi-source browse / load-more). */
   const browsingPlRef = useRef<PlaylistSummary | null>(null);
+  const playlistBrowseGenerationRef = useRef(0);
   const qqDefaultQueueLoadingRef = useRef(false);
 
   const refreshAccountPlaylists = useCallback(async (uid = loginStatus?.uid) => {
     setAccountPlaylistsLoading(true);
     try {
-      const lists: PlaylistSummary[] = [];
-      // NetEase
+      const tasks: Array<Promise<PlaylistSummary[]>> = [];
       if (uid) {
-        try {
-          const netease = await getUserPlaylists(uid, 200, 0);
-          lists.push(
-            ...netease
-              .filter((p) => p.createdByAccount)
-              .map((p) => ({ ...p, source: "netease" as const }))
-          );
-        } catch {
-          /* ignore */
-        }
+        tasks.push(
+          getUserPlaylists(uid, 200, 0).then((items) =>
+            items
+              .filter((playlist) => playlist.createdByAccount)
+              .map((playlist) => ({ ...playlist, source: "netease" as const })),
+          ),
+        );
       }
-      // QQ Music
-      if (multiAuth?.qq.logged_in) {
-        try {
-          const qq = await getQqUserPlaylists();
-          lists.push(...qq);
-        } catch (e) {
-          console.warn("[playlists] qq fetch failed", e);
-        }
-      }
-      // Kugou
-      if (multiAuth?.kugou.logged_in) {
-        try {
-          const kugou = await getKugouUserPlaylists();
-          lists.push(...kugou);
-        } catch (e) {
-          console.warn("[playlists] kugou fetch failed", e);
-        }
-      }
-      setAccountPlaylists(lists);
+      if (multiAuth?.qq.logged_in) tasks.push(getQqUserPlaylists());
+      if (multiAuth?.kugou.logged_in) tasks.push(getKugouUserPlaylists());
+      const settled = await Promise.allSettled(tasks);
+      setAccountPlaylists(
+        settled.flatMap((result) =>
+          result.status === "fulfilled" ? result.value : [],
+        ),
+      );
     } catch {
       setAccountPlaylists([]);
     } finally {
@@ -555,10 +560,10 @@ export default function App() {
         prev();
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        seek(currentTime + 5);
+        seek(usePlayerStore.getState().currentTime + 5);
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
-        seek(Math.max(0, currentTime - 5));
+        seek(Math.max(0, usePlayerStore.getState().currentTime - 5));
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         setVolume(Math.min(1, volume + 0.05));
@@ -594,7 +599,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [toggle, next, prev, seek, currentTime, volume, setVolume, multiAuth?.anyLoggedIn]);
+  }, [toggle, next, prev, seek, volume, setVolume, multiAuth?.anyLoggedIn]);
 
   const handleReloadFavorites = async () => {
     await loadFavPlaylist();
@@ -608,7 +613,10 @@ export default function App() {
   const commitAppPlaylists = useCallback((next: AppPlaylist[]) => {
     appPlaylistsRef.current = next;
     setAppPlaylists(next);
-    saveAppPlaylists(next);
+    void persistAppPlaylists(next).catch((error) => {
+      console.warn("[playlists] save failed", error);
+      toast("自建歌单保存失败，已保留本地恢复副本", { tone: "warning" });
+    });
   }, []);
 
   const handleCreateAppPlaylist = useCallback((name: string) => {
@@ -675,7 +683,6 @@ export default function App() {
   /** Browse a playlist's songs for viewing WITHOUT disturbing playback. */
   const handleBrowsePlaylist = useCallback(
     (pl: PlaylistSummary) => {
-      browsingPlRef.current = pl;
       const playlistId = pl.id;
       const src = pl.source ?? "netease";
       const state = usePlayerStore.getState();
@@ -688,6 +695,8 @@ export default function App() {
       ) {
         return;
       }
+      const browseGeneration = ++playlistBrowseGenerationRef.current;
+      browsingPlRef.current = pl;
 
       if (src === "kugou" || src === "qq") {
         void (async () => {
@@ -716,7 +725,11 @@ export default function App() {
                     pagesize: 50,
                   });
             // Ignore stale responses if user switched playlist while loading.
-            if (browsingPlRef.current?.id !== playlistId) return;
+            if (
+              browseGeneration !== playlistBrowseGenerationRef.current ||
+              browsingPlRef.current?.id !== playlistId ||
+              (browsingPlRef.current.source ?? "netease") !== src
+            ) return;
             usePlayerStore.setState({
               browseList: page.songs,
               browsePlaylistId: playlistId,
@@ -731,7 +744,11 @@ export default function App() {
             });
           } catch (e: any) {
             console.warn(`[playlists] ${src} browse failed`, e);
-            if (browsingPlRef.current?.id !== playlistId) return;
+            if (
+              browseGeneration !== playlistBrowseGenerationRef.current ||
+              browsingPlRef.current?.id !== playlistId ||
+              (browsingPlRef.current.source ?? "netease") !== src
+            ) return;
             usePlayerStore.setState({
               browseList: [],
               browsePlaylistId: playlistId,
@@ -784,6 +801,7 @@ export default function App() {
         : accountPlaylists.find((p) => p.id === pid);
     const src = pl?.source ?? "netease";
     if (pl && (src === "kugou" || src === "qq")) {
+      const browseGeneration = playlistBrowseGenerationRef.current;
       void (async () => {
         usePlayerStore.setState({ browseLoadingMore: true });
         try {
@@ -803,6 +821,11 @@ export default function App() {
                   { page: nextPage, pagesize: 50 }
                 );
           const cur = usePlayerStore.getState();
+          if (
+            browseGeneration !== playlistBrowseGenerationRef.current ||
+            cur.browsePlaylistId !== pid ||
+            cur.browseSource !== src
+          ) return;
           usePlayerStore.setState({
             browseList: [...cur.browseList, ...page.songs],
             browseLoaded: cur.browseLoaded + page.songs.length,
@@ -810,7 +833,9 @@ export default function App() {
             browseTotal: page.total || cur.browseTotal,
           });
         } catch {
-          usePlayerStore.setState({ browseLoadingMore: false });
+          if (browseGeneration === playlistBrowseGenerationRef.current) {
+            usePlayerStore.setState({ browseLoadingMore: false });
+          }
         }
       })();
       return;
@@ -833,7 +858,7 @@ export default function App() {
   };
 
   const handleBackgroundOpacityChange = (value: number) => {
-    const nextValue = Math.min(80, Math.max(0, Math.round(value)));
+    const nextValue = Math.min(100, Math.max(0, Math.round(value)));
     setBackgroundOpacity(nextValue);
     saveBackgroundOpacity(nextValue);
   };
@@ -880,13 +905,16 @@ export default function App() {
 
   const handleAuthChange = (status: MultiAuthStatus) => {
     setMultiAuth(status);
-    setLoginOpen(!status.anyLoggedIn);
+    // Do not close the scanner after the first successful platform login: the
+    // same panel is also the entry point for adding a second/third account.
+    // The user leaves explicitly via “进入播放器”.
+    if (!status.anyLoggedIn) setLoginOpen(true);
   };
 
   const handleLoggedIn = (_status: LoginStatus) => {
     void getMultiAuthStatus().then((status) => {
       setMultiAuth(status);
-      setLoginOpen(!status.anyLoggedIn);
+      if (!status.anyLoggedIn) setLoginOpen(true);
     });
   };
 
@@ -1037,7 +1065,6 @@ export default function App() {
       </AnimatePresence>
 
       {multiAuth.anyLoggedIn && <NavigationRail
-        reveal={layout === "lyrics" && lyricsPanelHovered}
         searchOpen={searchOpen}
         playlistsOpen={playlistsOpen}
         settingsOpen={settingsOpen}
@@ -1065,7 +1092,6 @@ export default function App() {
         <GlassPlayer
           song={shown}
           isPlaying={isPlaying}
-          currentTime={currentTime}
           onPlayPause={toggle}
           onNext={() => void next()}
           onPrev={prev}
@@ -1075,7 +1101,6 @@ export default function App() {
             setSettingsOpen(false);
             setQueueOpen(true);
           }}
-          onLyricsPanelHoverChange={setLyricsPanelHovered}
           onSeek={seek}
           layout={layout}
           onToggleLayout={setLayout}
@@ -1106,6 +1131,9 @@ export default function App() {
           playMode={playMode}
           onCyclePlayMode={cyclePlayMode}
           motionLevel={motionLevel}
+          suspendVisuals={
+            queueOpen || playlistsOpen || searchOpen || settingsOpen || loginOpen
+          }
         />
       </div>
 
@@ -1120,7 +1148,6 @@ export default function App() {
         onMoveQueueItem={moveQueueItem}
         onClearQueue={clearQueue}
         onOpenSongActions={setSongActionTarget}
-        motionLevel={motionLevel}
         browseList={browseList}
         browsePlaylistId={browsePlaylistId}
         browseTotal={browseTotal}
@@ -1153,7 +1180,6 @@ export default function App() {
       <SearchOverlay
         open={searchOpen}
         onClose={() => setSearchOpen(false)}
-        motionLevel={motionLevel}
         onOpenSongActions={setSongActionTarget}
         onPick={async (s) => {
           await playSong(s, []);
@@ -1170,17 +1196,21 @@ export default function App() {
         onCreatePlaylistWithSong={handleCreateAppPlaylistWithSong}
       />
 
-      <LoginPanel
-        open={loginOpen}
-        onClose={() => {
-          // Only allow leaving login after at least one platform is signed in.
-          if (multiAuth?.anyLoggedIn) setLoginOpen(false);
-        }}
-        onLoggedIn={handleLoggedIn}
-        onAuthChange={handleAuthChange}
-        closable={Boolean(multiAuth?.anyLoggedIn)}
-        initialPlatform={loginPlatform}
-      />
+      <Suspense fallback={null}>
+        {loginOpen && (
+          <LoginPanel
+            open
+            onClose={() => {
+              // Only allow leaving login after at least one platform is signed in.
+              if (multiAuth?.anyLoggedIn) setLoginOpen(false);
+            }}
+            onLoggedIn={handleLoggedIn}
+            onAuthChange={handleAuthChange}
+            closable={Boolean(multiAuth?.anyLoggedIn)}
+            initialPlatform={loginPlatform}
+          />
+        )}
+      </Suspense>
 
       <SettingsPanel
         open={settingsOpen}
@@ -1237,9 +1267,6 @@ function SettingsPanel({
   motionLevel: MotionLevel;
   onMotionLevelChange: (value: MotionLevel) => void;
 }) {
-  const [apiBaseInput, setApiBaseInput] = useState(getApiBase);
-  const useBuiltInApi = usesBuiltInNeteaseApi();
-  const [status, setStatus] = useState("");
   /** Confirm before destructive logout */
   const [logoutConfirm, setLogoutConfirm] = useState<
     null | { kind: "all" } | { kind: "platform"; platform: AuthPlatform }
@@ -1248,22 +1275,9 @@ function SettingsPanel({
 
   useEffect(() => {
     if (!open) return;
-    setApiBaseInput(getApiBase());
-    setStatus("");
     setLogoutConfirm(null);
     setLogoutBusy(false);
   }, [open]);
-
-  const saveApiBase = () => {
-    const nextBase = apiBaseInput.trim();
-    if (!/^https?:\/\/.+/i.test(nextBase)) {
-      setStatus("请输入以 http:// 或 https:// 开头的 API 地址");
-      return false;
-    }
-    setApiBase(nextBase);
-    setStatus("已保存");
-    return true;
-  };
 
   const runConfirmedLogout = async () => {
     if (!logoutConfirm || logoutBusy) return;
@@ -1288,7 +1302,7 @@ function SettingsPanel({
           animate={{ x: 0, opacity: 1, scale: 1 }}
           exit={{ x: 22, opacity: 0, scale: 0.99 }}
           transition={{ type: "spring", stiffness: 300, damping: 30, mass: 0.72 }}
-          style={{ transform: "translateZ(0)", contain: "layout paint" }}
+          style={{ contain: "layout paint" }}
           className="context-panel context-panel--tab-page player-liquid-glass settings-player-page absolute z-50 flex flex-col text-white overflow-hidden"
         >
             <header
@@ -1317,7 +1331,7 @@ function SettingsPanel({
 
             <div
               className="context-panel-layer player-liquid-content settings-player-grid flex-1 min-h-0 grid grid-cols-[minmax(280px,0.88fr)_minmax(330px,1.12fr)] gap-4 p-5 pt-4 no-drag"
-              style={{ transform: "translateZ(0)", contain: "layout paint", overscrollBehavior: "contain", ["--context-layer" as string]: 1 }}
+              style={{ contain: "layout paint", overscrollBehavior: "contain", ["--context-layer" as string]: 1 }}
             >
               <div className="min-h-0 space-y-4 overflow-y-auto pr-1">
               <section className="settings-player-section rounded-[22px] p-4 space-y-3">
@@ -1402,36 +1416,6 @@ function SettingsPanel({
                 </span>
               </p>
 
-              {!useBuiltInApi && (
-                <section className="settings-player-section rounded-[22px] p-4 space-y-3">
-                  <label className="block">
-                    <span className="mb-2 flex items-center gap-2 text-sm font-semibold text-white/85">
-                      <span className="settings-player-inline-icon grid h-7 w-7 place-items-center rounded-full text-white/55">
-                        <Server size={14} />
-                      </span>
-                      API 地址
-                    </span>
-                    <input
-                      value={apiBaseInput}
-                      onChange={(e) => {
-                        setApiBaseInput(e.target.value);
-                        setStatus("");
-                      }}
-                      className="app-liquid-input w-full h-10 rounded-xl px-3 text-sm text-white outline-none"
-                      placeholder="http://127.0.0.1:5000"
-                    />
-                  </label>
-                  <div className="flex justify-end">
-                    <button
-                      onClick={saveApiBase}
-                      className="h-9 px-3 rounded-full bg-white/10 hover:bg-white/16 border border-white/10 text-sm font-semibold text-white transition-colors inline-flex items-center gap-2"
-                    >
-                      <Save size={14} />
-                      保存
-                    </button>
-                  </div>
-                </section>
-              )}
               </div>
 
               <div className="min-h-0 space-y-4 overflow-y-auto pl-1">
@@ -1511,7 +1495,7 @@ function SettingsPanel({
                   <input
                     type="range"
                     min={0}
-                    max={80}
+                    max={100}
                     step={1}
                     value={backgroundOpacity}
                     onChange={(e) => onBackgroundOpacityChange(Number(e.target.value))}
@@ -1527,7 +1511,7 @@ function SettingsPanel({
                     动效强度
                   </div>
                   <p className="mb-2 text-xs text-white/45">
-                    列表进场、进度反馈、指针光晕等（受系统「减少动态效果」影响）
+                    歌词、按钮与进度反馈动画（受系统「减少动态效果」影响）
                   </p>
                   <div className="flex flex-wrap gap-1.5">
                     {MOTION_LEVEL_OPTIONS.map(({ value, label, hint }) => (
@@ -1549,11 +1533,6 @@ function SettingsPanel({
                 </div>
               </section>
 
-              {status && (
-                <p className="text-xs font-medium text-white/50">
-                  {status}
-                </p>
-              )}
               </div>
             </div>
 
@@ -1628,7 +1607,6 @@ function SettingsPanel({
 }
 
 const NavigationRail = memo(function NavigationRail({
-  reveal,
   searchOpen,
   playlistsOpen,
   settingsOpen,
@@ -1636,7 +1614,6 @@ const NavigationRail = memo(function NavigationRail({
   onTogglePlaylists,
   onOpenSettings,
 }: {
-  reveal: boolean;
   searchOpen: boolean;
   playlistsOpen: boolean;
   settingsOpen: boolean;
@@ -1645,7 +1622,42 @@ const NavigationRail = memo(function NavigationRail({
   onOpenSettings: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
-  const visible = reveal || hovered || searchOpen || playlistsOpen || settingsOpen;
+  const [lingerVisible, setLingerVisible] = useState(false);
+  const [hoverSuppressed, setHoverSuppressed] = useState(false);
+  const pointerInsideRef = useRef(false);
+  const hideTimerRef = useRef<number | null>(null);
+  const anyPageOpen = searchOpen || playlistsOpen || settingsOpen;
+  const previousPageOpenRef = useRef(anyPageOpen);
+  const visible = anyPageOpen || lingerVisible || (hovered && !hoverSuppressed);
+
+  useEffect(() => {
+    const wasOpen = previousPageOpenRef.current;
+    previousPageOpenRef.current = anyPageOpen;
+    if (hideTimerRef.current != null) {
+      clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+    if (anyPageOpen) {
+      setLingerVisible(false);
+      setHoverSuppressed(false);
+      return;
+    }
+    if (!wasOpen) return;
+    setLingerVisible(true);
+    hideTimerRef.current = window.setTimeout(() => {
+      hideTimerRef.current = null;
+      setLingerVisible(false);
+      setHovered(false);
+      setHoverSuppressed(pointerInsideRef.current);
+    }, 5000);
+  }, [anyPageOpen]);
+
+  useEffect(
+    () => () => {
+      if (hideTimerRef.current != null) clearTimeout(hideTimerRef.current);
+    },
+    [],
+  );
   const items = [
     { label: "搜索", icon: Search, active: searchOpen, action: onOpenSearch },
     { label: "我的歌单", icon: Library, active: playlistsOpen, action: onTogglePlaylists },
@@ -1654,12 +1666,16 @@ const NavigationRail = memo(function NavigationRail({
 
   return (
     <aside
-      className={`fixed top-1/2 z-[80] -translate-y-1/2 no-drag transition-opacity duration-300 ${
-        visible ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
-      }`}
-      style={{ right: "14px" }}
-      onPointerEnter={() => setHovered(true)}
-      onPointerLeave={() => setHovered(false)}
+      className="fixed right-0 top-1/2 z-[80] flex h-[220px] w-[72px] -translate-y-1/2 items-center justify-end pr-[14px] no-drag"
+      onPointerEnter={() => {
+        pointerInsideRef.current = true;
+        if (!hoverSuppressed) setHovered(true);
+      }}
+      onPointerLeave={() => {
+        pointerInsideRef.current = false;
+        setHovered(false);
+        setHoverSuppressed(false);
+      }}
       onFocus={() => setHovered(true)}
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setHovered(false);
@@ -1667,11 +1683,17 @@ const NavigationRail = memo(function NavigationRail({
     >
       <motion.nav
         initial={false}
-        animate={{ x: visible ? 0 : 8, scale: visible ? 1 : 0.94 }}
+        animate={{
+          x: visible ? 0 : 12,
+          scale: visible ? 1 : 0.94,
+          opacity: visible ? 1 : 0,
+        }}
         transition={{ type: "spring", stiffness: 420, damping: 32, mass: 0.65 }}
         aria-label="主导航"
         tabIndex={visible ? 0 : -1}
-        className="app-liquid-tab-rail flex w-[52px] flex-col gap-1 p-1 text-white outline-none"
+        className={`app-liquid-tab-rail flex w-[52px] flex-col gap-1 p-1 text-white outline-none ${
+          visible ? "pointer-events-auto" : "pointer-events-none"
+        }`}
         role="tablist"
         aria-orientation="vertical"
       >
@@ -1843,6 +1865,63 @@ function SongActionDialog({
   );
 }
 
+const loadedListCoverUrls = new Set<string>();
+const failedListCoverUrls = new Set<string>();
+
+function listCoverThumbnail(src: string): string {
+  try {
+    const url = new URL(src);
+    if (url.hostname.endsWith("music.126.net")) {
+      url.searchParams.set("param", "96y96");
+      return url.toString();
+    }
+    if (url.hostname.endsWith("gtimg.cn")) {
+      return src.replace(/T002R\d+x\d+M000/i, "T002R90x90M000");
+    }
+  } catch {
+    // Provider occasionally returns a relative/data URL; keep it untouched.
+  }
+  return src;
+}
+
+const CollectionSongCover = memo(function CollectionSongCover({
+  src,
+  suspendLoading,
+}: {
+  src?: string;
+  suspendLoading: boolean;
+}) {
+  const thumbnail = useMemo(() => (src ? listCoverThumbnail(src) : ""), [src]);
+  const [failed, setFailed] = useState(() => failedListCoverUrls.has(thumbnail));
+
+  useEffect(() => {
+    setFailed(failedListCoverUrls.has(thumbnail));
+  }, [thumbnail]);
+
+  if (
+    !thumbnail ||
+    failed ||
+    (suspendLoading && !loadedListCoverUrls.has(thumbnail))
+  ) {
+    return null;
+  }
+
+  return (
+    <img
+      src={thumbnail}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      className="h-full w-full object-cover"
+      onLoad={() => loadedListCoverUrls.add(thumbnail)}
+      onError={() => {
+        failedListCoverUrls.add(thumbnail);
+        setFailed(true);
+      }}
+    />
+  );
+});
+
 /** Separate full-window views for the live queue and account playlists. */
 const CollectionDrawer = memo(function CollectionDrawer({
   open,
@@ -1855,7 +1934,6 @@ const CollectionDrawer = memo(function CollectionDrawer({
   onMoveQueueItem,
   onClearQueue,
   onOpenSongActions,
-  motionLevel = "light",
   browseList,
   browsePlaylistId,
   browseTotal,
@@ -1894,7 +1972,6 @@ const CollectionDrawer = memo(function CollectionDrawer({
   onMoveQueueItem: (from: number, to: number) => void;
   onClearQueue: () => void;
   onOpenSongActions: (song: Song) => void;
-  motionLevel?: MotionLevel;
   browseList: Song[];
   browsePlaylistId: number | null;
   browseTotal: number;
@@ -1923,9 +2000,17 @@ const CollectionDrawer = memo(function CollectionDrawer({
   onMoveAppPlaylistSong: (id: string, from: number, to: number) => void;
   onPlayFromAppPlaylist: (playlist: AppPlaylist, song: Song) => void;
 }) {
-  // Virtualized-ish rendering: only render the first `limit` rows, grow on
-  // scroll near the bottom. Avoids mounting 1785 <button>+<img> at once.
-  const [limit, setLimit] = useState(60);
+  // Real fixed-row virtualization: only rows near the viewport are mounted,
+  // regardless of whether the playlist contains 60 or several thousand songs.
+  const ROW_HEIGHT = 58;
+  const ROW_OVERSCAN = 8;
+  const ROW_WINDOW_STEP = 4;
+  const [virtualScrollRow, setVirtualScrollRow] = useState(0);
+  const [virtualViewportHeight, setVirtualViewportHeight] = useState(560);
+  const [suspendCoverLoading, setSuspendCoverLoading] = useState(false);
+  const scrollFrameRef = useRef<number | null>(null);
+  const scrollIdleTimerRef = useRef<number | null>(null);
+  const coverLoadingSuspendedRef = useRef(false);
   const [playlistLibrary, setPlaylistLibrary] = useState<"app" | "platform">(
     activeAppPlaylistId ? "app" : "platform"
   );
@@ -1939,10 +2024,7 @@ const CollectionDrawer = memo(function CollectionDrawer({
   const [renameValue, setRenameValue] = useState("");
   const [confirmDeletePlaylistId, setConfirmDeletePlaylistId] = useState<string | null>(null);
   const [confirmClearQueue, setConfirmClearQueue] = useState(false);
-  const [panelScrolling, setPanelScrolling] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const scrollIdleRef = useRef<number | null>(null);
-  useScrollEdgeFriction(scrollRef, open);
 
   const isPlaylistMode = mode === "playlists";
   const activeAppPlaylist = appPlaylists.find((playlist) => playlist.id === activeAppPlaylistId) ?? null;
@@ -1982,21 +2064,33 @@ const CollectionDrawer = memo(function CollectionDrawer({
         : playlistLoadingMore;
   const showLoadMoreFooter =
     !isAppLibrary && listTotal > 0 && listLoaded < listTotal;
-  const listStagger = motionAllowsListStagger(motionLevel);
-
-  // reset limit when reopening or when the browse list changes (switch playlist)
-  useEffect(() => {
-    if (open) setLimit(60);
-  }, [open]);
   useEffect(() => {
     setConfirmClearQueue(false);
     setPlaylistSearchOpen(false);
     setPlaylistSearchQuery("");
   }, [mode, open]);
   useEffect(() => {
-    setLimit(60);
+    setVirtualScrollRow(0);
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [activeAppPlaylistId, browsePlaylistId, mode, playlistLibrary]);
+
+  useEffect(() => {
+    if (!open) return;
+    const element = scrollRef.current;
+    if (!element) return;
+    const updateHeight = () => setVirtualViewportHeight(element.clientHeight || 560);
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [open, mode, playlistLibrary, activeAppPlaylistId, browsePlaylistId]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollFrameRef.current != null) cancelAnimationFrame(scrollFrameRef.current);
+      if (scrollIdleTimerRef.current != null) clearTimeout(scrollIdleTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (!isPlaylistMode || !open || playlistLibrary !== "app") return;
@@ -2015,35 +2109,50 @@ const CollectionDrawer = memo(function CollectionDrawer({
     previousActiveAppPlaylistIdRef.current = activeAppPlaylistId;
   }, [activeAppPlaylistId]);
 
-  useEffect(() => {
-    return () => {
-      if (scrollIdleRef.current != null) window.clearTimeout(scrollIdleRef.current);
-    };
-  }, []);
-
-  useListEnter(scrollRef, open && listStagger, [list.length, activeAppPlaylistId, browsePlaylistId, limit, open]);
-
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    setPanelScrolling(true);
-    if (scrollIdleRef.current != null) window.clearTimeout(scrollIdleRef.current);
-    scrollIdleRef.current = window.setTimeout(() => {
-      scrollIdleRef.current = null;
-      setPanelScrolling(false);
-    }, 120);
+    if (!coverLoadingSuspendedRef.current) {
+      coverLoadingSuspendedRef.current = true;
+      setSuspendCoverLoading(true);
+    }
+    if (scrollIdleTimerRef.current != null) {
+      clearTimeout(scrollIdleTimerRef.current);
+    }
+    scrollIdleTimerRef.current = window.setTimeout(() => {
+      scrollIdleTimerRef.current = null;
+      coverLoadingSuspendedRef.current = false;
+      setSuspendCoverLoading(false);
+    }, 160);
+    if (scrollFrameRef.current == null) {
+      scrollFrameRef.current = requestAnimationFrame(() => {
+        scrollFrameRef.current = null;
+        const nextRow = Math.floor(el.scrollTop / ROW_HEIGHT);
+        setVirtualScrollRow((current) =>
+          Math.abs(current - nextRow) >= ROW_WINDOW_STEP ? nextRow : current,
+        );
+      });
+    }
     const nearBottom = el.scrollTop + el.clientHeight > el.scrollHeight - 400;
     if (nearBottom) {
-      // grow the client-side render window
-      if (limit < list.length) setLimit((l) => Math.min(l + 60, list.length));
-      // and fetch the next server page if we've rendered most of what's loaded
-      if (!isAppBrowsing && limit + 60 >= list.length && listLoaded < listTotal && !listLoadingMore) {
+      if (!isAppBrowsing && listLoaded < listTotal && !listLoadingMore) {
         isPlaylistMode ? onBrowseMore() : onLoadMore();
       }
     }
   };
 
-  const visible = list.slice(0, limit);
+  const virtualRange = getVirtualListRange(
+    list.length,
+    virtualScrollRow * ROW_HEIGHT,
+    virtualViewportHeight,
+    ROW_HEIGHT,
+    ROW_OVERSCAN,
+  );
+  const virtualStart = virtualRange.start;
+  const virtualEnd = virtualRange.end;
+  const visible = list.slice(virtualStart, virtualEnd);
+  const virtualTopHeight = virtualRange.topHeight;
+  const virtualBottomHeight = virtualRange.bottomHeight;
   const sourceCounts = useMemo(() => {
     const c = { all: playlists.length, netease: 0, qq: 0, kugou: 0 };
     for (const p of playlists) {
@@ -2169,12 +2278,12 @@ const CollectionDrawer = memo(function CollectionDrawer({
           animate={{ x: 0, opacity: 1, scale: 1 }}
           exit={{ x: 22, opacity: 0, scale: 0.99 }}
           transition={{ type: "spring", stiffness: 300, damping: 30, mass: 0.72 }}
-          style={{ transform: "translateZ(0)", contain: "layout paint" }}
+          style={{ contain: "layout paint" }}
           className={`context-panel player-liquid-glass settings-player-page absolute z-50 flex flex-col text-white overflow-hidden ${
             isPlaylistMode
               ? "context-panel--tab-page"
               : "context-panel--queue"
-          } ${panelScrolling ? "context-panel--scrolling" : ""}`}
+          }`}
         >
             <header
               data-tauri-drag-region
@@ -2537,7 +2646,12 @@ const CollectionDrawer = memo(function CollectionDrawer({
               ref={scrollRef}
               onScroll={onScroll}
               className="context-panel-layer player-liquid-content flex-1 overflow-y-auto px-3 py-3 no-drag"
-              style={{ transform: "translateZ(0)", contain: "layout paint", overscrollBehavior: "contain", ["--context-layer" as string]: 2 }}
+              style={{
+                contain: "strict",
+                overscrollBehavior: "contain",
+                overflowAnchor: "none",
+                ["--context-layer" as string]: 2,
+              }}
             >
               {list.length === 0 && (
                 <p className="px-5 py-10 text-center text-sm text-white/35">
@@ -2552,7 +2666,9 @@ const CollectionDrawer = memo(function CollectionDrawer({
                     : "队列为空"}
                 </p>
               )}
-              {visible.map((s, i) => {
+              {virtualTopHeight > 0 && <div aria-hidden style={{ height: virtualTopHeight }} />}
+              {visible.map((s, visibleIndex) => {
+                const i = virtualStart + visibleIndex;
                 const liveSong = queue[activeIndex];
                 const active = isBrowsing
                   ? !!liveSong && sameSong(liveSong, s)
@@ -2560,7 +2676,7 @@ const CollectionDrawer = memo(function CollectionDrawer({
                 const reorderable = isAppBrowsing || !isPlaylistMode;
                 return (
                   <div
-                    key={`${s.source ?? "netease"}-${s.qqMid ?? s.kgHash ?? s.id}-${i}`}
+                    key={getSongKey(s)}
                     draggable={reorderable}
                     onDragStart={(event) => {
                       if (!reorderable) return;
@@ -2576,11 +2692,9 @@ const CollectionDrawer = memo(function CollectionDrawer({
                       setDragIndex(null);
                     }}
                     onDragEnd={() => setDragIndex(null)}
-                    className={`intent-surface app-liquid-row list-enter w-full flex items-center gap-2 rounded-2xl px-2 py-2 text-left transition-colors ${
+                    className={`intent-surface app-liquid-row h-[58px] w-full flex items-center gap-2 rounded-2xl px-2 py-2 text-left transition-colors ${
                       active ? "is-active" : ""
-                    } ${dragIndex === i ? "opacity-45" : ""} ${listStagger ? "" : "motion-off"}`}
-                    style={{ ["--i" as string]: String(i % 24) }}
-                    data-shown={listStagger ? undefined : "1"}
+                    } ${dragIndex === i ? "opacity-45" : ""} motion-off`}
                   >
                     <span
                       className={`grid h-8 w-6 shrink-0 place-items-center ${
@@ -2600,14 +2714,10 @@ const CollectionDrawer = memo(function CollectionDrawer({
                       className="flex min-w-0 flex-1 items-center gap-3 rounded-xl text-left"
                     >
                       <span className="relative h-10 w-10 shrink-0 overflow-hidden rounded-md bg-white/5 ring-1 ring-white/10">
-                        {s.pic && (
-                          <img
-                            src={s.pic}
-                            alt=""
-                            loading="lazy"
-                            className="h-full w-full object-cover"
-                          />
-                        )}
+                        <CollectionSongCover
+                          src={s.pic}
+                          suspendLoading={suspendCoverLoading}
+                        />
                         {active && (
                           <span className="absolute inset-0 grid place-items-center bg-black/25">
                             <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
@@ -2654,6 +2764,7 @@ const CollectionDrawer = memo(function CollectionDrawer({
                   </div>
                 );
               })}
+              {virtualBottomHeight > 0 && <div aria-hidden style={{ height: virtualBottomHeight }} />}
               {showLoadMoreFooter && (
                 <div className="py-4 text-center text-xs text-white/30">
                   {listLoadingMore
@@ -2677,7 +2788,7 @@ const CollectionDrawer = memo(function CollectionDrawer({
  * - double-click (or Enter) the centered cover to open that playlist
  * - follows the currently active playlist when it changes
  */
-function PlaylistCoverFlow({
+const PlaylistCoverFlow = memo(function PlaylistCoverFlow({
   playlists,
   loading,
   activePlaylistId,
@@ -2907,6 +3018,8 @@ function PlaylistCoverFlow({
 
   const CARD = compact ? 108 : 168; // cover width/height
   const gap = compact ? 72 : 96;    // horizontal offset per step from center
+  const coverRange = getCoverFlowRange(playlists.length, focus);
+  const visiblePlaylists = playlists.slice(coverRange.start, coverRange.end);
 
   if (playlists.length === 0) {
     return (
@@ -2937,7 +3050,8 @@ function PlaylistCoverFlow({
       style={{ perspective: "1300px", perspectiveOrigin: "50% 44%" }}
     >
       <div className="absolute inset-0" style={{ transformStyle: "preserve-3d" }}>
-        {playlists.map((playlist, i) => {
+        {visiblePlaylists.map((playlist, visibleIndex) => {
+          const i = coverRange.start + visibleIndex;
           const offset = i - focus;
           const absOff = Math.abs(offset);
           const rotateY = offset === 0 ? 0 : offset > 0 ? -56 : 56;
@@ -2963,7 +3077,6 @@ function PlaylistCoverFlow({
                 zIndex: 200 - absOff,
                 opacity,
                 transition: "transform 0.5s cubic-bezier(0.22,0.61,0.36,1), opacity 0.5s ease",
-                willChange: "transform, opacity",
               }}
               title={`${playlist.name} — ${playlist.trackCount} 首`}
             >
@@ -2979,7 +3092,9 @@ function PlaylistCoverFlow({
                     src={playlist.coverImgUrl}
                     alt={playlist.name}
                     draggable={false}
-                    loading="lazy"
+                    loading="eager"
+                    decoding="async"
+                    referrerPolicy="no-referrer"
                     className="absolute inset-0 h-full w-full object-cover transition-opacity group-hover:opacity-95"
                   />
                 ) : (
@@ -3059,7 +3174,7 @@ function PlaylistCoverFlow({
       )}
     </div>
   );
-}
+});
 
 /** Live multi-source search overlay (NetEase / QQ / Kugou). */
 function SearchOverlay({
@@ -3067,13 +3182,11 @@ function SearchOverlay({
   onClose,
   onPick,
   onOpenSongActions,
-  motionLevel = "light",
 }: {
   open: boolean;
   onClose: () => void;
   onPick: (s: Song) => void | Promise<void>;
   onOpenSongActions: (song: Song) => void;
-  motionLevel?: MotionLevel;
 }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState<Song[]>([]);
@@ -3081,9 +3194,7 @@ function SearchOverlay({
   const [err, setErr] = useState<string | null>(null);
   const [source, setSource] = useState<MusicSource>(loadMusicSource);
   const resultsRef = useRef<HTMLDivElement>(null);
-  useScrollEdgeFriction(resultsRef, open);
-  const listStagger = motionAllowsListStagger(motionLevel);
-  useListEnter(resultsRef, open && listStagger, [results.length, open, source]);
+  const searchGenerationRef = useRef(0);
 
   useEffect(() => {
     if (!open) return;
@@ -3104,22 +3215,25 @@ function SearchOverlay({
     }
     setLoading(true);
     setErr(null);
+    const searchGeneration = ++searchGenerationRef.current;
     const ctrl = new AbortController();
     const t = setTimeout(async () => {
       try {
         const r = await searchMusic(kw, source, 40, ctrl.signal);
+        if (searchGeneration !== searchGenerationRef.current) return;
         setResults(r);
         if (r.length === 0) setErr("没有找到相关歌曲");
       } catch (e: any) {
-        if (e?.name !== "AbortError")
+        if (searchGeneration === searchGenerationRef.current && e?.name !== "AbortError")
           setErr(e?.message ? `搜索失败：${e.message}` : "搜索失败，请稍后重试");
       } finally {
-        setLoading(false);
+        if (searchGeneration === searchGenerationRef.current) setLoading(false);
       }
     }, 380);
     return () => {
       clearTimeout(t);
       ctrl.abort();
+      searchGenerationRef.current += 1;
     };
   }, [q, open, source]);
 
@@ -3197,14 +3311,10 @@ function SearchOverlay({
                   选择音源后输入关键词搜索（QQ / 酷狗需桌面端）
                 </p>
               )}
-              {results.map((s, i) => (
+              {results.map((s) => (
                 <div
-                  key={`${s.source ?? "netease"}-${s.id}-${s.qqMid ?? s.kgHash ?? i}`}
-                  className={`intent-surface app-liquid-row list-enter mx-2 my-1 flex w-auto items-center gap-3 rounded-2xl px-3 py-2.5 text-left transition-colors ${
-                    listStagger ? "" : "motion-off"
-                  }`}
-                  style={{ ["--i" as string]: String(i % 24) }}
-                  data-shown={listStagger ? undefined : "1"}
+                  key={getSongKey(s)}
+                  className="intent-surface app-liquid-row mx-2 my-1 flex w-auto items-center gap-3 rounded-2xl px-3 py-2.5 text-left transition-colors motion-off"
                 >
                   <button
                     type="button"

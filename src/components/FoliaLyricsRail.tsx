@@ -5,11 +5,19 @@
  * Word/grapheme timings are synthesized from LRC when true yrc is unavailable
  * (same even-split fallback Folia uses when words are missing).
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { AnimatePresence, animate, motion, useMotionValue, useTransform } from "motion/react";
 import type { LyricsLine, LyricMotionStyle } from "./playerTypes";
 import { buildDisplayTokens, type GraphemeTiming } from "../lib/lyricTiming";
 import { colorWithAlpha, mixColors } from "./folia/colorMix";
+import { usePlayerStore } from "../store/playerStore";
 import {
   MONET_GLOW_PASS_TAIL_SECONDS,
   MONET_GLOW_RISE_DURATION_SCALE,
@@ -30,13 +38,14 @@ import {
   resolveMonetWordStatus,
   toTimedLines,
   type LineStatus,
+  type MonetDomLineMeasurement,
   type PositionedMonetLineEntry,
 } from "./folia/monetModel";
 
 export interface FoliaLyricsRailProps {
   style: LyricMotionStyle;
   lines: LyricsLine[];
-  currentTime: number;
+  timeOffsetSeconds: number;
   activeIndex: number;
   anchorIndex: number;
   showTranslation: boolean;
@@ -44,6 +53,7 @@ export interface FoliaLyricsRailProps {
   onSeek: (time: number) => void;
   manualAnchor: number | null;
   onManualStep: (nextIndex: number) => void;
+  onManualActivity: () => void;
   onResumeAuto: () => void;
 }
 
@@ -366,11 +376,11 @@ function MonetRailLine({
   translationFontPx,
   fontStack,
   glowBufferPx,
-  vGlowBufferPx,
   showTranslation,
   styleName,
   disableEntryMotion,
   renderStaticPassed,
+  onMeasured,
   onSeek,
 }: {
   entry: PositionedMonetLineEntry;
@@ -379,13 +389,15 @@ function MonetRailLine({
   translationFontPx: number;
   fontStack: string;
   glowBufferPx: number;
-  vGlowBufferPx: number;
   showTranslation: boolean;
   styleName: LyricMotionStyle;
   disableEntryMotion: boolean;
   renderStaticPassed: boolean;
+  onMeasured: (key: string, measurement: MonetDomLineMeasurement) => void;
   onSeek: (t: number) => void;
 }) {
+  const textRef = useRef<HTMLDivElement>(null);
+  const translationRef = useRef<HTMLDivElement>(null);
   const initialOffset = entry.offset >= 0 ? 34 : -34;
   const exitOffset = entry.status === "passed" || entry.offset < 0 ? -38 : 38;
   const isActive = entry.status === "active";
@@ -394,10 +406,37 @@ function MonetRailLine({
   const enterBlur = styleName === "classic" && isActive ? 10 : 5;
   const exitBlur = styleName === "classic" ? 12 : 6;
 
+  useLayoutEffect(() => {
+    const measure = () => {
+      const textNode = textRef.current;
+      if (!textNode) return;
+      onMeasured(entry.key, {
+        textHeightPx: textNode.offsetHeight,
+        translationHeightPx: translationRef.current?.offsetHeight ?? 0,
+      });
+    };
+
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    if (textRef.current) observer.observe(textRef.current);
+    if (translationRef.current) observer.observe(translationRef.current);
+    return () => observer.disconnect();
+  }, [
+    entry.key,
+    entry.line.fullText,
+    entry.line.translation,
+    entry.tone.fontWeight,
+    lyricFontPx,
+    translationFontPx,
+    showTranslation,
+    onMeasured,
+  ]);
+
   return (
     <motion.button
       type="button"
-      className="absolute top-0 min-w-0 cursor-pointer select-none text-left will-change-transform"
+      className="absolute top-0 min-w-0 cursor-pointer select-none text-left"
       initial={
         disableEntryMotion
           ? false
@@ -460,65 +499,68 @@ function MonetRailLine({
         />
       )}
 
-      <div
-        className="min-w-0 overflow-hidden"
-        style={{
-          marginLeft: `-${glowBufferPx}px`,
-          marginRight: `-${glowBufferPx}px`,
-          paddingLeft: `${glowBufferPx}px`,
-          paddingRight: `${glowBufferPx}px`,
-          marginTop: `-${vGlowBufferPx}px`,
-          marginBottom: `-${vGlowBufferPx}px`,
-          paddingTop: `${entry.layout.textPaddingTopPx + vGlowBufferPx}px`,
-          paddingBottom: `${entry.layout.textPaddingBottomPx + vGlowBufferPx}px`,
-          height: `${entry.layout.textHeightPx + vGlowBufferPx * 2}px`,
-          boxSizing: "border-box",
-          fontFamily: fontStack,
-          fontSize: lyricFontPx,
-          fontWeight: entry.tone.fontWeight,
-          lineHeight: `${entry.layout.lineHeightPx}px`,
-          letterSpacing: 0,
-          textShadow:
-            entry.status === "active"
-              ? "0 14px 34px rgba(0,0,0,0.22)"
-              : "none",
-        }}
-      >
-        <MonetTimedLine
-          entry={entry}
-          timeMv={timeMv}
-          fontPx={lyricFontPx}
-          fontStack={fontStack}
-          renderStaticPassed={renderStaticPassed}
-          styleName={styleName}
-        />
-      </div>
-
-      {showTranslation && isActive && entry.line.translation ? (
-        <motion.div
-          className="min-w-0 overflow-hidden whitespace-pre-wrap break-words"
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+      <div className="flex min-w-0 w-full flex-col">
+        <div
+          ref={textRef}
+          className="min-w-0 overflow-visible"
           style={{
             marginLeft: `-${glowBufferPx}px`,
             marginRight: `-${glowBufferPx}px`,
             paddingLeft: `${glowBufferPx}px`,
             paddingRight: `${glowBufferPx}px`,
-            height: entry.layout.translationHeightPx,
-            paddingTop: entry.layout.translationPaddingTopPx,
-            paddingBottom: entry.layout.translationPaddingBottomPx,
+            paddingTop: entry.layout.textPaddingTopPx,
+            paddingBottom: entry.layout.textPaddingBottomPx,
             boxSizing: "border-box",
-            color: "rgba(255,255,255,0.55)",
             fontFamily: fontStack,
-            fontSize: translationFontPx,
-            fontWeight: 500,
-            lineHeight: `${entry.layout.translationLineHeightPx}px`,
+            fontSize: lyricFontPx,
+            fontWeight: entry.tone.fontWeight,
+            lineHeight: `${entry.layout.lineHeightPx}px`,
+            letterSpacing: 0,
+            textShadow:
+              entry.status === "active"
+                ? "0 14px 34px rgba(0,0,0,0.22)"
+                : "none",
           }}
         >
-          {entry.line.translation}
-        </motion.div>
-      ) : null}
+          <MonetTimedLine
+            entry={entry}
+            timeMv={timeMv}
+            fontPx={lyricFontPx}
+            fontStack={fontStack}
+            renderStaticPassed={renderStaticPassed}
+            styleName={styleName}
+          />
+        </div>
+
+        {showTranslation && entry.line.translation ? (
+          <motion.div
+            ref={translationRef}
+            className="min-w-0 overflow-visible whitespace-pre-wrap break-words"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+            style={{
+              marginLeft: `-${glowBufferPx}px`,
+              marginRight: `-${glowBufferPx}px`,
+              paddingLeft: `${glowBufferPx}px`,
+              paddingRight: `${glowBufferPx}px`,
+              paddingTop: entry.layout.translationPaddingTopPx,
+              paddingBottom: entry.layout.translationPaddingBottomPx,
+              boxSizing: "border-box",
+              color:
+                entry.status === "active"
+                  ? "rgba(255,255,255,0.58)"
+                  : "rgba(255,255,255,0.42)",
+              fontFamily: fontStack,
+              fontSize: translationFontPx,
+              fontWeight: 500,
+              lineHeight: `${entry.layout.translationLineHeightPx}px`,
+            }}
+          >
+            {entry.line.translation}
+          </motion.div>
+        ) : null}
+      </div>
     </motion.button>
   );
 }
@@ -528,7 +570,7 @@ function MonetRailLine({
 export default function FoliaLyricsRail({
   style,
   lines,
-  currentTime,
+  timeOffsetSeconds,
   activeIndex,
   anchorIndex,
   showTranslation,
@@ -536,10 +578,14 @@ export default function FoliaLyricsRail({
   onSeek,
   manualAnchor,
   onManualStep,
+  onManualActivity,
   onResumeAuto,
 }: FoliaLyricsRailProps) {
   const railRef = useRef<HTMLDivElement>(null);
   const [railSize, setRailSize] = useState({ width: 0, height: 0 });
+  const [domMeasurements, setDomMeasurements] = useState<
+    Map<string, MonetDomLineMeasurement>
+  >(() => new Map());
   const wheelAccRef = useRef(0);
   const wheelDirRef = useRef(0);
   const touchLastYRef = useRef<number | null>(null);
@@ -547,12 +593,18 @@ export default function FoliaLyricsRail({
   const touchDirRef = useRef(0);
   const idleTimerRef = useRef<number | null>(null);
 
-  const timeMv = useMotionValue(currentTime);
+  const timeMv = useMotionValue(
+    Math.max(0, usePlayerStore.getState().currentTime + timeOffsetSeconds),
+  );
   const edgeY = useMotionValue(0);
   const edgeAnimationRef = useRef<ReturnType<typeof animate> | null>(null);
   useEffect(() => {
-    timeMv.set(currentTime);
-  }, [currentTime, timeMv]);
+    const update = (currentTime: number) => {
+      timeMv.set(Math.max(0, currentTime + timeOffsetSeconds));
+    };
+    update(usePlayerStore.getState().currentTime);
+    return usePlayerStore.subscribe((state) => update(state.currentTime));
+  }, [timeOffsetSeconds, timeMv]);
 
   const styleName: LyricMotionStyle =
     style === "fume" || style === "classic" || style === "monet"
@@ -564,7 +616,6 @@ export default function FoliaLyricsRail({
   const inactiveFontPx = resolveClampFontPx(1.08, 2, 1.48) * fontScale;
   const translationFontPx = resolveClampFontPx(0.94, 1.28, 1.14) * fontScale;
   const glowBufferPx = Math.round(lyricFontPx * 1.2);
-  const vGlowBufferPx = Math.round(lyricFontPx * 1.2);
 
   useEffect(() => {
     const node = railRef.current;
@@ -605,6 +656,27 @@ export default function FoliaLyricsRail({
     [timedLines, lines, focusIndex, activeIndex, isManualScrolling]
   );
 
+  const handleLineMeasured = useCallback(
+    (key: string, measurement: MonetDomLineMeasurement) => {
+      setDomMeasurements((current) => {
+        const previous = current.get(key);
+        if (
+          previous &&
+          Math.abs(previous.textHeightPx - measurement.textHeightPx) < 0.5 &&
+          Math.abs(
+            previous.translationHeightPx - measurement.translationHeightPx,
+          ) < 0.5
+        ) {
+          return current;
+        }
+        const next = new Map(current);
+        next.set(key, measurement);
+        return next;
+      });
+    },
+    [],
+  );
+
   const positioned = useMemo(
     () =>
       buildPositionedEntries(
@@ -617,7 +689,8 @@ export default function FoliaLyricsRail({
         translationFontPx,
         FONT_STACK,
         glowBufferPx,
-        showTranslation
+        showTranslation,
+        domMeasurements
       ),
     [
       visibleEntries,
@@ -628,6 +701,7 @@ export default function FoliaLyricsRail({
       translationFontPx,
       glowBufferPx,
       showTranslation,
+      domMeasurements,
     ]
   );
 
@@ -639,6 +713,7 @@ export default function FoliaLyricsRail({
   };
 
   const bumpIdle = useCallback(() => {
+    onManualActivity();
     clearIdle();
     idleTimerRef.current = window.setTimeout(() => {
       idleTimerRef.current = null;
@@ -647,7 +722,7 @@ export default function FoliaLyricsRail({
       touchAccRef.current = 0;
       touchDirRef.current = 0;
     }, MONET_SCROLL_IDLE_RESET_MS);
-  }, []);
+  }, [onManualActivity]);
 
   useEffect(() => () => clearIdle(), []);
 
@@ -816,13 +891,13 @@ export default function FoliaLyricsRail({
             translationFontPx={translationFontPx}
             fontStack={FONT_STACK}
             glowBufferPx={glowBufferPx}
-            vGlowBufferPx={vGlowBufferPx}
             showTranslation={showTranslation}
             styleName={styleName}
             disableEntryMotion={isManualScrolling}
             renderStaticPassed={
               isManualScrolling && entry.index !== activeIndex
             }
+            onMeasured={handleLineMeasured}
             onSeek={handleSeek}
           />
         ))}

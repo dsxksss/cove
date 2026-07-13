@@ -1,8 +1,8 @@
 import { create } from "zustand";
 import type { LyricLine, RepeatMode, Song } from "../lib/types";
 import { getAudio, saveVolume } from "../lib/audio";
-import { getFavPlaylistId, getPlaylistPage, getSongJson } from "../lib/api";
-import { resolvePlayback, sameSong } from "../lib/musicSources";
+import { getFavPlaylistId, getPlaylistPage, getSongMetadata } from "../lib/api";
+import { resolvePlayback, resolvePlaybackUrl, sameSong } from "../lib/musicSources";
 import { mergeTranslation, parseLrc, parseTranslation } from "../lib/lyric";
 import { extractAccent } from "../lib/color";
 import type { AccentColor } from "../lib/types";
@@ -25,10 +25,15 @@ import {
   resolveExternalLyrics,
   type LyricSourceMode,
 } from "../lib/lyrics/matchLyrics";
+import { LatestRequestGate } from "../lib/requestGate";
 
 /** Page size for favorites playlist pagination (server-side). */
 const FAV_PAGE_SIZE = 100;
 const SHUFFLE_TRAIL_LIMIT = 200;
+const playbackGate = new LatestRequestGate();
+const playlistLoadGate = new LatestRequestGate();
+const browseGate = new LatestRequestGate();
+const browseMoreGate = new LatestRequestGate();
 
 /** User-facing message when a track has no playable stream (VIP / rights / region). */
 function playRestrictionMessage(song: Song, resolvedName?: string): string {
@@ -95,7 +100,7 @@ async function warmNextTrack(): Promise<void> {
   const nextSong = queue[nextIndex];
   if (!nextSong) return;
   try {
-    const { url } = await resolvePlayback(nextSong, level);
+    const url = await resolvePlaybackUrl(nextSong, level);
     if (url) {
       clearPreload(); // keep only the latest next candidate
       preloadAudioUrl(url);
@@ -261,6 +266,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   },
 
   clearQueue: () => {
+    playbackGate.cancel();
+    playlistLoadGate.cancel();
     const audio = getAudio();
     audio.pause();
     audio.removeAttribute("src");
@@ -409,6 +416,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   },
 
   playSong: async (song, queue, options) => {
+    const requestToken = playbackGate.next();
     const state = get();
     const queueProvided = queue !== undefined;
     let q = queueProvided ? queue.slice() : state.queue.slice();
@@ -442,9 +450,11 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       ...shuffleTrail,
     });
     const audio = getAudio();
+    audio.pause();
     try {
       // Multi-source resolve: NetEase / QQ / Kugou streaming + metadata.
       const { url, meta } = await resolvePlayback(song, state.level);
+      if (!playbackGate.isCurrent(requestToken)) return;
       // Prefer playlist/search pic when present — API often returns a different
       // CDN size/path for the same cover and causes a second visual change.
       let pic = song.pic || meta.pic;
@@ -465,7 +475,9 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
         // Give the user a moment to read the toast, then skip to next.
         // forceAdvance: don't re-loop the same VIP/broken track in single-loop mode.
         setTimeout(() => {
-          if (get().error === msg) void get().next(true, { forceAdvance: true });
+          if (playbackGate.isCurrent(requestToken) && get().error === msg) {
+            void get().next(true, { forceAdvance: true });
+          }
         }, 3200);
         return;
       }
@@ -493,10 +505,12 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       try {
         await audio.play();
       } catch {
+        if (!playbackGate.isCurrent(requestToken)) return;
         // MediaElementError is surfaced via the 'error' event → useAudioEngine.
         // Autoplay block (no media error) just pauses UI.
         set({ loading: false, isPlaying: false });
       }
+      if (!playbackGate.isCurrent(requestToken)) return;
 
       const audioDur =
         Number.isFinite(audio.duration) && audio.duration > 0 && audio.duration < Infinity
@@ -552,6 +566,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
               durationMs: toDurationMs(song.duration) || Math.round(resolvedDuration * 1000),
               mode: extMode,
             });
+            if (!playbackGate.isCurrent(requestToken)) return;
             // Drop if user already skipped ahead.
             const cur = get().currentSong();
             if (!cur || !sameSong(cur, playToken)) return;
@@ -569,16 +584,29 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       if (coverNext && coverNext !== coverNow) {
         extractAccent(coverNext).then((c) => {
           // Drop stale accent work if user already skipped ahead.
-          if (c && sameSong(get().currentSong() ?? song, song)) set({ accent: c });
+          if (
+            c &&
+            playbackGate.isCurrent(requestToken) &&
+            sameSong(get().currentSong() ?? song, song)
+          ) {
+            set({ accent: c });
+          }
         });
       } else if (coverNext && !get().accent) {
         extractAccent(coverNext).then((c) => {
-          if (c && sameSong(get().currentSong() ?? song, song)) set({ accent: c });
+          if (
+            c &&
+            playbackGate.isCurrent(requestToken) &&
+            sameSong(get().currentSong() ?? song, song)
+          ) {
+            set({ accent: c });
+          }
         });
       }
 
       void warmNextTrack();
     } catch (e: unknown) {
+      if (!playbackGate.isCurrent(requestToken)) return;
       const msg = formatPlayError(e, song);
       set({ loading: false, isPlaying: false, error: msg });
       setTimeout(() => {
@@ -594,10 +622,12 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   },
 
   loadPlaylist: async (pid, source = "playlist") => {
+    const requestToken = playlistLoadGate.next();
     try {
       // Paginated: fetch only the first page (100 tracks) for a fast initial
       // load. More pages load on demand when the queue drawer scrolls near the bottom.
       const page = await getPlaylistPage(pid, FAV_PAGE_SIZE, 0);
+      if (!playlistLoadGate.isCurrent(requestToken)) return;
       if (page.songs.length === 0) {
         set({ error: "歌单为空或读取失败，请稍后重试" });
         return;
@@ -624,7 +654,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       // Pre-fetch first track metadata (cover + lyrics) — don't play.
       const first = page.songs[0];
       try {
-        const json = await getSongJson(first.id);
+        const json = await getSongMetadata(first.id);
+        if (!playlistLoadGate.isCurrent(requestToken)) return;
         if (!json) return;
         const pic = first.pic ?? json.pic;
         const rawLrc = json.lyric ?? "";
@@ -700,15 +731,9 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       shuffleHistory: [],
       shuffleFuture: [],
     });
-    // clear any active browse list (we've just committed it as the live queue)
-    set({
-      browseList: [],
-      browsePlaylistId: null,
-      browseSource: null,
-      browseTotal: 0,
-      browseLoaded: 0,
-      browseLoadingMore: false,
-    });
+    // Keep browseList/browsePlaylistId intact. Playback and browsing are
+    // independent contexts: choosing a track must not close the playlist page
+    // or discard its pagination/scroll state.
     // If the playlist has more pages than we loaded, fetch the rest in the
     // background so shuffle/next cover the full playlist.
     if (realTotal > q.length) {
@@ -727,6 +752,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     ) {
       return;
     }
+    const requestToken = browseGate.next();
+    browseMoreGate.cancel();
     // Clear first so the UI doesn't keep showing the previous platform's tracks.
     set({
       browseList: [],
@@ -739,6 +766,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     });
     try {
       const page = await getPlaylistPage(pid, FAV_PAGE_SIZE, 0);
+      if (!browseGate.isCurrent(requestToken)) return;
       // NOTE: deliberately does NOT touch index / isPlaying / currentTime /
       // currentCover / lyrics — playback keeps running undisturbed.
       set({
@@ -752,6 +780,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
           page.songs.length === 0 ? "歌单为空或读取失败，请稍后重试" : null,
       });
     } catch (e: unknown) {
+      if (!browseGate.isCurrent(requestToken)) return;
       const msg = e instanceof Error ? e.message : "加载歌单失败";
       set({
         browseList: [],
@@ -766,23 +795,32 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   },
 
   browseMore: async () => {
-    const { browsePlaylistId, browseList, browseLoadingMore, browseLoaded, browseTotal } = get();
+    const { browsePlaylistId, browseSource, browseLoadingMore, browseLoaded, browseTotal } = get();
     if (browsePlaylistId == null || browseLoadingMore) return;
     if (browseLoaded >= browseTotal) return;
+    const requestToken = browseMoreGate.next();
     set({ browseLoadingMore: true });
     try {
       const page = await getPlaylistPage(browsePlaylistId, FAV_PAGE_SIZE, browseLoaded);
+      const latest = get();
+      if (
+        !browseMoreGate.isCurrent(requestToken) ||
+        latest.browsePlaylistId !== browsePlaylistId ||
+        latest.browseSource !== browseSource
+      ) return;
       set({
-        browseList: [...browseList, ...page.songs],
-        browseLoaded: browseLoaded + page.songs.length,
+        browseList: [...latest.browseList, ...page.songs],
+        browseLoaded: latest.browseLoaded + page.songs.length,
         browseLoadingMore: false,
       });
     } catch {
-      set({ browseLoadingMore: false });
+      if (browseMoreGate.isCurrent(requestToken)) set({ browseLoadingMore: false });
     }
   },
 
   clearBrowse: () => {
+    browseGate.cancel();
+    browseMoreGate.cancel();
     set({
       browseList: [],
       browsePlaylistId: null,
