@@ -20,6 +20,23 @@ import time
 from pathlib import Path
 
 
+def nvidia_gpu_available() -> bool:
+    candidates = [shutil.which("nvidia-smi")]
+    if os.name == "nt":
+        candidates.extend([
+            str(Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "nvidia-smi.exe"),
+            str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"),
+        ])
+    for candidate in dict.fromkeys(value for value in candidates if value):
+        try:
+            probe = subprocess.run([candidate, "-L"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8)
+            if probe.returncode == 0 and "GPU" in probe.stdout:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
 def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):

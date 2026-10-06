@@ -55,6 +55,27 @@ def available_memory_bytes() -> int | None:
     return None
 
 
+def nvidia_gpu_available() -> bool:
+    """Check the installed driver, not just whether bundled Torch has CUDA."""
+    candidates = []
+    located = shutil.which("nvidia-smi")
+    if located:
+        candidates.append(located)
+    if os.name == "nt":
+        candidates.extend([
+            str(Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "nvidia-smi.exe"),
+            str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"),
+        ])
+    for candidate in dict.fromkeys(candidates):
+        try:
+            probe = subprocess.run([candidate, "-L"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8)
+            if probe.returncode == 0 and "GPU" in probe.stdout:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
 class SeparationProgress:
     """Read actual chunk/inference progress from the bundled separator's log."""
 
@@ -133,7 +154,7 @@ def main() -> int:
     parser.add_argument("--model", default="")
     # CPU is the portable default. Bundled CUDA/PyTorch can report a CUDA
     # build even when the target machine has no usable NVIDIA device.
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--chunk-duration", type=float, default=DEFAULT_CHUNK_DURATION)
     parser.add_argument("--timeout-minutes", type=float, default=DEFAULT_TIMEOUT_MINUTES)
     parser.add_argument("--memory-floor-mib", type=int, default=DEFAULT_MEMORY_FLOOR_MIB)
@@ -189,7 +210,8 @@ def main() -> int:
         for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "TORCH_NUM_THREADS"):
             environment[name] = "2"
         environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        if args.device != "cuda":
+        use_cuda = args.device == "cuda" or (args.device == "auto" and nvidia_gpu_available())
+        if not use_cuda:
             # `-1` is required on Windows; an empty value can still leave the
             # CUDA runtime visible to some PyTorch builds.
             environment["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -198,11 +220,11 @@ def main() -> int:
         environment["PYTHONUNBUFFERED"] = "1"
         environment["COVE_NCM2ACC_CHUNK_DURATION"] = str(max(10.0, args.chunk_duration))
         environment["COVE_NCM2ACC_THREADS"] = "2"
-        environment["COVE_NCM2ACC_USE_AUTOCAST"] = "1" if args.device == "cuda" else "0"
+        environment["COVE_NCM2ACC_USE_AUTOCAST"] = "1" if use_cuda else "0"
         # Model loading and CPU separation can take several minutes.  Do not
         # leave the UI at the initial 8% while waiting for a subprocess that
         # intentionally produces no stdout until it finishes.
-        emit("separate", 0.16, message="正在加载模型，首次运行可能需要几分钟…", indeterminate=True, elapsedSec=0)
+        emit("separate", 0.16, message=f"正在加载模型（{'NVIDIA GPU' if use_cuda else 'CPU'}），首次运行可能需要几分钟…", indeterminate=True, elapsedSec=0)
         # Keep diagnostic logs after the temporary audio has been cleaned up.
         log_path = args.output / "separator.log"
         with log_path.open("w", encoding="utf-8", errors="replace") as log:

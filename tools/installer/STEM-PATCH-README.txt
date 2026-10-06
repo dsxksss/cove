@@ -3,8 +3,11 @@ Cove 伴奏转换编码补丁
 
 用途
 ----
-修复部分电脑上转换时出现“伴奏运行包退出码 120”、GBK 乱码或
-“OSError: [Errno 22] Invalid argument”的问题。
+修复部分电脑上转换时出现“伴奏运行包退出码 120”、GBK 乱码、
+“OSError: [Errno 22] Invalid argument”以及有 NVIDIA 显卡却一直使用 CPU 的问题。
+
+补丁会自动检测 nvidia-smi。检测到可用 NVIDIA GPU 时使用 GPU；没有可用
+GPU 时回退到 CPU 安全模式。
 
 使用方法
 --------
