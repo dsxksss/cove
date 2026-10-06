@@ -56,7 +56,7 @@ export function createTrackGraph(context: BaseAudioContext, destination: AudioNo
       dry.gain.value = 1 - e.reverb.mix; wet.gain.value = e.reverb.mix;
       if (decay !== e.reverb.decaySec) { reverb.buffer = impulse(context, e.reverb.decaySec); decay = e.reverb.decaySec; }
       echo.gain.value = e.delay.mix; delay.delayTime.value = e.delay.timeMs / 1000; feedback.gain.value = e.delay.feedback;
-      gain.gain.value = track.mixer.mute || (hasSolo && !track.mixer.solo) ? 0 : clamp(track.mixer.gain, 0, 2);
+      gain.gain.value = (hasSolo ? !track.mixer.solo : track.mixer.mute) ? 0 : clamp(track.mixer.gain, 0, 2);
       pan.pan.value = clamp(track.mixer.pan, -1, 1);
     },
     dispose() { nodes.forEach(node => node.disconnect()); },

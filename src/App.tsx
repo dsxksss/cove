@@ -819,7 +819,6 @@ export default function App() {
     const nextProject = createStudioProject({
       songId: String(projectSong.id),
       source: projectSong.source ?? "netease",
-      sourceUrl: projectSong === activeRaw ? getAudio().currentSrc || getAudio().src || undefined : undefined,
       title,
       artist,
       album: projectSong.album,
@@ -1059,6 +1058,7 @@ export default function App() {
       <div className="relative z-10 w-full h-full">
         {studioOpen && studioProject ? (
           <StudioWorkspace
+            key={studioProject.id}
             project={studioProject}
             onBack={() => setStudioOpen(false)}
             onPlayInPlayer={playStudioMixInPlayer}

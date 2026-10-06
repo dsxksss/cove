@@ -6,6 +6,7 @@ import { StudioAudioEngine } from "../lib/studioAudio";
 import { renderStudioMix } from "../lib/studioExport";
 import { StudioRecorder } from "../lib/studioRecorder";
 import { useStudioStore } from "../studio/studioStore";
+import { downloadStudioOriginal, resolveStudioSourceUrl } from "../studio/source";
 import type { StudioAsset, StudioEffects, StudioProject, StudioTrack } from "../studio/types";
 
 type Props = {
@@ -56,6 +57,13 @@ function lastAsset(assets: StudioAsset[]): StudioAsset | undefined {
   return assets.length > 0 ? assets[assets.length - 1] : undefined;
 }
 
+function TrackAudio({ track, attach }: { track: StudioTrack; attach: (id: string, element: HTMLAudioElement | null, startSec: number) => void }) {
+  const asset = lastAsset(track.assets);
+  const startSec = track.clips[track.clips.length - 1]?.startSec ?? 0;
+  const bind = useCallback((element: HTMLAudioElement | null) => attach(track.id, element, startSec), [attach, track.id, startSec]);
+  return asset ? <audio ref={bind} src={asset.url} preload="auto" /> : null;
+}
+
 function instrumentalCacheId(project: Pick<StudioProject, "source" | "songId">): string {
   return `${project.source}-${project.songId}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 110);
 }
@@ -93,7 +101,9 @@ function EffectPanel({ track, onChange }: { track: StudioTrack; onChange: (effec
 }
 
 export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Props) {
-  const currentProject = useStudioStore((state) => state.project) ?? project;
+  const sessionProjectIdRef = useRef(project.id);
+  const storedProject = useStudioStore((state) => state.project);
+  const currentProject = storedProject?.id === sessionProjectIdRef.current ? storedProject : project;
   const currentTime = useStudioStore((state) => state.currentTime);
   const isPlaying = useStudioStore((state) => state.isPlaying);
   const recordingTrackId = useStudioStore((state) => state.recordingTrackId);
@@ -144,6 +154,9 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [timelineDragging, setTimelineDragging] = useState(false);
   const [renamingProject, setRenamingProject] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState(project.title);
+  const mountedRef = useRef(false);
+  const stemJobRef = useRef<string | null>(null);
+  const isCurrentProject = (id: string) => mountedRef.current && useStudioStore.getState().project?.id === id;
 
   useEffect(() => {
     const dismiss = (event: PointerEvent) => {
@@ -161,9 +174,20 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     useStudioStore.getState().setProject(project);
-    engineRef.current = new StudioAudioEngine();
-    return () => engineRef.current?.dispose();
+    engineRef.current ??= new StudioAudioEngine();
+    return () => {
+      mountedRef.current = false;
+      countdownAbortRef.current = true;
+      recorderRef.current?.dispose();
+      if (stemJobRef.current) void invokeNative("studio_cancel_job", { jobId: stemJobRef.current }).catch(() => undefined);
+      // StrictMode replays effects with the same DOM elements. Keep their
+      // MediaElementSource/context association during that synchronous replay.
+      queueMicrotask(() => {
+        if (!mountedRef.current) engineRef.current?.dispose();
+      });
+    };
   }, [project]);
 
   const refreshDevices = useCallback(async () => {
@@ -186,12 +210,19 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, [currentProject.id]);
 
   const openSavedProject = async (id: string) => {
+    const previousId = currentProject.id;
     try {
       const loaded = await invokeNative<StudioProject>("studio_load_project", { projectId: id });
       for (const track of loaded.tracks) for (const asset of track.assets) {
         const encoded = await invokeNative<string>("studio_read_asset", { projectId: loaded.id, assetId: asset.id });
         asset.url = base64Url(encoded, asset.mimeType);
       }
+      if (!isCurrentProject(previousId)) return;
+      engineRef.current?.pause();
+      if (stemJobRef.current) void invokeNative("studio_cancel_job", { jobId: stemJobRef.current }).catch(() => undefined);
+      stemJobRef.current = null;
+      setJobId(null);
+      sessionProjectIdRef.current = loaded.id;
       persistedProjectIdsRef.current.add(loaded.id);
       setProject(loaded); setSelectedTrackId("instrumental"); setProjectMenuOpen(false); setNcmStatus("已打开本地工程");
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "无法打开工程"); }
@@ -209,7 +240,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const micLabel = inputDeviceId === "default" ? "默认麦克风" : selectedMic?.label || `麦克风 ${inputDeviceId.slice(0, 5)}`;
 
   const attachAudio = useCallback((id: string, element: HTMLAudioElement | null, startSec = 0) => {
-    if (!element) return;
+    if (!element) {
+      audioRefs.current.delete(id);
+      audioStartRefs.current.delete(id);
+      engineRef.current?.detach(id);
+      return;
+    }
     audioRefs.current.set(id, element);
     audioStartRefs.current.set(id, startSec);
     engineRef.current?.attach(id, element, startSec);
@@ -235,7 +271,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   useEffect(() => {
     if (!isPlaying) return;
     const timer = window.setInterval(() => {
-      const clock = audioRefs.current.get("instrumental")?.currentTime ?? currentTime;
+      const clock = engineRef.current?.currentTime ?? currentTime;
       setCurrentTime(clock);
       if (clock >= currentProject.durationSec && currentProject.durationSec > 0) { engineRef.current?.pause(); setPlaying(false); }
     }, 50);
@@ -314,18 +350,30 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   const togglePlayback = async () => {
     if (isPlaying) { engineRef.current?.pause(); setPlaying(false); return; }
-    engineRef.current?.seek(currentTime);
-    await engineRef.current?.play(currentTime);
-    setPlaying(true);
+    try {
+      await engineRef.current?.play(currentTime);
+      setPlaying(true);
+    } catch (error) { setPlaying(false); setNcmStatus(error instanceof Error ? error.message : "音频播放失败"); }
   };
 
   const importAudio = async (file: File, trackId = "instrumental", startSec = 0) => {
+    const projectId = currentProject.id;
     const probe = document.createElement("audio");
-    probe.src = URL.createObjectURL(file);
-    await new Promise<void>((resolve) => { probe.onloadedmetadata = () => resolve(); probe.onerror = () => resolve(); });
-    const durationSec = Number.isFinite(probe.duration) ? probe.duration : currentProject.durationSec;
+    const probeUrl = URL.createObjectURL(file);
+    let durationSec: number;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        probe.onloadedmetadata = () => resolve();
+        probe.onerror = () => reject(new Error("音频格式不受支持或文件已损坏"));
+        probe.src = probeUrl;
+      });
+      durationSec = Number.isFinite(probe.duration) ? probe.duration : currentProject.durationSec;
+    } finally { probe.removeAttribute("src"); probe.load(); URL.revokeObjectURL(probeUrl); }
+    if (!isCurrentProject(projectId)) return;
     const asset = assetFromFile(file, durationSec);
-    const targetTrack = currentProject.tracks.find((track) => track.id === trackId);
+    const targetTrack = useStudioStore.getState().project?.tracks.find((track) => track.id === trackId);
+    engineRef.current?.pause();
+    setPlaying(false);
     if (trackId === "instrumental" || targetTrack?.kind === "reference" || trackId.startsWith("reference-")) replaceAssetOnTrack(trackId, asset, startSec);
     else addAssetToTrack(trackId, asset, undefined, startSec);
     void readFileAsBase64(file).then((inputBase64) => invokeNative("studio_write_asset", { projectId: currentProject.id, assetId: asset.id, inputBase64 })).catch(() => undefined);
@@ -339,7 +387,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     try {
       await importAudio(file, trackId);
       setSelectedTrackId(trackId);
-      setNcmStatus("原曲已导入参考音轨（默认静音）");
+      if (isCurrentProject(currentProject.id)) setNcmStatus("原曲已导入，点击原曲轨的 S 独奏试听，或关闭 M 与伴奏一起播放");
     } catch (error) {
       setNcmStatus(error instanceof Error ? error.message : "导入原曲失败");
     }
@@ -352,23 +400,17 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       setNcmStatus("当前平台暂不支持自动下载原曲，请选择本地原曲文件");
       return;
     }
+    const projectId = currentProject.id;
     setNcmStatus("正在下载当前歌曲原曲…");
     try {
-      let sourceUrl = currentProject.sourceUrl;
-      if (!sourceUrl || !sourceUrl.startsWith("https://")) {
-        const result = await invokeNative<{ data?: { url?: string | null } }>("netease_song_url", { args: { id: Number(currentProject.songId), level: "exhigh" } });
-        sourceUrl = result.data?.url ?? undefined;
-      }
-      if (!sourceUrl) throw new Error("当前歌曲没有可用的原曲下载地址");
-      const fileName = `${currentProject.title.replace(/[\\/:*?"<>|]/g, "_")}.mp3`;
-      const audio = await invokeNative<{ name?: string; mimeType?: string; base64?: string }>("studio_download_source", { sourceUrl, fileName });
-      if (!audio.base64) throw new Error("原曲下载内容为空");
-      const bytes = Uint8Array.from(atob(audio.base64), (char) => char.charCodeAt(0));
-      await importAudio(new File([bytes], audio.name || fileName, { type: audio.mimeType || "audio/mpeg" }), trackId);
+      const file = await downloadStudioOriginal(currentProject);
+      if (!isCurrentProject(projectId)) return;
+      await importAudio(file, trackId);
+      if (!isCurrentProject(projectId)) return;
       setSelectedTrackId(trackId);
-      setNcmStatus("当前原曲已导入参考音轨（默认静音）");
+      setNcmStatus("原曲已导入，点击原曲轨的 S 独奏试听，或关闭 M 与伴奏一起播放");
     } catch (error) {
-      setNcmStatus(error instanceof Error ? error.message : "下载原曲失败，请选择本地原曲文件");
+      if (isCurrentProject(projectId)) setNcmStatus(error instanceof Error ? error.message : "下载原曲失败，请选择本地原曲文件");
     }
   };
 
@@ -431,6 +473,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   };
 
   const startStemJob = (input: { inputBase64?: string; sourceUrl?: string; fileName: string }) => new Promise<void>((resolve, reject) => {
+    const projectId = currentProject.id;
+    if (!isCurrentProject(projectId)) { resolve(); return; }
     setNcmStatus("准备伴奏任务…");
     setStemStage("准备文件");
     setStemProgress(0.02);
@@ -438,10 +482,17 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     void (async () => {
       try {
         const started = await invokeNative<{ jobId: string }>("studio_prepare_instrumental", { args: { ...input, title: currentProject.title } });
+        if (!isCurrentProject(projectId)) {
+          void invokeNative("studio_cancel_job", { jobId: started.jobId }).catch(() => undefined);
+          resolve(); return;
+        }
+        stemJobRef.current = started.jobId;
         setJobId(started.jobId);
         const poll = async () => {
           try {
+            if (!isCurrentProject(projectId)) { resolve(); return; }
             const status = await invokeNative<{ state: string; stage: string; progress: number; outputPath?: string; error?: string; message?: string; elapsedSec?: number; indeterminate?: boolean }>("studio_job_status", { jobId: started.jobId });
+            if (!isCurrentProject(projectId)) { resolve(); return; }
             setStemStage(status.stage);
             setStemProgress(Math.max(0, Math.min(1, status.progress)));
             setStemIndeterminate(Boolean(status.indeterminate));
@@ -449,11 +500,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             setNcmStatus(`${status.message ?? `${status.stage} ${Math.round(status.progress * 100)}%`}${elapsed}`);
             if (status.state === "running" || status.state === "queued") { window.setTimeout(() => void poll(), 800); return; }
             setJobId(null);
+            stemJobRef.current = null;
             if (status.state === "completed") {
               try {
                 const audio = await invokeNative<{ name: string; base64: string }>("studio_job_audio", { jobId: started.jobId });
+                if (!isCurrentProject(projectId)) { resolve(); return; }
                 const bytes = Uint8Array.from(atob(audio.base64), (char) => char.charCodeAt(0));
                 await importAudio(new File([bytes], audio.name, { type: audio.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav" }));
+                if (!isCurrentProject(projectId)) { resolve(); return; }
                 try {
                   await invokeNative("studio_cache_write", {
                     cacheId: instrumentalCacheId(currentProject),
@@ -465,12 +519,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                   // The generated accompaniment is still usable in this
                   // project when the optional shared cache cannot be written.
                 }
+                if (!isCurrentProject(projectId)) { resolve(); return; }
                 setStemProgress(1); setStemIndeterminate(false);
                 setNcmStatus("伴奏已生成并缓存");
                 resolve();
               } catch (error) { reject(error instanceof Error ? error : new Error(`伴奏已生成：${status.outputPath ?? "请导入输出文件"}`)); }
             } else reject(new Error(status.error ?? "伴奏任务失败"));
-          } catch (error) { setJobId(null); reject(error instanceof Error ? error : new Error("伴奏任务状态读取失败")); }
+          } catch (error) { if (!isCurrentProject(projectId)) { resolve(); return; } stemJobRef.current = null; setJobId(null); reject(error instanceof Error ? error : new Error("伴奏任务状态读取失败")); }
         };
         void poll();
       } catch (error) { reject(error instanceof Error ? error : new Error("伴奏任务不可用，请确认已安装本地运行包")); }
@@ -486,25 +541,23 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     if ((currentProject.source ?? "netease") !== "netease") { setNcmStatus("当前歌曲来自其他平台，请使用“导入音频”选择本地伴奏"); return; }
     setNcmStatus("正在获取当前歌曲下载地址…");
     try {
-      let sourceUrl = currentProject.sourceUrl;
-      if (!sourceUrl) {
-        const result = await invokeNative<{ data?: { url?: string | null } }>("netease_song_url", { args: { id: Number(currentProject.songId), level: "exhigh" } });
-        sourceUrl = result.data?.url ?? undefined;
-      }
-      if (!sourceUrl) throw new Error("当前歌曲没有可用的网易云音频地址，请确认已登录且歌曲可播放");
+      const sourceUrl = await resolveStudioSourceUrl(currentProject);
+      if (!isCurrentProject(currentProject.id)) return;
       const fileName = `${currentProject.title.replace(/[\\/:*?"<>|]/g, "_")}.mp3`;
       await startStemJob({ sourceUrl, fileName });
-    } catch (error) { setNcmStatus(error instanceof Error ? error.message : "无法获取当前歌曲"); }
+    } catch (error) { if (isCurrentProject(currentProject.id)) setNcmStatus(error instanceof Error ? error.message : "无法获取当前歌曲"); }
   };
 
   const restoreCachedInstrumental = async (): Promise<boolean> => {
     const cached = await invokeNative<{ name?: string; mimeType?: string; base64?: string } | null>("studio_cache_read", {
       cacheId: instrumentalCacheId(currentProject),
     });
+    if (!isCurrentProject(currentProject.id)) return true;
     if (!cached?.base64) return false;
     const bytes = Uint8Array.from(atob(cached.base64), (char) => char.charCodeAt(0));
     const file = new File([bytes], cached.name || `${currentProject.title}-伴奏.wav`, { type: cached.mimeType || "audio/wav" });
     await importAudio(file);
+    if (!isCurrentProject(currentProject.id)) return true;
     setStemProgress(1);
     setNcmStatus("已使用缓存伴奏");
     return true;
@@ -513,21 +566,19 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   useEffect(() => {
     if (autoPrepareRef.current === currentProject.id || lastAsset(currentProject.tracks.find((track) => track.id === "instrumental")?.assets ?? [])) return;
     autoPrepareRef.current = currentProject.id;
-    let cancelled = false;
     void (async () => {
       try {
-        if (await restoreCachedInstrumental() || cancelled) return;
+        if (await restoreCachedInstrumental()) return;
       } catch {
         // A stale or unreadable cache falls through to a fresh preparation.
       }
-      if (cancelled) return;
+      if (!isCurrentProject(currentProject.id)) return;
       if ((currentProject.source ?? "netease") !== "netease") {
         setNcmStatus("当前歌曲不是网易云来源，请导入本地伴奏");
         return;
       }
       await handleCurrentSong();
     })();
-    return () => { cancelled = true; };
   }, [currentProject.id]);
 
   const cancelNcm = async () => {
@@ -695,6 +746,6 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       </main>
     </div>
     {countdownValue !== null && <div className="pointer-events-none absolute inset-0 z-[200] grid place-items-center bg-slate-950/45 backdrop-blur-[2px]" role="status" aria-live="assertive"><div className="flex flex-col items-center gap-3"><div className="grid h-32 w-32 place-items-center rounded-full border border-lime-200/50 bg-slate-950/80 text-7xl font-black text-lime-100 shadow-[0_0_70px_rgba(190,242,100,.25)] animate-pulse">{countdownValue}</div><span className="rounded-full bg-black/40 px-4 py-1.5 text-xs font-bold tracking-[0.2em] text-white/70">准备录音</span></div></div>}
-    <div className="pointer-events-none absolute -left-[9999px] top-0 h-px w-px overflow-hidden">{currentProject.tracks.map((track) => { const asset = lastAsset(track.assets); if (!asset) return null; const clip = track.clips.length > 0 ? track.clips[track.clips.length - 1] : undefined; return <audio key={`${track.id}:${asset.id}`} ref={(element) => attachAudio(track.id, element, clip?.startSec ?? 0)} src={asset.url} preload="auto" />; })}</div>
+    <div className="pointer-events-none absolute -left-[9999px] top-0 h-px w-px overflow-hidden">{currentProject.tracks.map((track) => <TrackAudio key={`${currentProject.id}:${track.id}:${lastAsset(track.assets)?.id ?? "empty"}`} track={track} attach={attachAudio} />)}</div>
   </div>;
 }
