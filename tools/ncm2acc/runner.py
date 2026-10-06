@@ -20,12 +20,19 @@ import time
 from pathlib import Path
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace", write_through=True)
+
+
 def emit(stage: str, progress: float, **extra: object) -> None:
     payload = {"stage": stage, "progress": max(0.0, min(1.0, progress)), **extra}
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    print(json.dumps(payload, ensure_ascii=True), flush=True)
 
 
 def main() -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -74,6 +81,8 @@ def main() -> int:
             if model and model.exists():
                 command += ["--model_filename", model.name]
         environment = os.environ.copy()
+        environment["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+        environment["PYTHONUTF8"] = "1"
         environment["PATH"] = str(root) + os.pathsep + environment.get("PATH", "")
         # Model loading and CPU separation can take several minutes.  Do not
         # leave the UI at the initial 8% while waiting for a subprocess that

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Cove",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "identifier": "com.saymiao.netease-music-player",
   "build": {
     "beforeDevCommand": "pnpm dev",

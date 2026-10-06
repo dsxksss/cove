@@ -108,12 +108,23 @@ def stop_process(process: subprocess.Popen) -> None:
         process.wait()
 
 
+def configure_stdio() -> None:
+    # Hidden Windows processes use redirected handles, not a UTF-8 console.
+    # Do not inherit a machine's GBK/ANSI locale for the JSON protocol or logs.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace", write_through=True)
+
+
 def emit(stage: str, progress: float, **extra: object) -> None:
     payload = {"stage": stage, "progress": max(0.0, min(1.0, progress)), **extra}
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    # ASCII JSON escapes preserve Unicode after serde_json decoding and also
+    # remain safe when an older launcher forces an ANSI stdout wrapper.
+    print(json.dumps(payload, ensure_ascii=True), flush=True)
 
 
 def main() -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -171,6 +182,8 @@ def main() -> int:
                 command += ["--model_filename", model.name]
         environment = os.environ.copy()
         environment["PATH"] = str(root) + os.pathsep + environment.get("PATH", "")
+        environment["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+        environment["PYTHONUTF8"] = "1"
         # PyTorch/OpenMP may otherwise create one worker per logical core.
         # That is fast on a workstation but can exhaust RAM on a laptop.
         for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "TORCH_NUM_THREADS"):
