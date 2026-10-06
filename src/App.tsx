@@ -96,6 +96,7 @@ import {
 import { toast } from "./store/toastStore";
 import { getCoverFlowRange } from "./lib/coverFlow";
 import { createStudioProject, type StudioProject } from "./studio/types";
+import { getProjectDuration } from "./lib/studioSchedule";
 
 const LoginPanel = lazy(() =>
   import("./components/LoginPanel").then((module) => ({ default: module.LoginPanel })),
@@ -846,7 +847,7 @@ export default function App() {
       artist: project.artist,
       album: project.album ?? "翻唱工作室",
       pic: project.coverUrl || undefined,
-      duration: Math.max(0, Math.round(project.durationSec * 1000)),
+      duration: Math.max(0, Math.round(getProjectDuration(project) * 1000)),
       source: project.source,
       localAudioUrl: audioUrl,
       localLyrics: project.lyrics,
@@ -1060,7 +1061,7 @@ export default function App() {
           <StudioWorkspace
             key={studioProject.id}
             project={studioProject}
-            onBack={() => setStudioOpen(false)}
+            onBack={(updatedProject) => { if (updatedProject) setStudioProject(updatedProject); setStudioOpen(false); }}
             onPlayInPlayer={playStudioMixInPlayer}
           />
         ) : (

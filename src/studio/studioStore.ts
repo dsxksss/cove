@@ -1,6 +1,6 @@
 import { create } from "zustand";
-import type { StudioEffects, StudioProject, StudioTrack, StudioAsset, StudioTake } from "./types";
-import { createReferenceTrack, createVocalTrack } from "./types";
+import type { StudioEffects, StudioProject, StudioTrack, StudioAsset, StudioTake, StudioClip } from "./types";
+import { createReferenceTrack, createVocalTrack, DEFAULT_EFFECTS } from "./types";
 
 type StudioState = {
   project: StudioProject | null;
@@ -19,8 +19,12 @@ type StudioState = {
   addVocalTrack: () => void;
   addReferenceTrack: () => string | null;
   updateTrack: (id: string, patch: Partial<StudioTrack>) => void;
+  renameTrack: (id: string, name: string) => void;
   updateMixer: (id: string, patch: Partial<StudioTrack["mixer"]>) => void;
   updateEffects: (id: string, effects: Partial<StudioEffects>) => void;
+  resetEffects: (id: string) => void;
+  updateClip: (trackId: string, clipId: string, patch: Partial<StudioClip>) => void;
+  removeClip: (trackId: string, clipId: string) => void;
   addAssetToTrack: (trackId: string, asset: StudioAsset, take?: StudioTake, startSec?: number) => void;
   replaceAssetOnTrack: (trackId: string, asset: StudioAsset, startSec?: number) => void;
   removeTrack: (id: string) => void;
@@ -63,13 +67,52 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     if (!state.project) return state;
     return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, ...patch } : track) }) };
   }),
+  renameTrack: (id, name) => set((state) => {
+    if (!state.project) return state;
+    const nextName = name.trim();
+    if (!nextName) return state;
+    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, name: nextName } : track) }) };
+  }),
   updateMixer: (id, patch) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, mixer: { ...track.mixer, ...patch } } : track) }) };
+    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => {
+      if (track.id !== id) return track;
+      const mixer = { ...track.mixer, ...patch };
+      if (patch.solo === true) mixer.mute = false;
+      if (patch.mute === true) mixer.solo = false;
+      return { ...track, mixer };
+    }) }) };
   }),
   updateEffects: (id, effects) => set((state) => {
     if (!state.project) return state;
     return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effects: { ...track.effects, ...effects, eq: { ...track.effects.eq, ...effects.eq }, compressor: { ...track.effects.compressor, ...effects.compressor }, reverb: { ...track.effects.reverb, ...effects.reverb }, delay: { ...track.effects.delay, ...effects.delay } } } : track) }) };
+  }),
+  resetEffects: (id) => set((state) => {
+    if (!state.project) return state;
+    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effects: structuredClone(DEFAULT_EFFECTS) } : track) }) };
+  }),
+  updateClip: (trackId, clipId, patch) => set((state) => {
+    if (!state.project) return state;
+    return { project: touch({
+      ...state.project,
+      tracks: state.project.tracks.map((track) => {
+        if (track.id !== trackId) return track;
+        return { ...track, clips: track.clips.map((clip) => {
+          if (clip.id !== clipId) return clip;
+          const next = { ...clip, ...patch };
+          const asset = track.assets.find((item) => item.id === next.assetId);
+          const maxDuration = asset?.durationSec ?? next.durationSec;
+          const offset = Math.max(0, Math.min(next.offsetSec, Math.max(0, maxDuration - 0.05)));
+          const duration = Math.max(0.05, Math.min(next.durationSec, maxDuration - offset));
+          const start = Math.max(0, next.startSec);
+          return { ...next, startSec: start, offsetSec: offset, durationSec: duration };
+        }) };
+      }),
+    }) };
+  }),
+  removeClip: (trackId, clipId) => set((state) => {
+    if (!state.project) return state;
+    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === trackId ? { ...track, clips: track.clips.filter((clip) => clip.id !== clipId) } : track) }) };
   }),
   addAssetToTrack: (trackId, asset, take, startSec = 0) => set((state) => {
     if (!state.project) return state;

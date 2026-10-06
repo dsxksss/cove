@@ -4,14 +4,15 @@ import type { LyricsLine } from "./playerTypes";
 import { invokeNative } from "../lib/native";
 import { StudioAudioEngine } from "../lib/studioAudio";
 import { renderStudioMix } from "../lib/studioExport";
-import { StudioRecorder } from "../lib/studioRecorder";
+import { StudioRecorder, type StudioInputLevel } from "../lib/studioRecorder";
 import { useStudioStore } from "../studio/studioStore";
 import { downloadStudioOriginal, resolveStudioSourceUrl } from "../studio/source";
-import type { StudioAsset, StudioEffects, StudioProject, StudioTrack } from "../studio/types";
+import type { StudioAsset, StudioClip, StudioEffects, StudioProject, StudioTrack } from "../studio/types";
+import { getProjectDuration, hasAudibleClips } from "../lib/studioSchedule";
 
 type Props = {
   project: StudioProject;
-  onBack: () => void;
+  onBack: (project?: StudioProject) => void;
   onPlayInPlayer: (audioUrl: string, project: StudioProject) => Promise<void> | void;
 };
 
@@ -57,25 +58,22 @@ function lastAsset(assets: StudioAsset[]): StudioAsset | undefined {
   return assets.length > 0 ? assets[assets.length - 1] : undefined;
 }
 
-function TrackAudio({ track, attach }: { track: StudioTrack; attach: (id: string, element: HTMLAudioElement | null, startSec: number) => void }) {
-  const asset = lastAsset(track.assets);
-  const startSec = track.clips[track.clips.length - 1]?.startSec ?? 0;
-  const bind = useCallback((element: HTMLAudioElement | null) => attach(track.id, element, startSec), [attach, track.id, startSec]);
-  return asset ? <audio ref={bind} src={asset.url} preload="auto" /> : null;
-}
-
 function instrumentalCacheId(project: Pick<StudioProject, "source" | "songId">): string {
   return `${project.source}-${project.songId}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 110);
 }
 
-function TrackRow({ track, selected, onSelect, onMixer, onDelete }: { track: StudioTrack; selected: boolean; onSelect: () => void; onMixer: (patch: Partial<StudioTrack["mixer"]>) => void; onDelete: () => void }) {
+function TrackRow({ track, selected, onSelect, onMixer, onDelete, onRename }: { track: StudioTrack; selected: boolean; onSelect: () => void; onMixer: (patch: Partial<StudioTrack["mixer"]>) => void; onDelete: () => void; onRename: (name: string) => void }) {
   const asset = lastAsset(track.assets);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(track.name);
+  const commit = () => { const next = draft.trim(); if (next) onRename(next); else setDraft(track.name); setEditing(false); };
   return (
     <div role="button" tabIndex={0} onClick={onSelect} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(); } }} className={`group flex min-h-24 w-full flex-col gap-2 rounded-2xl border p-3 text-left transition ${selected ? "border-white/30 bg-white/10" : "border-white/8 bg-white/[0.035] hover:bg-white/[0.07]"}`}>
       <div className="flex items-center gap-2">
         <span className="h-3 w-3 rounded-full" style={{ background: track.color }} />
-        <span className="min-w-0 flex-1 truncate text-xs font-bold text-white/85">{track.name}</span>
+        {editing ? <input autoFocus aria-label="音轨名称" value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => { if (event.key === "Enter") commit(); if (event.key === "Escape") { setDraft(track.name); setEditing(false); } }} onClick={(event) => event.stopPropagation()} className="no-drag min-w-0 flex-1 rounded bg-white/10 px-1.5 py-0.5 text-xs font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <span className="min-w-0 flex-1 truncate text-xs font-bold text-white/85">{track.name}</span>}
         <span className="text-[10px] text-white/35">{track.kind === "instrumental" ? "伴奏" : track.kind === "reference" ? "参考" : `${track.takes.length} takes`}</span>
+        <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(track.name); setEditing(true); }} className="rounded p-1 text-white/25 hover:bg-white/10 hover:text-white/80" aria-label={`重命名 ${track.name}`} title="重命名音轨"><Pencil size={12} /></button>
         {track.kind !== "instrumental" && <button type="button" onClick={(event) => { event.stopPropagation(); onDelete(); }} className="rounded p-1 text-white/30 hover:bg-red-400/15 hover:text-red-200" aria-label={`删除 ${track.name}`}><Trash2 size={13} /></button>}
       </div>
       <div className="h-8 overflow-hidden rounded-lg bg-black/20">
@@ -91,10 +89,10 @@ function TrackRow({ track, selected, onSelect, onMixer, onDelete }: { track: Stu
   );
 }
 
-function EffectPanel({ track, onChange }: { track: StudioTrack; onChange: (effects: Partial<StudioEffects>) => void }) {
+function EffectPanel({ track, onChange, onReset }: { track: StudioTrack; onChange: (effects: Partial<StudioEffects>) => void; onReset: () => void }) {
   const setEq = (key: keyof StudioEffects["eq"], value: number) => onChange({ eq: { ...track.effects.eq, [key]: value } });
   return <div className="space-y-2 rounded-2xl border border-white/8 bg-white/[0.025] p-3">
-    <div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs font-bold text-white/75"><SlidersHorizontal size={14} /> {track.name} 效果器</div><span className="rounded-full bg-white/8 px-2 py-0.5 text-[9px] text-white/35">实时</span></div>
+    <div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs font-bold text-white/75"><SlidersHorizontal size={14} /> {track.name} 效果器</div><div className="flex items-center gap-1"><button type="button" onClick={onReset} className="flex items-center gap-1 rounded-lg bg-white/8 px-1.5 py-1 text-[9px] text-white/50 hover:bg-white/15 hover:text-white/80" title="恢复默认效果"><RotateCcw size={11} />默认</button><span className="rounded-full bg-white/8 px-2 py-0.5 text-[9px] text-white/35">实时</span></div></div>
     <div className="grid grid-cols-3 gap-2">{(["lowDb", "midDb", "highDb"] as const).map((key) => <label key={key} className="min-w-0 text-[10px] text-white/45"><span className="flex justify-between"><span>{key === "lowDb" ? "低频" : key === "midDb" ? "中频" : "高频"}</span><span className="font-mono text-white/30">{track.effects.eq[key].toFixed(1)}</span></span><input aria-label={key} type="range" min="-12" max="12" step="0.5" value={track.effects.eq[key]} onChange={(event) => setEq(key, Number(event.target.value))} className="w-full accent-lime-200" /></label>)}</div>
     <div className="grid grid-cols-3 gap-2 border-t border-white/8 pt-2"><label className="min-w-0 text-[10px] text-white/45">压缩 <input aria-label="压缩比例" type="range" min="1" max="12" step="0.5" value={track.effects.compressor.ratio} onChange={(event) => onChange({ compressor: { ...track.effects.compressor, ratio: Number(event.target.value) } })} className="w-full accent-lime-200" /><span className="block text-right font-mono text-white/30">{track.effects.compressor.ratio.toFixed(1)}:1</span></label><label className="min-w-0 text-[10px] text-white/45">混响 <input aria-label="混响" type="range" min="0" max="1" step="0.01" value={track.effects.reverb.mix} onChange={(event) => onChange({ reverb: { ...track.effects.reverb, mix: Number(event.target.value) } })} className="w-full accent-lime-200" /><span className="block text-right font-mono text-white/30">{Math.round(track.effects.reverb.mix * 100)}%</span></label><label className="min-w-0 text-[10px] text-white/45">延迟 <input aria-label="延迟" type="range" min="0" max="1" step="0.01" value={track.effects.delay.mix} onChange={(event) => onChange({ delay: { ...track.effects.delay, mix: Number(event.target.value) } })} className="w-full accent-lime-200" /><span className="block text-right font-mono text-white/30">{Math.round(track.effects.delay.mix * 100)}%</span></label></div>
   </div>;
@@ -104,6 +102,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const sessionProjectIdRef = useRef(project.id);
   const storedProject = useStudioStore((state) => state.project);
   const currentProject = storedProject?.id === sessionProjectIdRef.current ? storedProject : project;
+  const projectDuration = getProjectDuration(currentProject);
   const currentTime = useStudioStore((state) => state.currentTime);
   const isPlaying = useStudioStore((state) => state.isPlaying);
   const recordingTrackId = useStudioStore((state) => state.recordingTrackId);
@@ -116,17 +115,19 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const setInputDeviceId = useStudioStore((state) => state.setInputDeviceId);
   const setRecordingTrackId = useStudioStore((state) => state.setRecordingTrackId);
   const updateProjectTitle = useStudioStore((state) => state.updateProjectTitle);
+  const renameTrack = useStudioStore((state) => state.renameTrack);
   const addVocalTrack = useStudioStore((state) => state.addVocalTrack);
   const addReferenceTrack = useStudioStore((state) => state.addReferenceTrack);
   const updateMixer = useStudioStore((state) => state.updateMixer);
   const updateEffects = useStudioStore((state) => state.updateEffects);
+  const resetEffects = useStudioStore((state) => state.resetEffects);
+  const updateClip = useStudioStore((state) => state.updateClip);
+  const removeClip = useStudioStore((state) => state.removeClip);
   const addAssetToTrack = useStudioStore((state) => state.addAssetToTrack);
   const replaceAssetOnTrack = useStudioStore((state) => state.replaceAssetOnTrack);
   const removeTrack = useStudioStore((state) => state.removeTrack);
   const updateLatency = useStudioStore((state) => state.updateLatency);
   const engineRef = useRef<StudioAudioEngine | null>(null);
-  const audioRefs = useRef(new Map<string, HTMLAudioElement>());
-  const audioStartRefs = useRef(new Map<string, number>());
   const recorderRef = useRef<StudioRecorder | null>(null);
   const recordStartRef = useRef(0);
   const countdownAbortRef = useRef(false);
@@ -148,12 +149,15 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [countdownEnabled, setCountdownEnabled] = useState(loadRecordCountdown);
   const [countdownValue, setCountdownValue] = useState<number | null>(null);
   const autoPrepareRef = useRef<string | null>(null);
-  const waveformRef = useRef<HTMLCanvasElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineDraggingRef = useRef(false);
   const [timelineDragging, setTimelineDragging] = useState(false);
+  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; startSec: number; offsetSec: number; durationSec: number } | null>(null);
   const [renamingProject, setRenamingProject] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState(project.title);
+  const [micLevel, setMicLevel] = useState<StudioInputLevel>({ rms: 0, peak: 0, clipping: false });
+  const inputGain = 1;
+  const assetWritesRef = useRef(new Map<string, Promise<unknown>>());
   const mountedRef = useRef(false);
   const stemJobRef = useRef<string | null>(null);
   const isCurrentProject = (id: string) => mountedRef.current && useStudioStore.getState().project?.id === id;
@@ -227,6 +231,22 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       setProject(loaded); setSelectedTrackId("instrumental"); setProjectMenuOpen(false); setNcmStatus("已打开本地工程");
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "无法打开工程"); }
   };
+  const importProjectPackage = async () => {
+    try {
+      const loaded = await invokeNative<StudioProject | null>("studio_import_package");
+      if (!loaded || !isCurrentProject(currentProject.id)) return;
+      for (const track of loaded.tracks) for (const asset of track.assets) {
+        const encoded = await invokeNative<string>("studio_read_asset", { projectId: loaded.id, assetId: asset.id });
+        asset.url = base64Url(encoded, asset.mimeType);
+      }
+      sessionProjectIdRef.current = loaded.id;
+      persistedProjectIdsRef.current.add(loaded.id);
+      setProject(loaded);
+      setSelectedTrackId("instrumental");
+      setProjectMenuOpen(false);
+      setNcmStatus("工程包已导入");
+    } catch (error) { setNcmStatus(error instanceof Error ? error.message : "工程包导入失败"); }
+  };
   const deleteSavedProject = async (id: string) => {
     try {
       await invokeNative("studio_delete_project", { projectId: id });
@@ -239,31 +259,17 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const selectedMic = devices.find((device) => device.deviceId === inputDeviceId);
   const micLabel = inputDeviceId === "default" ? "默认麦克风" : selectedMic?.label || `麦克风 ${inputDeviceId.slice(0, 5)}`;
 
-  const attachAudio = useCallback((id: string, element: HTMLAudioElement | null, startSec = 0) => {
-    if (!element) {
-      audioRefs.current.delete(id);
-      audioStartRefs.current.delete(id);
-      engineRef.current?.detach(id);
-      return;
-    }
-    audioRefs.current.set(id, element);
-    audioStartRefs.current.set(id, startSec);
-    engineRef.current?.attach(id, element, startSec);
-  }, []);
-
   useEffect(() => {
     const engine = engineRef.current;
-    if (engine) {
-      for (const [id, element] of audioRefs.current) engine.attach(id, element, audioStartRefs.current.get(id) ?? 0);
-    }
-    engine?.updateAll(currentProject.tracks);
+    if (!engine) return;
+    void engine.setProject(currentProject).catch((error) => setNcmStatus(error instanceof Error ? error.message : "音频载入失败"));
   }, [currentProject.tracks]);
 
   useEffect(() => {
     if (!persistedProjectIdsRef.current.has(currentProject.id)) return;
     const timer = window.setTimeout(() => {
       try { localStorage.setItem(`cove.studio.${currentProject.id}`, JSON.stringify(currentProject)); } catch { /* storage quota is non-fatal */ }
-      void invokeNative("studio_save_project", { project: currentProject }).catch(() => undefined);
+      void waitForAssetWrites(currentProject.id).then(() => invokeNative("studio_save_project", { project: currentProject })).catch(() => undefined);
     }, 450);
     return () => window.clearTimeout(timer);
   }, [currentProject]);
@@ -273,19 +279,27 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const timer = window.setInterval(() => {
       const clock = engineRef.current?.currentTime ?? currentTime;
       setCurrentTime(clock);
-      if (clock >= currentProject.durationSec && currentProject.durationSec > 0) { engineRef.current?.pause(); setPlaying(false); }
+      if (clock >= projectDuration && projectDuration > 0) { engineRef.current?.pause(); setPlaying(false); }
     }, 50);
     return () => window.clearInterval(timer);
-  }, [currentProject.durationSec, currentTime, isPlaying, setCurrentTime, setPlaying]);
+  }, [projectDuration, currentTime, isPlaying, setCurrentTime, setPlaying]);
+
+  useEffect(() => {
+    if (!recordingTrackId) { setMicLevel({ rms: 0, peak: 0, clipping: false }); return; }
+    const timer = window.setInterval(() => setMicLevel(recorderRef.current?.getLevel() ?? { rms: 0, peak: 0, clipping: false }), 100);
+    return () => window.clearInterval(timer);
+  }, [recordingTrackId]);
+
+  useEffect(() => { recorderRef.current?.update(inputGain, monitorInput); }, [inputGain, monitorInput]);
 
   const seekTimelineFromPointer = useCallback((clientX: number) => {
     const bounds = timelineRef.current?.getBoundingClientRect();
     if (!bounds) return;
     const ratio = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
-    const value = ratio * Math.max(currentProject.durationSec, 1);
+    const value = ratio * Math.max(projectDuration, 1);
     engineRef.current?.seek(value);
-    setCurrentTime(Math.min(value, currentProject.durationSec || value));
-  }, [currentProject.durationSec, setCurrentTime]);
+    setCurrentTime(Math.min(value, projectDuration || value));
+  }, [projectDuration, setCurrentTime]);
 
   useEffect(() => {
     if (!timelineDragging) return;
@@ -302,6 +316,32 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     };
   }, [seekTimelineFromPointer, timelineDragging]);
 
+  const beginClipDrag = useCallback((trackId: string, clip: StudioClip, mode: "move" | "left" | "right", clientX: number) => {
+    clipDragRef.current = { trackId, clip, mode, originX: clientX, startSec: clip.startSec, offsetSec: clip.offsetSec, durationSec: clip.durationSec };
+    setSelectedTrackId(trackId);
+  }, []);
+
+  useEffect(() => {
+    const move = (event: PointerEvent) => {
+      const drag = clipDragRef.current;
+      const bounds = timelineRef.current?.getBoundingClientRect();
+      if (!drag || !bounds || bounds.width <= 0) return;
+      const delta = (event.clientX - drag.originX) / bounds.width * Math.max(projectDuration, 1);
+      if (drag.mode === "move") {
+        updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + delta });
+      } else if (drag.mode === "left") {
+        const nextDelta = Math.max(-drag.offsetSec, Math.min(drag.durationSec - 0.05, delta));
+        updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + nextDelta, offsetSec: drag.offsetSec + nextDelta, durationSec: drag.durationSec - nextDelta });
+      } else {
+        updateClip(drag.trackId, drag.clip.id, { durationSec: drag.durationSec + delta });
+      }
+    };
+    const end = () => { clipDragRef.current = null; };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); };
+  }, [projectDuration, updateClip]);
+
   const selectedTrack = currentProject.tracks.find((track) => track.id === selectedTrackId) ?? currentProject.tracks[0];
   const lyricIndex = useMemo(() => activeLyric(currentProject.lyrics, currentTime), [currentProject.lyrics, currentTime]);
   const lyricRows = useMemo(() => {
@@ -313,40 +353,6 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       index: start + offset,
     }));
   }, [currentProject.lyrics, lyricIndex]);
-
-  useEffect(() => {
-    let frame = 0;
-    const draw = () => {
-      const canvas = waveformRef.current;
-      if (canvas) {
-        const bounds = canvas.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        const width = Math.max(1, Math.round(bounds.width * dpr));
-        const height = Math.max(1, Math.round(bounds.height * dpr));
-        if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.clearRect(0, 0, width, height);
-          const samples = engineRef.current?.waveform() ?? new Uint8Array(0);
-          const bars = Math.max(36, Math.floor(bounds.width / 7));
-          const barWidth = width / bars;
-          const phase = performance.now() / 900;
-          for (let i = 0; i < bars; i += 1) {
-            const sample = samples.length ? Math.abs(samples[Math.floor(i / bars * samples.length)] - 128) / 128 : 0.12 + Math.abs(Math.sin(phase + i * 0.32)) * 0.12;
-            const motion = isPlaying ? 1 + Math.abs(Math.sin(phase * 2 + i * 0.18)) * 0.35 : 0.72;
-            const barHeight = Math.max(3 * dpr, sample * height * 1.5 * motion);
-            const progress = currentProject.durationSec ? currentTime / currentProject.durationSec : 0;
-            const played = i / bars <= progress;
-            ctx.fillStyle = played ? "rgba(190,242,100,.82)" : "rgba(255,255,255,.20)";
-            ctx.beginPath(); ctx.roundRect(i * barWidth + 1, (height - barHeight) / 2, Math.max(1, barWidth - 2), barHeight, 2 * dpr); ctx.fill();
-          }
-        }
-      }
-      frame = requestAnimationFrame(draw);
-    };
-    frame = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frame);
-  }, [currentProject.durationSec, currentTime, isPlaying]);
 
   const togglePlayback = async () => {
     if (isPlaying) { engineRef.current?.pause(); setPlaying(false); return; }
@@ -376,7 +382,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setPlaying(false);
     if (trackId === "instrumental" || targetTrack?.kind === "reference" || trackId.startsWith("reference-")) replaceAssetOnTrack(trackId, asset, startSec);
     else addAssetToTrack(trackId, asset, undefined, startSec);
-    void readFileAsBase64(file).then((inputBase64) => invokeNative("studio_write_asset", { projectId: currentProject.id, assetId: asset.id, inputBase64 })).catch(() => undefined);
+    const assetWrite = readFileAsBase64(file).then((inputBase64) => invokeNative("studio_write_asset", { projectId: currentProject.id, assetId: asset.id, inputBase64 }));
+    const assetKey = `${currentProject.id}:${asset.id}`;
+    assetWritesRef.current.set(assetKey, assetWrite);
+    void assetWrite.catch(() => undefined).finally(() => { if (assetWritesRef.current.get(assetKey) === assetWrite) assetWritesRef.current.delete(assetKey); });
     if (trackId === "instrumental" && durationSec > 0 && currentProject.durationSec === 0) setProject({ ...useStudioStore.getState().project!, durationSec });
     setSelectedTrackId(trackId);
   };
@@ -419,8 +428,17 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     try {
       countdownAbortRef.current = false;
       const recorder = new StudioRecorder(engineRef.current.context);
-      await recorder.prepare(inputDeviceId, 1, monitorInput);
-      recorder.onDeviceLost(() => { setNcmStatus("麦克风已断开"); setRecordingTrackId(null); });
+      await recorder.prepare(inputDeviceId, inputGain, monitorInput);
+      recorder.onDeviceLost(() => {
+        if (recorderRef.current !== recorder) return;
+        recorder.dispose();
+        recorderRef.current = null;
+        engineRef.current?.pause();
+        setPlaying(false);
+        setMicLevel({ rms: 0, peak: 0, clipping: false });
+        setNcmStatus("麦克风已断开，录音已停止");
+        setRecordingTrackId(null);
+      });
       recorderRef.current = recorder;
       if (countdownAbortRef.current) {
         recorder.dispose();
@@ -441,12 +459,17 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         }
         setCountdownValue(null);
       }
-    recordStartRef.current = currentTime;
-    recorder.start((engineRef.current.context.currentTime ?? 0) + 0.05);
+    const scheduleAt = (engineRef.current?.context.currentTime ?? 0) + 0.015;
+    recordStartRef.current = recorder.start(scheduleAt);
+    await engineRef.current?.play(currentTime, true);
     setPlaying(true);
-    await engineRef.current?.play(currentTime);
     setNcmStatus("正在录音，再次点击停止");
     } catch (error) {
+      recorderRef.current?.dispose();
+      recorderRef.current = null;
+      engineRef.current?.pause();
+      setPlaying(false);
+      setMicLevel({ rms: 0, peak: 0, clipping: false });
       setNcmStatus(error instanceof Error ? error.message : "无法访问麦克风");
       setRecordingTrackId(null);
     }
@@ -590,14 +613,22 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "取消任务失败"); }
   };
 
-  const saveProject = () => {
-    persistedProjectIdsRef.current.add(currentProject.id);
-    localStorage.setItem(`cove.studio.${currentProject.id}`, JSON.stringify(currentProject));
-    setSavedProjects((items) => {
-      const next = { id: currentProject.id, title: currentProject.title, artist: currentProject.artist };
-      return [next, ...items.filter((item) => item.id !== next.id)];
-    });
-    void invokeNative("studio_save_project", { project: currentProject }).then(() => setNcmStatus("工程已保存到本地"), () => setNcmStatus("工程已保存到当前会话；本地工程目录不可用"));
+  const waitForAssetWrites = async (projectId: string) => {
+    const writes = [...assetWritesRef.current.entries()].filter(([key]) => key.startsWith(`${projectId}:`)).map(([, promise]) => promise);
+    if (writes.length) await Promise.all(writes);
+  };
+  const saveProject = async () => {
+    try {
+      await waitForAssetWrites(currentProject.id);
+      await invokeNative("studio_save_project", { project: currentProject });
+      persistedProjectIdsRef.current.add(currentProject.id);
+      try { localStorage.setItem(`cove.studio.${currentProject.id}`, JSON.stringify(currentProject)); } catch { /* native project remains authoritative */ }
+      setSavedProjects((items) => {
+        const next = { id: currentProject.id, title: currentProject.title, artist: currentProject.artist };
+        return [next, ...items.filter((item) => item.id !== next.id)];
+      });
+      setNcmStatus("工程已保存到本地");
+    } catch { setNcmStatus("工程保存失败，请检查应用数据目录权限"); }
   };
   const exportFile = async (extension: "wav" | "mp3" | "cove-studio") => {
     if (exportBusyRef.current) return;
@@ -606,22 +637,27 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setExportMenuOpen(false);
     const snapshot = currentProject;
     try {
-      let encoded: string;
+      await waitForAssetWrites(snapshot.id);
+      let encoded: string | undefined;
       if (extension === "cove-studio") {
         setNcmStatus("正在打包工程…");
         persistedProjectIdsRef.current.add(snapshot.id);
         setSavedProjects((items) => [{ id: snapshot.id, title: snapshot.title, artist: snapshot.artist }, ...items.filter((item) => item.id !== snapshot.id)]);
+        await waitForAssetWrites(snapshot.id);
         await invokeNative("studio_save_project", { project: snapshot });
-        encoded = await invokeNative<string>("studio_export_package", { projectId: snapshot.id });
+        const path = await invokeNative<string | null>("studio_export_package_to_file", { projectId: snapshot.id, fileName: `${snapshot.title}.cove-studio` });
+        setNcmStatus(path ? `工程包已导出到：${path}` : "已取消导出");
+        return;
       } else {
         setNcmStatus(extension === "mp3" ? "正在渲染 320 kbps MP3…" : "正在离线渲染混音…");
         const wav = await renderStudioMix(snapshot);
         encoded = await readBlobAsBase64(wav);
         if (extension === "mp3") encoded = await invokeNative<string>("studio_encode_mp3", { projectId: snapshot.id, inputBase64: encoded });
       }
+      if (!encoded) throw new Error("导出数据为空");
       setNcmStatus("请选择导出文件夹和文件名…");
       const path = await invokeNative<string | null>("studio_save_export", {
-        fileName: `${snapshot.title}${extension === "cove-studio" ? "" : "-翻唱"}.${extension}`,
+        fileName: `${snapshot.title}-翻唱.${extension}`,
         extension,
         inputBase64: encoded,
       });
@@ -666,13 +702,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setRenamingProject(false);
   };
 
-  const timelineProgress = Math.min(100, Math.max(0, (currentTime / Math.max(currentProject.durationSec, 1)) * 100));
+  const timelineProgress = Math.min(100, Math.max(0, (currentTime / Math.max(projectDuration, 1)) * 100));
   const playheadLeft = `clamp(8px, ${timelineProgress}%, calc(100% - 8px))`;
-  const hasRenderableAudio = currentProject.tracks.some((track) => track.clips.some((clip) => track.assets.some((asset) => asset.id === clip.assetId)));
+  const hasRenderableAudio = hasAudibleClips(currentProject);
 
   return <div className="relative flex h-full w-full flex-col overflow-hidden bg-slate-950/90 text-white">
     <header ref={headerMenuRef} data-tauri-drag-region className="flex h-16 shrink-0 items-center gap-3 border-b border-white/10 px-5">
-      <button type="button" onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white" aria-label="返回播放器"><ArrowLeft size={18} /></button>
+      <button type="button" onClick={() => onBack(useStudioStore.getState().project ?? currentProject)} className="grid h-9 w-9 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white" aria-label="返回播放器"><ArrowLeft size={18} /></button>
       {currentProject.coverUrl ? <img src={currentProject.coverUrl} alt="" className="h-10 w-10 rounded-xl object-cover" /> : <div className="grid h-10 w-10 place-items-center rounded-xl bg-white/10"><Disc3 size={18} /></div>}
       <div className="min-w-0 flex-1">{renamingProject ? <input autoFocus value={projectTitleDraft} onChange={(event) => setProjectTitleDraft(event.target.value)} onBlur={commitProjectRename} onKeyDown={(event) => { if (event.key === "Enter") commitProjectRename(); if (event.key === "Escape") { setProjectTitleDraft(currentProject.title); setRenamingProject(false); } }} aria-label="工程名称" className="no-drag w-full max-w-xs rounded-lg bg-white/10 px-2 py-1 text-sm font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <div className="flex min-w-0 items-center gap-1"><h1 className="truncate text-sm font-bold">{currentProject.title}</h1><button type="button" onClick={() => { setProjectTitleDraft(currentProject.title); setRenamingProject(true); }} className="no-drag shrink-0 rounded p-1 text-white/35 transition hover:bg-white/10 hover:text-white/80" aria-label="重命名工程" title="重命名工程"><Pencil size={12} /></button></div>}<p className="truncate text-xs text-white/45">{currentProject.artist} · 翻唱工作室</p></div>
       <label className="hidden items-center gap-2 text-xs text-white/45 lg:flex">输入延迟 <input type="text" inputMode="decimal" aria-label="输入延迟毫秒" value={currentProject.inputLatencyMs} onChange={(event) => { const value = event.target.value.replace(/[^0-9.-]/g, ""); if (value === "" || value === "-" || value === "." || /^-?\d*\.?\d*$/.test(value)) updateLatency(value === "" || value === "-" || value === "." ? 0 : Number(value)); }} className="studio-latency-input no-drag w-16 rounded-lg bg-white/8 px-2 py-1 text-right font-mono text-white outline-none transition focus:bg-white/12 focus:ring-1 focus:ring-lime-200/60" /> ms</label>
@@ -681,6 +717,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         <button type="button" aria-haspopup="menu" aria-expanded={projectMenuOpen} onClick={() => { setProjectMenuOpen((open) => !open); setMicMenuOpen(false); setExportMenuOpen(false); }} className="flex items-center justify-between gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/75 transition hover:bg-white/15"><span>工程</span><ChevronDown size={14} className={`transition-transform ${projectMenuOpen ? "rotate-180" : ""}`} /></button>
         {projectMenuOpen && <div role="menu" className="absolute right-0 top-full z-[100] mt-2 max-h-60 w-64 overflow-y-auto rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
           <p className="px-3 pt-2 text-[10px] text-white/35">打开本地工程</p>
+          <button type="button" role="menuitem" onClick={() => void importProjectPackage()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-bold text-lime-100/80 hover:bg-lime-200/10"><Upload size={13} />导入 .cove-studio 工程包</button>
           <p className="px-3 pb-2 text-[10px] leading-relaxed text-white/25">新工程点击“保存”后才会出现在这里</p>
           {savedProjects.length === 0 ? <div className="px-3 py-3 text-xs text-white/40">暂无已保存工程</div> : savedProjects.map((item) => <div key={item.id} className="group flex items-center gap-1 rounded-lg transition hover:bg-white/10"><button type="button" role="menuitem" onClick={() => void openSavedProject(item.id)} className="flex min-w-0 flex-1 flex-col items-start px-3 py-2 text-left"><span className="w-full truncate text-xs font-bold text-white/80">{item.title}</span><span className="w-full truncate text-[10px] text-white/40">{item.artist}</span></button><button type="button" onClick={() => void deleteSavedProject(item.id)} className="mr-1 rounded p-1.5 text-white/25 opacity-0 transition hover:bg-red-400/15 hover:text-red-200 group-hover:opacity-100" aria-label={`删除工程 ${item.title}`} title="删除工程"><Trash2 size={13} /></button></div>)}
           <div className="mt-1 border-t border-white/10 pt-1"><button type="button" role="menuitem" onClick={() => { setProjectMenuOpen(false); void deleteCurrentProject(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs text-red-200/80 hover:bg-red-400/10"><Trash2 size={13} />删除当前工程</button></div>
@@ -703,7 +740,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     <div className="flex min-h-0 flex-1">
       <aside className="flex w-72 shrink-0 flex-col gap-3 overflow-y-auto border-r border-white/10 p-4">
         <div className="flex items-center justify-between gap-2"><span className="text-[11px] font-black tracking-[0.16em] text-white/35">轨道</span><div className="flex items-center gap-1"><button type="button" onClick={addVocalTrack} className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-[11px] font-bold text-white/70 hover:bg-white/15"><Plus size={13} />人声轨</button><button type="button" onClick={() => void importOriginalCurrentSong()} className="rounded-lg bg-amber-300/15 px-2 py-1 text-[11px] font-bold text-amber-100/80 hover:bg-amber-300/25">原曲</button><label className="cursor-pointer rounded-lg bg-white/8 px-2 py-1 text-[11px] font-bold text-white/55 hover:bg-white/15" title="选择本地原曲文件">本地<input type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importOriginalFile(file); event.currentTarget.value = ""; }} /></label></div></div>
-        <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onDelete={() => removeTrack(track.id)} />)}</div>
+        <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} />)}</div>
         <div className="mt-auto space-y-2 rounded-2xl border border-white/8 bg-white/[0.035] p-3">
           <p className="text-[10px] font-black tracking-[0.15em] text-white/35">伴奏输入</p>
           <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/70 hover:bg-white/15"><Upload size={14} />导入音频<input type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importAudio(file); event.currentTarget.value = ""; }} /></label>
@@ -714,15 +751,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       </aside>
       <main className="flex min-w-0 flex-1 flex-col">
         <div className="flex min-h-0 flex-1 flex-col p-5">
-          <div ref={timelineRef} role="slider" tabIndex={0} aria-label="时间线播放头" aria-valuemin={0} aria-valuemax={Math.max(currentProject.durationSec, 1)} aria-valuenow={Math.round(currentTime * 100) / 100} onPointerDown={(event) => { if ((event.target as HTMLElement).closest("button")) return; timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }} onKeyDown={(event) => { const step = event.shiftKey ? 10 : 1; if (event.key === "ArrowLeft") { event.preventDefault(); seekTimelineFromPointer((timelineRef.current?.getBoundingClientRect().left ?? 0) + ((currentTime - step) / Math.max(currentProject.durationSec, 1)) * (timelineRef.current?.getBoundingClientRect().width ?? 0)); } if (event.key === "ArrowRight") { event.preventDefault(); seekTimelineFromPointer((timelineRef.current?.getBoundingClientRect().left ?? 0) + ((currentTime + step) / Math.max(currentProject.durationSec, 1)) * (timelineRef.current?.getBoundingClientRect().width ?? 0)); } }} className={`relative min-h-72 flex-1 overflow-hidden rounded-3xl border border-white/10 bg-black/20 ${timelineDragging ? "cursor-grabbing" : "cursor-crosshair"}`}>
+          <div ref={timelineRef} role="slider" tabIndex={0} aria-label="时间线播放头" aria-valuemin={0} aria-valuemax={Math.max(projectDuration, 1)} aria-valuenow={Math.round(currentTime * 100) / 100} onPointerDown={(event) => { if ((event.target as HTMLElement).closest("button, [role=button]")) return; timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }} onKeyDown={(event) => { const step = event.shiftKey ? 10 : 1; if (event.key === "ArrowLeft") { event.preventDefault(); seekTimelineFromPointer((timelineRef.current?.getBoundingClientRect().left ?? 0) + ((currentTime - step) / Math.max(projectDuration, 1)) * (timelineRef.current?.getBoundingClientRect().width ?? 0)); } if (event.key === "ArrowRight") { event.preventDefault(); seekTimelineFromPointer((timelineRef.current?.getBoundingClientRect().left ?? 0) + ((currentTime + step) / Math.max(projectDuration, 1)) * (timelineRef.current?.getBoundingClientRect().width ?? 0)); } }} className={`relative min-h-72 flex-1 overflow-hidden rounded-3xl border border-white/10 bg-black/20 ${timelineDragging ? "cursor-grabbing" : "cursor-crosshair"}`}>
             <div className="absolute inset-0 bg-[linear-gradient(90deg,transparent_0,transparent_calc(25%-1px),rgba(255,255,255,.05)_25%,transparent_calc(25%+1px),transparent_calc(50%-1px),rgba(255,255,255,.05)_50%,transparent_calc(50%+1px),transparent_calc(75%-1px),rgba(255,255,255,.05)_75%,transparent_calc(75%+1px),transparent_100%)]" />
-            <div className="absolute inset-x-0 top-4 flex justify-between px-4 text-[10px] font-mono text-white/25"><span>0:00</span><span>{formatTime(currentProject.durationSec / 2)}</span><span>{formatTime(currentProject.durationSec)}</span></div>
-            <canvas ref={waveformRef} aria-label="音频声波可视化" className="pointer-events-none absolute inset-x-4 top-10 h-24 w-[calc(100%-2rem)] opacity-90" />
-            <div className="absolute bottom-6 left-0 right-0 space-y-3 px-4">{currentProject.tracks.map((track) => <div key={track.id} className="relative h-14 rounded-xl bg-white/[0.035]" onClick={() => setSelectedTrackId(track.id)}><div className="absolute inset-y-0 left-2 flex items-center text-[10px] font-bold text-white/35">{track.name}</div>{track.clips.map((clip) => <div key={clip.id} className="absolute inset-y-2 rounded-lg border border-white/15 bg-white/10" style={{ left: `${(clip.startSec / Math.max(currentProject.durationSec, 1)) * 100}%`, width: `${Math.max(2, (clip.durationSec / Math.max(currentProject.durationSec, 1)) * 100)}%` }} />)}</div>)}</div>
+            <div className="absolute inset-x-0 top-4 flex justify-between px-4 text-[10px] font-mono text-white/25"><span>0:00</span><span>{formatTime(projectDuration / 2)}</span><span>{formatTime(projectDuration)}</span></div>
+            <div className="absolute bottom-6 left-0 right-0 space-y-3 px-4">{currentProject.tracks.map((track) => <div key={track.id} className="relative h-14 rounded-xl bg-white/[0.035]" onClick={() => setSelectedTrackId(track.id)}><div className="absolute inset-y-0 left-2 z-[1] flex items-center text-[10px] font-bold text-white/35">{track.name}</div>{track.clips.map((clip) => { const asset = track.assets.find((item) => item.id === clip.assetId); const left = (clip.startSec / Math.max(projectDuration, 1)) * 100; const width = Math.max(2, (clip.durationSec / Math.max(projectDuration, 1)) * 100); return <div key={clip.id} role="button" tabIndex={0} title={`${asset?.name ?? "音频片段"} · ${formatTime(clip.startSec)} · ${formatTime(clip.durationSec)}`} onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }} onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "move", event.clientX); }} onKeyDown={(event) => { if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); removeClip(track.id, clip.id); } }} className={`group absolute inset-y-2 z-[2] overflow-visible rounded-lg border ${track.id === selectedTrackId ? "border-lime-200/60 bg-lime-200/15" : "border-white/15 bg-white/10"} cursor-grab active:cursor-grabbing`} style={{ left: `${left}%`, width: `${width}%` }}><span className="absolute inset-0 truncate px-3 py-2 text-[10px] font-bold text-white/55">{track.name} · {formatTime(clip.durationSec)}</span><button type="button" aria-label="缩短片段起点" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "left", event.clientX); }} className="absolute left-0 top-1/2 z-10 h-8 w-1 -translate-x-1/2 -translate-y-1/2 cursor-ew-resize rounded-full bg-lime-200/80 opacity-0 transition group-hover:opacity-100" /><button type="button" aria-label="调整片段结尾" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "right", event.clientX); }} className="absolute right-0 top-1/2 z-10 h-8 w-1 translate-x-1/2 -translate-y-1/2 cursor-ew-resize rounded-full bg-lime-200/80 opacity-0 transition group-hover:opacity-100" /><button type="button" aria-label="删除片段" onClick={(event) => { event.stopPropagation(); removeClip(track.id, clip.id); }} className="absolute -right-1.5 -top-1.5 z-20 grid h-4 w-4 place-items-center rounded-full bg-red-300 text-[11px] font-black text-slate-950 opacity-0 transition group-hover:opacity-100">×</button></div>; })}</div>)}</div>
             <div className="pointer-events-none absolute bottom-0 top-0 z-10 w-px -translate-x-1/2 bg-lime-200/85" style={{ left: playheadLeft }} />
             <button type="button" aria-label="拖拽时间线播放头" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }} className={`absolute top-3 z-20 h-3 w-3 -translate-x-1/2 rounded-full border border-lime-100/90 bg-lime-200 transition-transform hover:scale-110 ${timelineDragging ? "scale-110 cursor-grabbing" : "cursor-grab"}`} style={{ left: playheadLeft }} />
           </div>
-          <div className="mt-4 flex items-center gap-3"><button type="button" onClick={() => void togglePlayback()} className="grid h-11 w-11 place-items-center rounded-full bg-white text-slate-950">{isPlaying ? <Pause size={18} /> : <Play size={18} fill="currentColor" />}</button><button type="button" onClick={() => { engineRef.current?.seek(0); setCurrentTime(0); }} className="grid h-9 w-9 place-items-center rounded-full bg-white/10 text-white/70 hover:bg-white/15" aria-label="回到开头"><Square size={13} /></button><span className="font-mono text-xs text-white/55">{formatTime(currentTime)} / {formatTime(currentProject.durationSec)}</span><div className="flex-1"><input aria-label="工作室进度" type="range" min="0" max={Math.max(currentProject.durationSec, 1)} step="0.01" value={Math.min(currentTime, currentProject.durationSec || 1)} onChange={(event) => { const value = Number(event.target.value); engineRef.current?.seek(value); setCurrentTime(value); }} style={{ "--studio-progress": `${Math.min(100, (currentTime / Math.max(currentProject.durationSec, 1)) * 100)}%` } as React.CSSProperties} className="studio-progress-slider w-full" /></div><span className="flex items-center gap-1 text-xs text-white/40"><Headphones size={14} />耳机监听</span><input type="checkbox" checked={monitorInput} onChange={(event) => setMonitorInput(event.target.checked)} className="accent-lime-200" /></div>
+          <div className="mt-4 flex items-center gap-3"><button type="button" onClick={() => void togglePlayback()} className="grid h-11 w-11 place-items-center rounded-full bg-white text-slate-950">{isPlaying ? <Pause size={18} /> : <Play size={18} fill="currentColor" />}</button><button type="button" onClick={() => { engineRef.current?.seek(0); setCurrentTime(0); }} className="grid h-9 w-9 place-items-center rounded-full bg-white/10 text-white/70 hover:bg-white/15" aria-label="回到开头"><Square size={13} /></button><span className="font-mono text-xs text-white/55">{formatTime(currentTime)} / {formatTime(projectDuration)}</span><div className="flex-1"><input aria-label="工作室进度" type="range" min="0" max={Math.max(projectDuration, 1)} step="0.01" value={Math.min(currentTime, projectDuration || 1)} onChange={(event) => { const value = Number(event.target.value); engineRef.current?.seek(value); setCurrentTime(value); }} style={{ "--studio-progress": `${Math.min(100, (currentTime / Math.max(projectDuration, 1)) * 100)}%` } as React.CSSProperties} className="studio-progress-slider w-full" /></div><span className="flex items-center gap-1 text-xs text-white/40"><Headphones size={14} />耳机监听</span><input type="checkbox" checked={monitorInput} onChange={(event) => setMonitorInput(event.target.checked)} className="accent-lime-200" /></div>
         </div>
         <div className="flex min-h-32 shrink-0 gap-5 border-t border-white/10 px-5 py-4">
           <section className="flex min-h-[190px] min-w-0 flex-1 flex-col rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3" aria-label="同步歌词">
@@ -741,11 +777,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
               })}
             </div> : <div className="flex flex-1 items-center rounded-xl bg-white/[0.035] px-4 text-sm font-bold text-white/45">导入伴奏后开始录制，歌词会跟随原曲时间线</div>}
           </section>
-          <div className="w-80 space-y-3">{selectedTrack && <EffectPanel track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} />}<div className="flex items-center gap-2"><div className="relative min-w-0 flex-1"><button type="button" aria-label="麦克风设备" aria-haspopup="menu" aria-expanded={micMenuOpen} onClick={() => { setMicMenuOpen((open) => !open); setProjectMenuOpen(false); }} className="flex w-full items-center justify-between gap-2 rounded-lg bg-white/8 px-2 py-1.5 text-left text-[11px] text-white/70 outline-none transition hover:bg-white/12"><span className="truncate">{micLabel}</span><ChevronDown size={13} className={`shrink-0 transition-transform ${micMenuOpen ? "rotate-180" : ""}`} /></button>{micMenuOpen && <div role="menu" className="absolute bottom-full left-0 z-[100] mb-2 w-full rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl"><button type="button" role="menuitem" onClick={() => { setInputDeviceId("default"); setMicMenuOpen(false); }} className={`w-full rounded-lg px-3 py-2 text-left text-[11px] transition hover:bg-white/10 ${inputDeviceId === "default" ? "bg-white/10 text-white" : "text-white/65"}`}>默认麦克风</button>{devices.map((device) => <button type="button" role="menuitem" key={device.deviceId} onClick={() => { setInputDeviceId(device.deviceId); setMicMenuOpen(false); }} className={`w-full truncate rounded-lg px-3 py-2 text-left text-[11px] transition hover:bg-white/10 ${inputDeviceId === device.deviceId ? "bg-white/10 text-white" : "text-white/65"}`}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</button>)}</div>}</div><button type="button" role="switch" aria-checked={countdownEnabled} onClick={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* storage is optional */ } }} className={`flex h-8 items-center gap-1.5 rounded-lg px-2 text-[10px] font-bold transition ${countdownEnabled ? "bg-lime-200/15 text-lime-100" : "bg-white/8 text-white/45 hover:bg-white/12"}`} title="录音前显示 3 秒倒计时"><span className={`relative h-3.5 w-6 rounded-full transition ${countdownEnabled ? "bg-lime-200/70" : "bg-white/20"}`}><span className={`absolute top-0.5 h-2.5 w-2.5 rounded-full bg-white transition ${countdownEnabled ? "left-3" : "left-0.5"}`} /></span>倒计时</button><button type="button" onClick={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") { setRecordingTrackId(selectedTrack.id); void startRecording(); } else setNcmStatus("请先添加并选择人声轨"); }} className={`grid h-8 w-8 place-items-center rounded-full ${recordingTrackId ? "bg-red-400 text-white" : "bg-white/10 text-white/65 hover:bg-white/15"}`} aria-label={recordingTrackId ? "停止录音" : "准备录音"}>{recordingTrackId ? <Square size={13} fill="currentColor" /> : <Mic2 size={15} />}</button>{recordingTrackId && <button type="button" onClick={stopRecording} className="rounded-lg bg-red-400/20 px-2 py-1 text-[10px] font-bold text-red-100">停止</button>}</div></div>
+          <div className="w-80 space-y-3">{selectedTrack && <EffectPanel track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} onReset={() => resetEffects(selectedTrack.id)} />}<div className="flex items-center gap-2"><div className="relative min-w-0 flex-1"><button type="button" aria-label="麦克风设备" aria-haspopup="menu" aria-expanded={micMenuOpen} onClick={() => { setMicMenuOpen((open) => !open); setProjectMenuOpen(false); }} className="flex w-full items-center justify-between gap-2 rounded-lg bg-white/8 px-2 py-1.5 text-left text-[11px] text-white/70 outline-none transition hover:bg-white/12"><span className="truncate">{micLabel}</span><ChevronDown size={13} className={`shrink-0 transition-transform ${micMenuOpen ? "rotate-180" : ""}`} /></button>{micMenuOpen && <div role="menu" className="absolute bottom-full left-0 z-[100] mb-2 w-full rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl"><button type="button" role="menuitem" onClick={() => { setInputDeviceId("default"); setMicMenuOpen(false); }} className={`w-full rounded-lg px-3 py-2 text-left text-[11px] transition hover:bg-white/10 ${inputDeviceId === "default" ? "bg-white/10 text-white" : "text-white/65"}`}>默认麦克风</button>{devices.map((device) => <button type="button" role="menuitem" key={device.deviceId} onClick={() => { setInputDeviceId(device.deviceId); setMicMenuOpen(false); }} className={`w-full truncate rounded-lg px-3 py-2 text-left text-[11px] transition hover:bg-white/10 ${inputDeviceId === device.deviceId ? "bg-white/10 text-white" : "text-white/65"}`}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</button>)}</div>}</div><div className="min-w-24 rounded-lg bg-black/15 px-2 py-1.5" title={micLevel.clipping ? "输入过载，请降低距离或增益" : "录音时显示麦克风输入电平"}><div className="flex items-center justify-between text-[9px] text-white/40"><span>麦克风</span><span className={micLevel.clipping ? "text-red-200" : micLevel.rms > 0.01 ? "text-lime-100" : "text-white/35"}>{micLevel.clipping ? "过载" : micLevel.rms > 0.01 ? "有声音" : "等待"}</span></div><div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/10"><div className={`h-full rounded-full transition-[width] ${micLevel.clipping ? "bg-red-300" : "bg-lime-200"}`} style={{ width: `${Math.min(100, Math.max(2, micLevel.peak * 100))}%` }} /></div></div><button type="button" role="switch" aria-checked={countdownEnabled} onClick={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* storage is optional */ } }} className={`flex h-8 items-center gap-1.5 rounded-lg px-2 text-[10px] font-bold transition ${countdownEnabled ? "bg-lime-200/15 text-lime-100" : "bg-white/8 text-white/45 hover:bg-white/12"}`} title="录音前显示 3 秒倒计时"><span className={`relative h-3.5 w-6 rounded-full transition ${countdownEnabled ? "bg-lime-200/70" : "bg-white/20"}`}><span className={`absolute top-0.5 h-2.5 w-2.5 rounded-full bg-white transition ${countdownEnabled ? "left-3" : "left-0.5"}`} /></span>倒计时</button><button type="button" onClick={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") { setRecordingTrackId(selectedTrack.id); void startRecording(); } else setNcmStatus("请先添加并选择人声轨"); }} className={`grid h-8 w-8 place-items-center rounded-full ${recordingTrackId ? "bg-red-400 text-white" : "bg-white/10 text-white/65 hover:bg-white/15"}`} aria-label={recordingTrackId ? "停止录音" : "准备录音"}>{recordingTrackId ? <Square size={13} fill="currentColor" /> : <Mic2 size={15} />}</button>{recordingTrackId && <button type="button" onClick={stopRecording} className="rounded-lg bg-red-400/20 px-2 py-1 text-[10px] font-bold text-red-100">停止</button>}</div></div>
         </div>
       </main>
     </div>
     {countdownValue !== null && <div className="pointer-events-none absolute inset-0 z-[200] grid place-items-center bg-slate-950/45 backdrop-blur-[2px]" role="status" aria-live="assertive"><div className="flex flex-col items-center gap-3"><div className="grid h-32 w-32 place-items-center rounded-full border border-lime-200/50 bg-slate-950/80 text-7xl font-black text-lime-100 shadow-[0_0_70px_rgba(190,242,100,.25)] animate-pulse">{countdownValue}</div><span className="rounded-full bg-black/40 px-4 py-1.5 text-xs font-bold tracking-[0.2em] text-white/70">准备录音</span></div></div>}
-    <div className="pointer-events-none absolute -left-[9999px] top-0 h-px w-px overflow-hidden">{currentProject.tracks.map((track) => <TrackAudio key={`${currentProject.id}:${track.id}:${lastAsset(track.assets)?.id ?? "empty"}`} track={track} attach={attachAudio} />)}</div>
   </div>;
 }

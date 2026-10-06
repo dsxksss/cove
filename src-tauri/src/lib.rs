@@ -6126,7 +6126,8 @@ pub fn run() {
             studio_files::studio_load_project,
             studio_files::studio_list_projects,
             studio_files::studio_delete_project,
-            studio_files::studio_export_package,
+            studio_files::studio_export_package_to_file,
+            studio_files::studio_import_package,
             studio_files::studio_save_export,
             studio_files::studio_encode_mp3,
             studio_job_audio

@@ -1,98 +1,221 @@
-import type { StudioEffects } from "../studio/types";
+import type { StudioProject, StudioTrack } from "../studio/types";
 import { createTrackGraph, type TrackGraph } from "./studioDsp";
+import { getClipDuration, getProjectDuration, isTrackAudible } from "./studioSchedule";
 
-type Channel = { element: HTMLAudioElement; startSec: number; source: MediaElementAudioSourceNode; graph: TrackGraph };
+type LoadedAsset = { buffer: AudioBuffer; url: string };
+type ScheduledSource = { source: AudioBufferSourceNode; trackId: string };
+
+/**
+ * Shared realtime transport for a StudioProject. Every clip owns an
+ * AudioBufferSourceNode, so takes, offsets and trims have the same semantics
+ * as the offline renderer.
+ */
 export class StudioAudioEngine {
   readonly context = new AudioContext();
   private readonly analyser = this.context.createAnalyser();
-  private channels = new Map<string, Channel>();
-  private sources = new WeakMap<HTMLAudioElement, MediaElementAudioSourceNode>();
-  private startTime = 0;
+  private project: StudioProject | null = null;
+  private graphs = new Map<string, TrackGraph>();
+  private loaded = new Map<string, LoadedAsset>();
+  private sources: ScheduledSource[] = [];
+  private loadRevision = 0;
+  private structureKey = "";
+  private startContextTime = 0;
   private position = 0;
   private playing = false;
-  private pendingStarts = new Map<string, ReturnType<typeof setTimeout>>();
+  private transportRevision = 0;
+
   constructor() {
     this.analyser.fftSize = 512;
     this.analyser.smoothingTimeConstant = 0.82;
     this.analyser.connect(this.context.destination);
   }
-  attach(id: string, element: HTMLAudioElement, startSec = 0): void {
-    const previous = this.channels.get(id);
-    if (previous?.element === element) { previous.startSec = Math.max(0, startSec); return; }
-    this.detach(id);
-    const graph = createTrackGraph(this.context, this.analyser);
-    const source = this.sources.get(element) ?? this.context.createMediaElementSource(element);
-    this.sources.set(element, source);
-    this.channels.set(id, { element, startSec: Math.max(0, startSec), source, graph });
-    source.connect(graph.input);
-  }
-  detach(id: string): void {
-    const channel = this.channels.get(id);
-    if (!channel) return;
-    channel.element.pause();
-    channel.source.disconnect();
-    channel.graph.dispose();
-    this.channels.delete(id);
-    const timer = this.pendingStarts.get(id);
-    if (timer !== undefined) clearTimeout(timer);
-    this.pendingStarts.delete(id);
-  }
+
   get currentTime(): number {
-    return this.position + (this.playing ? this.context.currentTime - this.startTime : 0);
+    if (!this.playing) return this.position;
+    return Math.max(0, this.position + Math.max(0, this.context.currentTime - this.startContextTime));
   }
-  update(id: string, mixer: { gain: number; pan: number; mute: boolean; solo?: boolean }, effects: StudioEffects): void {
-    const channel = this.channels.get(id); if (!channel) return;
-    channel.graph.update({ id, name: id, kind: "vocal", color: "", clips: [], takes: [], assets: [], mixer: { ...mixer, pan: mixer.pan, solo: mixer.solo ?? false, armed: false }, effects }, false);
-  }
-  updateAll(tracks: Array<{ id: string; mixer: { gain: number; pan: number; mute: boolean; solo: boolean }; effects: StudioEffects }>) {
-    const hasSolo = tracks.some(t => t.mixer.solo);
-    for (const track of tracks) this.channels.get(track.id)?.graph.update({ id: track.id, name: track.id, kind: "vocal", color: "", clips: [], takes: [], assets: [], mixer: { ...track.mixer, armed: false }, effects: track.effects }, hasSolo);
-  }
-  async play(time: number): Promise<void> {
-    // Start the media elements in the click task before awaiting the context.
-    // Waiting for resume first can consume the browser's user-activation and
-    // make HTMLMediaElement.play() silently reject on the first click.
+
+  get isPlaying(): boolean { return this.playing; }
+
+  /** Loads a project and its assets. A newer call invalidates older decode work. */
+  async setProject(project: StudioProject): Promise<void> {
+    const wasPlaying = this.playing;
+    const resumeAt = this.currentTime;
+    const previousProjectId = this.project?.id;
+    const nextKey = projectStructureKey(project);
+    const sameStructure = this.project?.id === project.id && this.structureKey === nextKey;
+    this.project = project;
+    if (sameStructure) {
+      this.updateAll(project.tracks);
+      return;
+    }
+
+    const revision = ++this.loadRevision;
     this.pause();
-    if (!this.channels.size) throw new Error("音频尚未准备好，请等待导入完成");
-    this.position = time;
-    this.startTime = this.context.currentTime;
-    this.playing = true;
-    const resume = this.context.resume();
-    const pending: Promise<void>[] = [];
-    for (const [id, c] of this.channels) {
-      if (time < c.startSec) {
-        c.element.pause();
-        this.pendingStarts.set(id, setTimeout(() => {
-          this.pendingStarts.delete(id);
-          if (this.playing && this.channels.get(id) === c) {
-            c.element.currentTime = Math.max(0, this.currentTime - c.startSec);
-            void c.element.play().catch(() => this.pause());
-          }
-        }, (c.startSec - time) * 1000));
-      } else {
-        c.element.currentTime = Math.max(0, time - c.startSec);
-        pending.push(c.element.play());
+    const pauseRevision = this.transportRevision;
+    this.clearGraphs();
+    if (previousProjectId !== project.id) this.loaded.clear();
+    const requestedUrls = new Map(project.tracks.flatMap((track) => track.assets.map((asset) => [asset.id, asset.url] as const)));
+    for (const [id, loaded] of this.loaded) if (requestedUrls.get(id) !== loaded.url) this.loaded.delete(id);
+    this.structureKey = nextKey;
+    this.updateGraphs(project.tracks);
+
+    const requested = new Map<string, { id: string; url: string }>();
+    for (const track of project.tracks) {
+      for (const asset of track.assets) {
+        if (!asset.url || requested.has(asset.id)) continue;
+        requested.set(asset.id, { id: asset.id, url: asset.url });
       }
     }
-    try { await resume; await Promise.all(pending); }
-    catch (error) { this.pause(); throw error; }
+    await Promise.all([...requested.values()].map(async ({ id, url }) => {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`无法读取音频资产：${response.status}`);
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = await this.context.decodeAudioData(arrayBuffer.slice(0));
+        if (revision === this.loadRevision && this.project?.id === project.id) this.loaded.set(id, { buffer, url });
+      } catch {
+        // Missing assets are skipped deliberately. Never substitute another
+        // asset from the same track, since that makes takes play incorrectly.
+      }
+    }));
+    if (revision !== this.loadRevision || this.project?.id !== project.id) return;
+    this.position = Math.min(this.position, getProjectDuration(project));
+    if (wasPlaying && pauseRevision === this.transportRevision) await this.play(Math.min(resumeAt, getProjectDuration(project)), true);
   }
+
+  /** Applies mixer/effect changes without rebuilding scheduled sources. */
+  updateAll(tracks: Array<Pick<StudioTrack, "id" | "mixer" | "effects">>): void {
+    const hasSolo = tracks.some((track) => track.mixer.solo);
+    for (const track of tracks) this.graphs.get(track.id)?.update(track as StudioTrack, hasSolo);
+  }
+
+  private updateGraphs(tracks: StudioTrack[]): void {
+    const hasSolo = tracks.some((track) => track.mixer.solo);
+    const ids = new Set(tracks.map((track) => track.id));
+    for (const [id, graph] of this.graphs) {
+      if (!ids.has(id)) { graph.dispose(); this.graphs.delete(id); }
+    }
+    for (const track of tracks) {
+      const graph = this.graphs.get(track.id) ?? createTrackGraph(this.context, this.analyser);
+      this.graphs.set(track.id, graph);
+      graph.update(track, hasSolo);
+    }
+  }
+
+  private clearGraphs(): void {
+    for (const graph of this.graphs.values()) graph.dispose();
+    this.graphs.clear();
+  }
+
+  private clearSources(): void {
+    for (const item of this.sources) {
+      try { item.source.stop(); } catch { /* already stopped */ }
+      item.source.disconnect();
+    }
+    this.sources = [];
+  }
+
+  async play(time: number, allowEmpty = false): Promise<void> {
+    this.pause();
+    const transportRevision = this.transportRevision;
+    const startPosition = Number.isFinite(time) ? Math.max(0, time) : 0;
+    const project = this.project;
+    if (!project) {
+      if (!allowEmpty) throw new Error("音频尚未准备好，请等待导入完成");
+      this.position = startPosition;
+      this.startContextTime = this.context.currentTime;
+      this.playing = true;
+      await this.context.resume();
+      if (transportRevision !== this.transportRevision) return;
+      return;
+    }
+    const hasSolo = project.tracks.some((track) => track.mixer.solo);
+    const scheduled = this.buildSources(project, startPosition, hasSolo);
+    if (!allowEmpty && scheduled.length === 0) throw new Error("音频尚未准备好，请等待导入完成");
+    this.position = startPosition;
+    const resume = this.context.resume();
+    const origin = this.context.currentTime + 0.015;
+    this.startContextTime = origin;
+    this.playing = true;
+    try {
+      await resume;
+      if (transportRevision !== this.transportRevision || !this.playing) {
+        for (const item of scheduled) {
+          try { item.source.stop(); } catch { /* not started */ }
+          item.source.disconnect();
+        }
+        return;
+      }
+      for (const item of scheduled) {
+        item.source.start(item.when, item.offset, item.duration);
+        this.sources.push({ source: item.source, trackId: item.trackId });
+      }
+    } catch (error) {
+      this.pause();
+      throw error;
+    }
+  }
+
+  private buildSources(project: StudioProject, time: number, hasSolo: boolean): Array<{ source: AudioBufferSourceNode; trackId: string; when: number; offset: number; duration: number }> {
+    const result: Array<{ source: AudioBufferSourceNode; trackId: string; when: number; offset: number; duration: number }> = [];
+    const origin = this.context.currentTime + 0.015;
+    for (const track of project.tracks) {
+      if (!isTrackAudible(track, hasSolo)) continue;
+      const graph = this.graphs.get(track.id);
+      if (!graph) continue;
+      for (const clip of track.clips) {
+        const asset = track.assets.find((candidate) => candidate.id === clip.assetId);
+        const loaded = asset ? this.loaded.get(asset.id) : undefined;
+        if (!asset || !loaded) continue;
+        const clipStart = Math.max(0, Number.isFinite(clip.startSec) ? clip.startSec : 0);
+        const offset = Math.max(0, Number.isFinite(clip.offsetSec) ? clip.offsetSec : 0);
+        const duration = getClipDuration(clip, { durationSec: loaded.buffer.duration });
+        if (duration <= 0 || clipStart + duration <= time) continue;
+        const elapsed = Math.max(0, time - clipStart);
+        const source = this.context.createBufferSource();
+        source.buffer = loaded.buffer;
+        source.connect(graph.input);
+        result.push({ source, trackId: track.id, when: origin + Math.max(0, clipStart - time), offset: Math.min(loaded.buffer.duration, offset + elapsed), duration: Math.max(0.001, duration - elapsed) });
+      }
+    }
+    return result;
+  }
+
   pause(): void {
-    this.position = this.currentTime;
+    this.transportRevision += 1;
+    if (this.playing) this.position = this.currentTime;
     this.playing = false;
-    for (const timer of this.pendingStarts.values()) clearTimeout(timer);
-    this.pendingStarts.clear();
-    for (const c of this.channels.values()) c.element.pause();
+    this.clearSources();
   }
+
   seek(time: number): void {
-    if (this.playing) { void this.play(time).catch(() => undefined); return; }
-    this.position = time;
-    for (const c of this.channels.values()) c.element.currentTime = Math.max(0, time - c.startSec);
+    const next = Math.max(0, Number.isFinite(time) ? time : 0);
+    if (this.playing) { void this.play(next, true).catch(() => undefined); return; }
+    this.position = next;
   }
+
   waveform(): Uint8Array {
     const data = new Uint8Array(this.analyser.frequencyBinCount);
     this.analyser.getByteTimeDomainData(data);
     return data;
   }
-  dispose(): void { this.pause(); for (const id of this.channels.keys()) this.detach(id); this.analyser.disconnect(); void this.context.close(); }
+
+  dispose(): void {
+    ++this.loadRevision;
+    this.pause();
+    this.clearGraphs();
+    this.loaded.clear();
+    this.project = null;
+    this.analyser.disconnect();
+    void this.context.close();
+  }
+}
+
+function projectStructureKey(project: StudioProject): string {
+  return JSON.stringify(project.tracks.map((track) => ({
+    id: track.id,
+    assets: track.assets.map((asset) => [asset.id, asset.url]),
+    clips: track.clips.map((clip) => [clip.id, clip.assetId, clip.startSec, clip.offsetSec, clip.durationSec]),
+  })));
 }
