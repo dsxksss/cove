@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+/* Native window dragging: sound continues; decorative CSS animation waits. */
+.is-window-interacting *,
+.is-window-interacting *::before,
+.is-window-interacting *::after {
+  animation-play-state: paused !important;
+}
+
 @theme {
   --font-sans: "Segoe UI Variable", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
@@ -24,6 +31,15 @@
   [data-tauri-drag-region] {
     -webkit-app-region: drag;
     app-region: drag;
+  }
+  .studio-latency-input {
+    appearance: none;
+    -moz-appearance: textfield;
+  }
+  .studio-latency-input::-webkit-inner-spin-button,
+  .studio-latency-input::-webkit-outer-spin-button {
+    appearance: none;
+    margin: 0;
   }
   /* interactive children opt back out of dragging */
   button,
@@ -105,9 +121,10 @@ body *::after {
 }
 
 .app-window-frame {
+  --window-radius: 8px;
   isolation: isolate;
   background: transparent;
-  border-radius: 20px;
+  border-radius: var(--window-radius);
   --app-glass-radius: 20px;
   --app-glass-line: rgba(255, 255, 255, 0.13);
   --app-glass-line-strong: rgba(255, 255, 255, 0.24);
@@ -238,12 +255,35 @@ body *::after {
   border: 1px solid transparent;
   transform: none;
   contain: layout paint style;
+  isolation: auto;
+  transition: none !important;
 }
 
 .app-liquid-row:hover {
   border-color: rgba(255, 255, 255, 0.075);
-  background: linear-gradient(100deg, rgba(255, 255, 255, 0.095), rgba(255, 255, 255, 0.035));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.055);
+  box-shadow: none;
+}
+
+/* The live queue is interacted with while the pointer is usually over a row.
+   Keep its controls and surface stable so a wheel fling cannot repeatedly
+   toggle hover opacity/paint state under the cursor. */
+.queue-mode .app-liquid-row:hover {
+  border-color: transparent !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.queue-mode .intent-controls {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  transform: none !important;
+  transition: none !important;
+}
+
+.queue-mode .intent-hint {
+  opacity: 0.9 !important;
+  transition: none !important;
 }
 
 .app-liquid-row.is-active {
@@ -252,6 +292,30 @@ body *::after {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.22),
     0 12px 30px -24px rgba(0, 0, 0, 0.72);
+}
+
+/* Pointer movement over rows is otherwise expensive during a fling: every
+   row crossing starts a gradient/shadow and action-control transition while
+   the virtual window is being replaced. Freeze decorative hover work until
+   scrolling settles; clicks and the active-row state remain available. */
+.is-scrolling .app-liquid-row {
+  transition: none !important;
+}
+
+.is-scrolling .app-liquid-row:hover {
+  box-shadow: none !important;
+}
+
+.is-scrolling .app-liquid-row:not(.is-active):hover {
+  border-color: transparent !important;
+  background: transparent !important;
+}
+
+.is-scrolling .intent-controls {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transform: none !important;
+  transition: none !important;
 }
 
 /* Intent-based controls: keep content calm until the row/card is engaged.
@@ -696,6 +760,58 @@ body *::after {
     opacity 0.15s ease,
     transform 0.22s cubic-bezier(0.34, 1.4, 0.64, 1);
   pointer-events: none;
+}
+
+/* Studio transport seek control: a larger, obvious handle is easier to grab
+   when recording while preserving native keyboard/range semantics. */
+.studio-progress-slider {
+  --studio-progress: 0%;
+  appearance: none;
+  height: 28px;
+  /* Keep the larger hit area without shifting the visual rail away from the
+     play button and time readout. */
+  margin: 0;
+  cursor: pointer;
+  background: transparent;
+  outline: none;
+}
+.studio-progress-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(to right, #d9f99d 0 var(--studio-progress), rgba(255, 255, 255, 0.25) var(--studio-progress) 100%);
+}
+.studio-progress-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -4px;
+  border: 2px solid #ecfccb;
+  border-radius: 50%;
+  background: #d9f99d;
+  box-shadow: none;
+  transition: transform 120ms ease;
+}
+.studio-progress-slider:hover::-webkit-slider-thumb,
+.studio-progress-slider:focus-visible::-webkit-slider-thumb {
+  transform: scale(1.2);
+}
+.studio-progress-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(to right, #d9f99d 0 var(--studio-progress), rgba(255, 255, 255, 0.25) var(--studio-progress) 100%);
+}
+.studio-progress-slider::-moz-range-progress {
+  height: 6px;
+  border-radius: 999px;
+  background: #d9f99d;
+}
+.studio-progress-slider::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: 2px solid #ecfccb;
+  border-radius: 50%;
+  background: #d9f99d;
+  box-shadow: none;
 }
 
 .motion-pop .progress-track:hover,

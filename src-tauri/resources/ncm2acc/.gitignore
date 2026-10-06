@@ -1,0 +1,5 @@
+.venv/
+models/
+python/
+audio-separator.exe
+ffmpeg.exe

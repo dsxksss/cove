@@ -67,7 +67,7 @@ export async function searchMusic(
   if (source === "qq") {
     const env = await invokeNative<{ data?: any[] }>("qq_search", {
       args: { keyword: kw, limit },
-    });
+    }, signal);
     return (env.data ?? []).map((s) => ({
       id: Number(s.id),
       name: String(s.name ?? "未知歌曲"),
@@ -85,7 +85,7 @@ export async function searchMusic(
   // kugou
   const env = await invokeNative<{ data?: any[] }>("kugou_search", {
     args: { keyword: kw, limit },
-  });
+  }, signal);
   return (env.data ?? []).map((s) => ({
     id: Number(s.id),
     name: String(s.name ?? "未知歌曲"),
@@ -175,6 +175,9 @@ async function resolvePlaybackUncached(
     const env = await invokeNative<{
       data?: {
         url?: string | null;
+        name?: string;
+        artist?: string;
+        pic?: string;
         level?: string;
         quality_name?: string;
         error?: string;
@@ -195,10 +198,10 @@ async function resolvePlaybackUncached(
     return {
       url,
       meta: {
-        name: song.name,
-        ar_name: song.artist,
+        name: env.data?.name ?? song.name,
+        ar_name: env.data?.artist ?? song.artist,
         al_name: song.album,
-        pic: song.pic,
+        pic: env.data?.pic ?? song.pic,
         lyric: "",
         tlyric: "",
         lyric_source: "qq",

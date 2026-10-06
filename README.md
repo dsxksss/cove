@@ -5,6 +5,8 @@
 基于 **Tauri 2 + React 18 + Tailwind CSS v4 + Zustand + Motion** 构建。
 网易云音频源可使用内置接口或 [Suxiaoqinx/Netease_url](https://github.com/Suxiaoqinx/Netease_url) 自托管服务。
 
+搜索与歌单的数据流、已修复问题和回归方法见 [搜索与歌单逻辑检查](docs/search-playlist-review.md)。
+
 ---
 
 ## ✨ 功能
@@ -19,6 +21,7 @@
 - ⚙️ 设置：API 地址、音质档位
 - ⌨️ 键盘快捷键（见下）
 - 🪟 无边框自定义窗口 + 系统托盘（关闭转最小化）
+- 🎙️ 翻唱工作室：伴奏导入 / `.ncm` 分离任务、多个人声轨、takes、歌词时间线、基础 EQ 与离线 WAV 混音
 
 ---
 
@@ -129,6 +132,14 @@ src-tauri/                    Rust 后端
 | 歌词+封面+URL | `GET /song?id=&type=json` | `data.{name,pic,lyric,tlyric,url}` |
 
 音质档位：`standard` `exhigh` `lossless` `hires` `jyeffect`（高音质需会员 cookie）。
+
+## 🎙️ 翻唱工作室
+
+播放网易云歌曲后，点击歌曲信息旁的麦克风按钮即可进入工作室。工作室会保留当前歌曲的封面、歌词和时间线，支持导入伴奏、添加人声轨、重复录制 takes、麦克风选择、耳机监听、音量/声像、EQ、压缩、混响、延迟和 WAV/MP3 离线混音。录音使用 AudioWorklet 捕获 PCM，录音会按输入延迟放回共享时间线；工程自动写入 `%APPDATA%/Netease Music Player/StudioProjects/<id>`，原始媒体不上传。工程可重新打开、删除并导出为 `.cove-studio` 工程包。
+
+伴奏任务通过 `studio_prepare_instrumental` 调用本地 runner。默认可以直接点击“自动下载当前歌曲并生成伴奏”，应用会用当前网易云歌曲 ID 获取可播放音频，下载到临时目录后交给 audio-separator；手动 `.ncm` 仍走 `ncm2acc` 解密流程。发布包需要把固定版本的 `ncm2acc`、`ncmdump-go.exe`、FFmpeg、Python/audio-separator 运行时和模型放进 `resources/ncm2acc`；源代码中的 `tools/ncm2acc/runner.py` 负责 JSON 行协议和单文件任务编排。原始 `.ncm` 文件不会被移动或删除。
+
+完整操作步骤见 [翻唱工作室使用说明](docs/cover-studio-guide.md)。
 
 ---
 

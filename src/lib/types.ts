@@ -29,6 +29,10 @@ export interface Song {
   kgResHash?: string;
   /** optional album mid / extra ids */
   albumId?: string;
+  /** Local rendered audio used by the cover studio's player handoff. */
+  localAudioUrl?: string;
+  /** Keep the studio timeline lyrics when a rendered mix is played locally. */
+  localLyrics?: LyricLine[];
 }
 
 export interface PlaylistSummary {

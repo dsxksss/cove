@@ -28,13 +28,13 @@ interface SearchEnvelope {
 export async function search(
   keyword: string,
   limit = 30,
-  _signal?: AbortSignal
+  signal?: AbortSignal
 ): Promise<Song[]> {
   const kw = keyword.trim();
   if (!kw) return [];
   const env = await invokeNative<SearchEnvelope>("netease_search", {
     args: { keyword: kw, limit },
-  });
+  }, signal);
   const list: any[] =
     env.data && Array.isArray(env.data)
       ? env.data
@@ -94,6 +94,37 @@ interface PlaylistPage {
   offset: number;
 }
 
+/**
+ * Collect every page of a playlist while keeping a small request concurrency.
+ * The collection UI is virtualized, so loading all tracks here does not mean
+ * mounting all rows; it only removes network work from the scroll path.
+ */
+async function collectPlaylistPages(
+  first: PlaylistPage,
+  pageSize: number,
+  fetchPage: (page: number) => Promise<PlaylistPage>,
+): Promise<PlaylistPage> {
+  const total = Math.max(first.total || 0, first.songs.length);
+  const pageCount = Math.ceil(total / pageSize);
+  if (pageCount <= 1) return { ...first, total };
+
+  const pages: PlaylistPage[] = new Array(pageCount - 1);
+  let nextPage = 2;
+  const worker = async () => {
+    while (true) {
+      const page = nextPage++;
+      if (page > pageCount) return;
+      pages[page - 2] = await fetchPage(page);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, pageCount - 1) }, worker));
+  return {
+    songs: [first, ...pages].flatMap((page) => page.songs),
+    total,
+    offset: 0,
+  };
+}
+
 export type { PlaylistSummary };
 
 function mapTracks(tracks: any[]): Song[] {
@@ -107,9 +138,7 @@ function mapTracks(tracks: any[]): Song[] {
   }));
 }
 
-/** Fetch a playlist page (limit/offset). Server-side pagination is far faster
- *  than fetching all tracks of a large playlist (1786 songs ~12s → 1.4s for 100).
- *  Returns {songs, total, offset}. */
+/** Fetch one server-side playlist page. Returns {songs, total, offset}. */
 export async function getPlaylistPage(
   id: number,
   limit: number,
@@ -126,6 +155,18 @@ export async function getPlaylistPage(
     total: pl?.trackTotal ?? tracks.length,
     offset: pl?.trackOffset ?? offset,
   };
+}
+
+/** Fetch all tracks of a NetEase playlist before displaying it. */
+export async function getAllPlaylistSongs(
+  id: number,
+  pageSize = 100,
+  signal?: AbortSignal,
+): Promise<PlaylistPage> {
+  const first = await getPlaylistPage(id, pageSize, 0, signal);
+  return collectPlaylistPages(first, pageSize, (page) =>
+    getPlaylistPage(id, pageSize, (page - 1) * pageSize, signal),
+  );
 }
 
 function mapPlaylist(raw: any, ownerUid: number): PlaylistSummary {
@@ -211,6 +252,26 @@ export async function getKugouPlaylistPage(
   };
 }
 
+/** Fetch all tracks of a Kugou playlist before displaying it. */
+export async function getAllKugouPlaylistSongs(
+  listid: number,
+  opts?: { globalCollectionId?: string; pagesize?: number },
+): Promise<PlaylistPage> {
+  const pagesize = opts?.pagesize ?? 50;
+  const first = await getKugouPlaylistPage(listid, {
+    globalCollectionId: opts?.globalCollectionId,
+    page: 1,
+    pagesize,
+  });
+  return collectPlaylistPages(first, pagesize, (page) =>
+    getKugouPlaylistPage(listid, {
+      globalCollectionId: opts?.globalCollectionId,
+      page,
+      pagesize,
+    }),
+  );
+}
+
 /** QQ Music account playlists (requires QQ QR → y.qq.com session). */
 export async function getQqUserPlaylists(): Promise<PlaylistSummary[]> {
   const env = await invokeNative<UserPlaylistsEnvelope>("qq_user_playlists");
@@ -255,6 +316,18 @@ export async function getQqPlaylistPage(
     total: pl?.trackTotal ?? songs.length,
     offset: pl?.trackOffset ?? (page - 1) * pagesize,
   };
+}
+
+/** Fetch all tracks of a QQ playlist before displaying it. */
+export async function getAllQqPlaylistSongs(
+  disstid: number,
+  opts?: { pagesize?: number },
+): Promise<PlaylistPage> {
+  const pagesize = opts?.pagesize ?? 50;
+  const first = await getQqPlaylistPage(disstid, { page: 1, pagesize });
+  return collectPlaylistPages(first, pagesize, (page) =>
+    getQqPlaylistPage(disstid, { page, pagesize }),
+  );
 }
 
 /** Stable key to avoid ID collisions across platforms. */

@@ -30,17 +30,20 @@ import {
   LogIn,
   Plus,
   Trash2,
-  GripVertical,
-  MoreHorizontal,
   ListPlus,
   Pencil,
   Check,
+  Mic2,
 } from "lucide-react";
 import GlassPlayer from "./components/GlassPlayer";
+import StudioWorkspace from "./components/StudioWorkspace";
 import { ToastHost } from "./components/ToastHost";
 import type { LyricMotionStyle, PlayerLayout, Song as PlayerSong } from "./components/playerTypes";
 import { getAudio } from "./lib/audio";
+import { CollectionSongVirtualList } from "./components/CollectionSongVirtualList";
+import { SearchOverlay } from "./components/SearchOverlay";
 import { useAudioEngine } from "./hooks/useAudioEngine";
+import { useDesktopBlur } from "./hooks/useDesktopBlur";
 import { usePlayerStore } from "./store/playerStore";
 import {
   loadMotionLevel,
@@ -52,10 +55,10 @@ import {
   getFavPlaylistId,
   setFavPlaylistId,
   getUserPlaylists,
+  getSongMetadata,
   getKugouUserPlaylists,
-  getKugouPlaylistPage,
   getQqUserPlaylists,
-  getQqPlaylistPage,
+  getAllQqPlaylistSongs,
   type PlaylistSummary,
   type LoginStatus,
 } from "./lib/api";
@@ -69,6 +72,7 @@ import {
   type MultiAuthStatus,
 } from "./lib/auth";
 import { toPlayerSong } from "./lib/adapter";
+import { resolvePlayback } from "./lib/musicSources";
 import { minimizeWindow, closeWindow } from "./lib/tauri";
 import type { Song } from "./lib/types";
 import {
@@ -76,16 +80,7 @@ import {
   saveLyricSourceMode,
   type LyricSourceMode,
 } from "./lib/lyrics/matchLyrics";
-import {
-  loadMusicSource,
-  getSongKey,
-  MUSIC_SOURCE_OPTIONS,
-  saveMusicSource,
-  sameSong,
-  searchMusic,
-} from "./lib/musicSources";
 import { pickQqFavoritesPlaylist } from "./lib/defaultPlaylist";
-import type { MusicSource } from "./lib/types";
 import {
   addSongToAppPlaylist,
   createAppPlaylist,
@@ -99,8 +94,8 @@ import {
   type AppPlaylist,
 } from "./lib/appPlaylists";
 import { toast } from "./store/toastStore";
-import { getVirtualListRange } from "./lib/virtualList";
 import { getCoverFlowRange } from "./lib/coverFlow";
+import { createStudioProject, type StudioProject } from "./studio/types";
 
 const LoginPanel = lazy(() =>
   import("./components/LoginPanel").then((module) => ({ default: module.LoginPanel })),
@@ -237,6 +232,7 @@ function saveShowTranslation(value: boolean) {
 
 export default function App() {
   useAudioEngine();
+  const desktopBlur = useDesktopBlur();
 
   // ---- data layer (Zustand) ----
   const queue = usePlayerStore((s) => s.queue);
@@ -265,14 +261,12 @@ export default function App() {
   const playlistLoaded = usePlayerStore((s) => s.playlistLoaded);
   const playlistTotal = usePlayerStore((s) => s.playlistTotal);
   const playlistLoadingMore = usePlayerStore((s) => s.playlistLoadingMore);
-  const loadMorePlaylist = usePlayerStore((s) => s.loadMorePlaylist);
   const browseList = usePlayerStore((s) => s.browseList);
   const browsePlaylistId = usePlayerStore((s) => s.browsePlaylistId);
   const browseTotal = usePlayerStore((s) => s.browseTotal);
   const browseLoaded = usePlayerStore((s) => s.browseLoaded);
   const browseLoadingMore = usePlayerStore((s) => s.browseLoadingMore);
   const browsePlaylist = usePlayerStore((s) => s.browsePlaylist);
-  const browseMore = usePlayerStore((s) => s.browseMore);
   const clearBrowse = usePlayerStore((s) => s.clearBrowse);
   const playFromPlaylist = usePlayerStore((s) => s.playFromPlaylist);
   const playNext = usePlayerStore((s) => s.playNext);
@@ -321,6 +315,13 @@ export default function App() {
   const appPlaylistsRef = useRef(appPlaylists);
   const [activeAppPlaylistId, setActiveAppPlaylistId] = useState<string | null>(null);
   const [songActionTarget, setSongActionTarget] = useState<Song | null>(null);
+  const [studioOpen, setStudioOpen] = useState(false);
+  const [studioProject, setStudioProject] = useState<StudioProject | null>(null);
+  const studioPlayerUrlRef = useRef<string | null>(null);
+
+  useEffect(() => () => {
+    if (studioPlayerUrlRef.current) URL.revokeObjectURL(studioPlayerUrlRef.current);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -377,9 +378,7 @@ export default function App() {
     })();
   }, []);
 
-  /** Currently opened playlist meta (for multi-source browse / load-more). */
-  const browsingPlRef = useRef<PlaylistSummary | null>(null);
-  const playlistBrowseGenerationRef = useRef(0);
+  /** Prevent overlapping QQ startup queue loads. */
   const qqDefaultQueueLoadingRef = useRef(false);
 
   const refreshAccountPlaylists = useCallback(async (uid = loginStatus?.uid) => {
@@ -456,7 +455,7 @@ export default function App() {
 
     const tryLoad = async (attempt: number) => {
       try {
-        const page = await getQqPlaylistPage(disstid, { page: 1, pagesize: 50 });
+        const page = await getAllQqPlaylistSongs(disstid, { pagesize: 50 });
         if (cancelled || usePlayerStore.getState().queue.length > 0) return;
         if (page.songs.length === 0) throw new Error("QQ 我喜欢歌单为空");
 
@@ -680,93 +679,10 @@ export default function App() {
     toast(`已将「${song.name}」设为下一首`, { tone: "success" });
   }, [playNext]);
 
-  /** Browse a playlist's songs for viewing WITHOUT disturbing playback. */
+  /** All platforms share the store's request generation and browse state. */
   const handleBrowsePlaylist = useCallback(
-    (pl: PlaylistSummary) => {
-      const playlistId = pl.id;
-      const src = pl.source ?? "netease";
-      const state = usePlayerStore.getState();
-      // Skip only if already showing this exact platform playlist with data.
-      if (
-        state.browsePlaylistId === playlistId &&
-        state.browseSource === src &&
-        state.browseList.length > 0 &&
-        !state.browseLoadingMore
-      ) {
-        return;
-      }
-      const browseGeneration = ++playlistBrowseGenerationRef.current;
-      browsingPlRef.current = pl;
-
-      if (src === "kugou" || src === "qq") {
-        void (async () => {
-          usePlayerStore.setState({
-            browseList: [],
-            browsePlaylistId: playlistId,
-            browseSource: src,
-            browseTotal: pl.trackCount || 0,
-            browseLoaded: 0,
-            browseLoadingMore: true,
-            error: null,
-          });
-          try {
-            const page =
-              src === "kugou"
-                ? await getKugouPlaylistPage(
-                    pl.kgListId && pl.kgListId > 0 ? pl.kgListId : pl.id,
-                    {
-                      globalCollectionId: pl.kgGlobalId || undefined,
-                      page: 1,
-                      pagesize: 50,
-                    }
-                  )
-                : await getQqPlaylistPage(pl.qqDissTid && pl.qqDissTid > 0 ? pl.qqDissTid : pl.id, {
-                    page: 1,
-                    pagesize: 50,
-                  });
-            // Ignore stale responses if user switched playlist while loading.
-            if (
-              browseGeneration !== playlistBrowseGenerationRef.current ||
-              browsingPlRef.current?.id !== playlistId ||
-              (browsingPlRef.current.source ?? "netease") !== src
-            ) return;
-            usePlayerStore.setState({
-              browseList: page.songs,
-              browsePlaylistId: playlistId,
-              browseSource: src,
-              browseTotal: page.total || page.songs.length,
-              browseLoaded: page.songs.length,
-              browseLoadingMore: false,
-              error:
-                page.songs.length === 0
-                  ? `${AUTH_PLATFORM_LABEL[src]}歌单「${pl.name}」暂无歌曲或接口未返回`
-                  : null,
-            });
-          } catch (e: any) {
-            console.warn(`[playlists] ${src} browse failed`, e);
-            if (
-              browseGeneration !== playlistBrowseGenerationRef.current ||
-              browsingPlRef.current?.id !== playlistId ||
-              (browsingPlRef.current.source ?? "netease") !== src
-            ) return;
-            usePlayerStore.setState({
-              browseList: [],
-              browsePlaylistId: playlistId,
-              browseSource: src,
-              browseTotal: 0,
-              browseLoaded: 0,
-              browseLoadingMore: false,
-              error: e?.message
-                ? `加载${AUTH_PLATFORM_LABEL[src]}歌单失败：${e.message}`
-                : `加载${AUTH_PLATFORM_LABEL[src]}歌单失败`,
-            });
-          }
-        })();
-        return;
-      }
-      void browsePlaylist(playlistId, src);
-    },
-    [browsePlaylist]
+    (playlist: PlaylistSummary) => { void browsePlaylist(playlist); },
+    [browsePlaylist],
   );
 
   /** Play a song from the browse list: commit its playlist as the live queue
@@ -789,63 +705,6 @@ export default function App() {
     setQueueOpen(false);
     setPlaylistsOpen(false);
   }, []);
-
-  const handleBrowseMore = useCallback(() => {
-    const state = usePlayerStore.getState();
-    const pid = state.browsePlaylistId;
-    if (pid == null || state.browseLoadingMore) return;
-    if (state.browseLoaded >= state.browseTotal && state.browseTotal > 0) return;
-    const pl =
-      browsingPlRef.current && browsingPlRef.current.id === pid
-        ? browsingPlRef.current
-        : accountPlaylists.find((p) => p.id === pid);
-    const src = pl?.source ?? "netease";
-    if (pl && (src === "kugou" || src === "qq")) {
-      const browseGeneration = playlistBrowseGenerationRef.current;
-      void (async () => {
-        usePlayerStore.setState({ browseLoadingMore: true });
-        try {
-          const nextPage = Math.floor(state.browseLoaded / 50) + 1;
-          const page =
-            src === "kugou"
-              ? await getKugouPlaylistPage(
-                  pl.kgListId && pl.kgListId > 0 ? pl.kgListId : pl.id,
-                  {
-                    globalCollectionId: pl.kgGlobalId || undefined,
-                    page: nextPage,
-                    pagesize: 50,
-                  }
-                )
-              : await getQqPlaylistPage(
-                  pl.qqDissTid && pl.qqDissTid > 0 ? pl.qqDissTid : pl.id,
-                  { page: nextPage, pagesize: 50 }
-                );
-          const cur = usePlayerStore.getState();
-          if (
-            browseGeneration !== playlistBrowseGenerationRef.current ||
-            cur.browsePlaylistId !== pid ||
-            cur.browseSource !== src
-          ) return;
-          usePlayerStore.setState({
-            browseList: [...cur.browseList, ...page.songs],
-            browseLoaded: cur.browseLoaded + page.songs.length,
-            browseLoadingMore: false,
-            browseTotal: page.total || cur.browseTotal,
-          });
-        } catch {
-          if (browseGeneration === playlistBrowseGenerationRef.current) {
-            usePlayerStore.setState({ browseLoadingMore: false });
-          }
-        }
-      })();
-      return;
-    }
-    void browseMore();
-  }, [accountPlaylists, browseMore]);
-
-  const handleLoadMoreQueue = useCallback(() => {
-    void loadMorePlaylist();
-  }, [loadMorePlaylist]);
 
   const handleRefreshPlaylists = useCallback(() => {
     void refreshAccountPlaylists();
@@ -902,6 +761,101 @@ export default function App() {
   );
 
   const shown = activePlayerSong ?? emptySong;
+
+  const openStudioForSong = useCallback(async (song: Song | undefined) => {
+    if (!song) {
+      toast("请先播放或选择一首歌曲", { tone: "error" });
+      return;
+    }
+    // A rendered studio mix already has a complete project behind it. Reopen
+    // that project directly instead of trying to send its blob URL through
+    // the remote stem downloader.
+    if (song.localAudioUrl && studioProject) {
+      setStudioProject(studioProject);
+      setStudioOpen(true);
+      getAudio().pause();
+      setSearchOpen(false);
+      setQueueOpen(false);
+      setPlaylistsOpen(false);
+      setSettingsOpen(false);
+      return;
+    }
+    const isPlaceholder = (value: string | undefined, fallback: string) => {
+      const text = value?.trim();
+      return !text || text === "未知歌曲" || text === "未知歌手" ? fallback : text;
+    };
+    const firstMeaningful = (...values: Array<string | undefined>) =>
+      values.map((value) => value?.trim()).find(
+        (value) => value && value !== "未知歌曲" && value !== "未知歌手",
+      );
+    let projectSong = song;
+    // Entering the studio can race the player's background metadata request.
+    // Hydrate a NetEase track once more so the project never freezes a
+    // temporary "未知歌曲/未知歌手" label while lyrics are already available.
+    if (isPlaceholder(song.name, "") === "" || isPlaceholder(song.artist, "") === "") {
+      try {
+        const source = song.source ?? "netease";
+        const metadata = source === "netease"
+          ? await getSongMetadata(song.id)
+          : (await resolvePlayback(song, level)).meta;
+        if (metadata) {
+          projectSong = {
+            ...song,
+            name: isPlaceholder(metadata.name, song.name),
+            artist: isPlaceholder(metadata.ar_name, song.artist),
+            album: isPlaceholder(metadata.al_name, song.album ?? "") || song.album,
+            pic: song.pic ?? metadata.pic,
+          };
+        }
+      } catch {
+        // Keep the catalog fields if the detail refresh is temporarily unavailable.
+      }
+    }
+    // Do not use the UI placeholder as a fallback: a project created while
+    // playback metadata is still loading must never permanently save it.
+    const title = firstMeaningful(projectSong.name, shown.title) ?? "未命名歌曲";
+    const artist = firstMeaningful(projectSong.artist, shown.artist) ?? "未知歌手";
+    const coverUrl = projectSong.pic ?? (projectSong === activeRaw ? cover : undefined) ?? "";
+    const nextProject = createStudioProject({
+      songId: String(projectSong.id),
+      source: projectSong.source ?? "netease",
+      sourceUrl: projectSong === activeRaw ? getAudio().currentSrc || getAudio().src || undefined : undefined,
+      title,
+      artist,
+      album: projectSong.album,
+      coverUrl,
+      durationSec: projectSong === activeRaw ? shown.duration : Math.max(0, (projectSong.duration ?? 0) / 1000),
+      lyrics: projectSong === activeRaw ? lyrics : [],
+    });
+    setStudioProject(nextProject);
+    setStudioOpen(true);
+    getAudio().pause();
+    setSearchOpen(false);
+    setQueueOpen(false);
+    setPlaylistsOpen(false);
+    setSettingsOpen(false);
+  }, [activeRaw, cover, level, lyrics, shown.artist, shown.duration, shown.title, studioProject]);
+
+  const playStudioMixInPlayer = useCallback(async (audioUrl: string, project: StudioProject) => {
+    if (studioPlayerUrlRef.current) URL.revokeObjectURL(studioPlayerUrlRef.current);
+    studioPlayerUrlRef.current = audioUrl;
+    const localSong: Song = {
+      // Keep this queue entry distinct from the catalog song so the player
+      // cannot silently resolve the original stream after the handoff.
+      id: -Date.now(),
+      name: project.title,
+      artist: project.artist,
+      album: project.album ?? "翻唱工作室",
+      pic: project.coverUrl || undefined,
+      duration: Math.max(0, Math.round(project.durationSec * 1000)),
+      source: project.source,
+      localAudioUrl: audioUrl,
+      localLyrics: project.lyrics,
+    };
+    await playSong(localSong, [localSong]);
+    setStudioProject(project);
+    setStudioOpen(false);
+  }, [playSong]);
 
   const handleAuthChange = (status: MultiAuthStatus) => {
     setMultiAuth(status);
@@ -978,6 +932,12 @@ export default function App() {
     setMultiAuth(emptyMultiAuth());
     clearNeteasePlaybackState();
     setSettingsOpen(false);
+    setStudioOpen(false);
+    setStudioProject(null);
+    setQueueOpen(false);
+    setSearchOpen(false);
+    setPlaylistsOpen(false);
+    setSongActionTarget(null);
     setLoginPlatform("netease");
     setLoginOpen(true);
     try {
@@ -1028,14 +988,22 @@ export default function App() {
     return (
       <div className="app-window-frame relative h-screen w-screen overflow-hidden font-sans">
         <ToastHost />
-        <LoginPanel
-          open
-          onClose={() => {}}
-          onLoggedIn={handleLoggedIn}
-          onAuthChange={handleAuthChange}
-          closable={false}
-          initialPlatform={loginPlatform}
-        />
+        <Suspense
+          fallback={
+            <div className="grid h-full place-items-center text-sm text-white/45">
+              正在打开登录面板…
+            </div>
+          }
+        >
+          <LoginPanel
+            open
+            onClose={() => {}}
+            onLoggedIn={handleLoggedIn}
+            onAuthChange={handleAuthChange}
+            closable={false}
+            initialPlatform={loginPlatform}
+          />
+        </Suspense>
       </div>
     );
   }
@@ -1064,7 +1032,7 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {multiAuth.anyLoggedIn && <NavigationRail
+      {multiAuth.anyLoggedIn && !studioOpen && <NavigationRail
         searchOpen={searchOpen}
         playlistsOpen={playlistsOpen}
         settingsOpen={settingsOpen}
@@ -1089,52 +1057,61 @@ export default function App() {
       />}
 
       <div className="relative z-10 w-full h-full">
-        <GlassPlayer
-          song={shown}
-          isPlaying={isPlaying}
-          onPlayPause={toggle}
-          onNext={() => void next()}
-          onPrev={prev}
-          onOpenQueue={() => {
-            setSearchOpen(false);
-            setPlaylistsOpen(false);
-            setSettingsOpen(false);
-            setQueueOpen(true);
-          }}
-          onSeek={seek}
-          layout={layout}
-          onToggleLayout={setLayout}
-          lyricOffsetSeconds={lyricOffsetSeconds}
-          onLyricOffsetChange={handleLyricOffsetChange}
-          volume={volume}
-          onVolumeChange={setVolume}
-          onOpenSettings={() => setSettingsOpen(true)}
-          onReloadFavorites={handleReloadFavorites}
-          backgroundBlur={backgroundBlur}
-          backgroundOpacity={backgroundOpacity}
-          lyricMotionStyle={lyricMotionStyle}
-          onLyricMotionStyleChange={handleLyricMotionStyleChange}
-          lyricSourceMode={lyricSourceMode}
-          onLyricSourceModeChange={(mode) => {
-            setLyricSourceMode(mode);
-            saveLyricSourceMode(mode);
-          }}
-          level={level}
-          onLevelChange={setLevel}
-          speed={speed}
-          onSpeedChange={setSpeed}
-          useCoverBackground={useCoverBackground}
-          showTranslation={showTranslation}
-          onToggleTranslation={() => handleShowTranslationChange(!showTranslation)}
-          onMinimize={() => void minimizeWindow()}
-          onClose={() => void closeWindow()}
-          playMode={playMode}
-          onCyclePlayMode={cyclePlayMode}
-          motionLevel={motionLevel}
-          suspendVisuals={
-            queueOpen || playlistsOpen || searchOpen || settingsOpen || loginOpen
-          }
-        />
+        {studioOpen && studioProject ? (
+          <StudioWorkspace
+            project={studioProject}
+            onBack={() => setStudioOpen(false)}
+            onPlayInPlayer={playStudioMixInPlayer}
+          />
+        ) : (
+          <GlassPlayer
+            song={shown}
+            isPlaying={isPlaying}
+            onPlayPause={toggle}
+            onNext={() => void next()}
+            onPrev={prev}
+            onOpenQueue={() => {
+              setSearchOpen(false);
+              setPlaylistsOpen(false);
+              setSettingsOpen(false);
+              setQueueOpen(true);
+            }}
+            onOpenStudio={() => openStudioForSong(activeRaw)}
+            onSeek={seek}
+            layout={layout}
+            onToggleLayout={setLayout}
+            lyricOffsetSeconds={lyricOffsetSeconds}
+            onLyricOffsetChange={handleLyricOffsetChange}
+            volume={volume}
+            onVolumeChange={setVolume}
+            onOpenSettings={() => setSettingsOpen(true)}
+            onReloadFavorites={handleReloadFavorites}
+            backgroundBlur={backgroundBlur}
+            backgroundOpacity={backgroundOpacity}
+            lyricMotionStyle={lyricMotionStyle}
+            onLyricMotionStyleChange={handleLyricMotionStyleChange}
+            lyricSourceMode={lyricSourceMode}
+            onLyricSourceModeChange={(mode) => {
+              setLyricSourceMode(mode);
+              saveLyricSourceMode(mode);
+            }}
+            level={level}
+            onLevelChange={setLevel}
+            speed={speed}
+            onSpeedChange={setSpeed}
+            useCoverBackground={useCoverBackground}
+            showTranslation={showTranslation}
+            onToggleTranslation={() => handleShowTranslationChange(!showTranslation)}
+            onMinimize={() => void minimizeWindow()}
+            onClose={() => void closeWindow()}
+            playMode={playMode}
+            onCyclePlayMode={cyclePlayMode}
+            motionLevel={motionLevel}
+            suspendVisuals={
+              queueOpen || playlistsOpen || searchOpen || settingsOpen || loginOpen
+            }
+          />
+        )}
       </div>
 
       <CollectionDrawer
@@ -1154,11 +1131,9 @@ export default function App() {
         browseLoaded={browseLoaded}
         browseLoadingMore={browseLoadingMore}
         onPlayFromBrowse={handlePlayFromBrowse}
-        onBrowseMore={handleBrowseMore}
         playlistLoaded={playlistLoaded}
         playlistTotal={playlistTotal}
         playlistLoadingMore={playlistLoadingMore}
-        onLoadMore={handleLoadMoreQueue}
         playlists={accountPlaylists}
         playlistsLoading={accountPlaylistsLoading}
         playlistSort={playlistSort}
@@ -1194,6 +1169,7 @@ export default function App() {
         onPlayNext={handlePlayNext}
         onAddToPlaylist={handleAddSongToAppPlaylist}
         onCreatePlaylistWithSong={handleCreateAppPlaylistWithSong}
+        onOpenStudio={(song) => openStudioForSong(song)}
       />
 
       <Suspense fallback={null}>
@@ -1214,6 +1190,7 @@ export default function App() {
 
       <SettingsPanel
         open={settingsOpen}
+        desktopBlur={desktopBlur}
         onClose={() => setSettingsOpen(false)}
         multiAuth={multiAuth}
         onLogoutPlatform={handleLogoutPlatform}
@@ -1225,6 +1202,7 @@ export default function App() {
         }}
         backgroundBlur={backgroundBlur}
         onBackgroundBlurChange={handleBackgroundBlurChange}
+        hasBackgroundCover={Boolean(shown.backgroundUrl || shown.coverUrl)}
         backgroundOpacity={backgroundOpacity}
         onBackgroundOpacityChange={handleBackgroundOpacityChange}
         useCoverBackground={useCoverBackground}
@@ -1238,6 +1216,7 @@ export default function App() {
 
 function SettingsPanel({
   open,
+  desktopBlur,
   onClose,
   multiAuth,
   onLogoutPlatform,
@@ -1245,6 +1224,7 @@ function SettingsPanel({
   onOpenLogin,
   backgroundBlur,
   onBackgroundBlurChange,
+  hasBackgroundCover,
   backgroundOpacity,
   onBackgroundOpacityChange,
   useCoverBackground,
@@ -1253,6 +1233,7 @@ function SettingsPanel({
   onMotionLevelChange,
 }: {
   open: boolean;
+  desktopBlur: ReturnType<typeof useDesktopBlur>;
   onClose: () => void;
   multiAuth: MultiAuthStatus;
   onLogoutPlatform: (p: AuthPlatform) => void | Promise<void>;
@@ -1260,6 +1241,7 @@ function SettingsPanel({
   onOpenLogin: (p: AuthPlatform) => void;
   backgroundBlur: number;
   onBackgroundBlurChange: (value: number) => void;
+  hasBackgroundCover: boolean;
   backgroundOpacity: number;
   onBackgroundOpacityChange: (value: number) => void;
   useCoverBackground: boolean;
@@ -1350,9 +1332,9 @@ function SettingsPanel({
                       type="button"
                       disabled={logoutBusy}
                       onClick={() => setLogoutConfirm({ kind: "all" })}
-                      className="h-8 px-2.5 rounded-full bg-red-500/15 hover:bg-red-500/22 border border-red-300/15 text-[11px] font-semibold text-red-100 transition-colors inline-flex items-center gap-1.5 disabled:opacity-50"
+                      className="h-8 min-w-[88px] shrink-0 whitespace-nowrap px-2.5 rounded-full bg-red-500/15 hover:bg-red-500/22 border border-red-300/15 text-[11px] font-semibold text-red-100 transition-colors inline-flex items-center justify-center gap-1.5 disabled:opacity-50"
                     >
-                      <LogOut size={12} />
+                      <LogOut size={12} className="shrink-0" />
                       全部退出
                     </button>
                   )}
@@ -1426,9 +1408,29 @@ function SettingsPanel({
                   </span>
                   <div className="min-w-0">
                     <p className="text-sm font-semibold text-white/85">外观</p>
-                    <p className="mt-0.5 text-xs text-white/45">封面背景与氛围参数</p>
+                    <p className="mt-0.5 text-xs text-white/45">桌面毛玻璃与歌曲封面背景</p>
                   </div>
                 </div>
+
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-white/85">桌面背景模糊</p>
+                    <p className="mt-1 text-xs text-white/45">仅模糊透过 Cove 窗口看到的背景，不修改桌面壁纸</p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-label="桌面背景模糊"
+                    aria-checked={desktopBlur.enabled}
+                    disabled={desktopBlur.busy}
+                    onClick={() => desktopBlur.apply(!desktopBlur.enabled)}
+                    className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-40 ${desktopBlur.enabled ? "bg-white/85" : "bg-white/15"}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full transition-transform ${desktopBlur.enabled ? "translate-x-[20px] bg-slate-950" : "bg-white"}`} />
+                  </button>
+                </div>
+                <p className="text-xs text-white/45">拖动或调整窗口时暂停毛玻璃和播放画面更新，音乐继续播放，松开后恢复。</p>
+                {desktopBlur.error && <p role="alert" className="text-xs text-amber-200">{desktopBlur.error}</p>}
 
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex min-w-0 items-start gap-2.5">
@@ -1467,7 +1469,7 @@ function SettingsPanel({
                       <span className="settings-player-inline-icon grid h-7 w-7 place-items-center rounded-full text-white/55">
                         <Aperture size={13} />
                       </span>
-                      背景模糊度
+                      封面背景模糊度
                     </span>
                     <span className="font-mono text-xs text-white/45">{backgroundBlur}px</span>
                   </div>
@@ -1477,9 +1479,19 @@ function SettingsPanel({
                     max={60}
                     step={1}
                     value={backgroundBlur}
+                    aria-label="封面背景模糊度"
+                    aria-describedby="cover-blur-hint"
+                    disabled={!useCoverBackground || !hasBackgroundCover}
                     onChange={(e) => onBackgroundBlurChange(Number(e.target.value))}
-                    className="w-full accent-white"
+                    className="w-full accent-white disabled:cursor-not-allowed disabled:opacity-35"
                   />
+                  <p id="cover-blur-hint" className="mt-1 text-xs text-white/45">
+                    {!useCoverBackground
+                      ? "开启“使用封面背景”后可调节模糊度"
+                      : !hasBackgroundCover
+                        ? "当前没有歌曲封面，选择带封面的歌曲后可调节"
+                        : "仅影响歌曲封面背景；关闭设置面板后查看效果"}
+                  </p>
                 </label>
 
                 <label className="block">
@@ -1742,6 +1754,7 @@ function SongActionDialog({
   onPlayNext,
   onAddToPlaylist,
   onCreatePlaylistWithSong,
+  onOpenStudio,
 }: {
   song: Song | null;
   appPlaylists: AppPlaylist[];
@@ -1749,6 +1762,7 @@ function SongActionDialog({
   onPlayNext: (song: Song) => void;
   onAddToPlaylist: (id: string, song: Song) => void;
   onCreatePlaylistWithSong: (name: string, song: Song) => void;
+  onOpenStudio: (song: Song) => void;
 }) {
   const [newName, setNewName] = useState("");
 
@@ -1799,6 +1813,18 @@ function SongActionDialog({
                 <X size={15} />
               </button>
             </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                onOpenStudio(song);
+                onClose();
+              }}
+              className="mt-2 flex h-11 w-full items-center gap-3 rounded-2xl bg-lime-200/15 px-3 text-left text-sm font-bold text-lime-100 hover:bg-lime-200/25"
+            >
+              <Mic2 size={17} />
+              打开翻唱工作室
+            </button>
 
             <button
               type="button"
@@ -1865,63 +1891,6 @@ function SongActionDialog({
   );
 }
 
-const loadedListCoverUrls = new Set<string>();
-const failedListCoverUrls = new Set<string>();
-
-function listCoverThumbnail(src: string): string {
-  try {
-    const url = new URL(src);
-    if (url.hostname.endsWith("music.126.net")) {
-      url.searchParams.set("param", "96y96");
-      return url.toString();
-    }
-    if (url.hostname.endsWith("gtimg.cn")) {
-      return src.replace(/T002R\d+x\d+M000/i, "T002R90x90M000");
-    }
-  } catch {
-    // Provider occasionally returns a relative/data URL; keep it untouched.
-  }
-  return src;
-}
-
-const CollectionSongCover = memo(function CollectionSongCover({
-  src,
-  suspendLoading,
-}: {
-  src?: string;
-  suspendLoading: boolean;
-}) {
-  const thumbnail = useMemo(() => (src ? listCoverThumbnail(src) : ""), [src]);
-  const [failed, setFailed] = useState(() => failedListCoverUrls.has(thumbnail));
-
-  useEffect(() => {
-    setFailed(failedListCoverUrls.has(thumbnail));
-  }, [thumbnail]);
-
-  if (
-    !thumbnail ||
-    failed ||
-    (suspendLoading && !loadedListCoverUrls.has(thumbnail))
-  ) {
-    return null;
-  }
-
-  return (
-    <img
-      src={thumbnail}
-      alt=""
-      loading="lazy"
-      decoding="async"
-      className="h-full w-full object-cover"
-      onLoad={() => loadedListCoverUrls.add(thumbnail)}
-      onError={() => {
-        failedListCoverUrls.add(thumbnail);
-        setFailed(true);
-      }}
-    />
-  );
-});
-
 /** Separate full-window views for the live queue and account playlists. */
 const CollectionDrawer = memo(function CollectionDrawer({
   open,
@@ -1940,11 +1909,9 @@ const CollectionDrawer = memo(function CollectionDrawer({
   browseLoaded,
   browseLoadingMore,
   onPlayFromBrowse,
-  onBrowseMore,
   playlistLoaded,
   playlistTotal,
   playlistLoadingMore,
-  onLoadMore,
   playlists,
   playlistsLoading,
   playlistSort,
@@ -1978,11 +1945,9 @@ const CollectionDrawer = memo(function CollectionDrawer({
   browseLoaded: number;
   browseLoadingMore: boolean;
   onPlayFromBrowse: (song: Song) => void;
-  onBrowseMore: () => void;
   playlistLoaded: number;
   playlistTotal: number;
   playlistLoadingMore: boolean;
-  onLoadMore: () => void;
   playlists: PlaylistSummary[];
   playlistsLoading: boolean;
   playlistSort: "updated" | "count" | "name";
@@ -2000,17 +1965,6 @@ const CollectionDrawer = memo(function CollectionDrawer({
   onMoveAppPlaylistSong: (id: string, from: number, to: number) => void;
   onPlayFromAppPlaylist: (playlist: AppPlaylist, song: Song) => void;
 }) {
-  // Real fixed-row virtualization: only rows near the viewport are mounted,
-  // regardless of whether the playlist contains 60 or several thousand songs.
-  const ROW_HEIGHT = 58;
-  const ROW_OVERSCAN = 8;
-  const ROW_WINDOW_STEP = 4;
-  const [virtualScrollRow, setVirtualScrollRow] = useState(0);
-  const [virtualViewportHeight, setVirtualViewportHeight] = useState(560);
-  const [suspendCoverLoading, setSuspendCoverLoading] = useState(false);
-  const scrollFrameRef = useRef<number | null>(null);
-  const scrollIdleTimerRef = useRef<number | null>(null);
-  const coverLoadingSuspendedRef = useRef(false);
   const [playlistLibrary, setPlaylistLibrary] = useState<"app" | "platform">(
     activeAppPlaylistId ? "app" : "platform"
   );
@@ -2025,6 +1979,7 @@ const CollectionDrawer = memo(function CollectionDrawer({
   const [confirmDeletePlaylistId, setConfirmDeletePlaylistId] = useState<string | null>(null);
   const [confirmClearQueue, setConfirmClearQueue] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const browseSource = usePlayerStore((state) => state.browseSource);
 
   const isPlaylistMode = mode === "playlists";
   const activeAppPlaylist = appPlaylists.find((playlist) => playlist.id === activeAppPlaylistId) ?? null;
@@ -2070,29 +2025,6 @@ const CollectionDrawer = memo(function CollectionDrawer({
     setPlaylistSearchQuery("");
   }, [mode, open]);
   useEffect(() => {
-    setVirtualScrollRow(0);
-    if (scrollRef.current) scrollRef.current.scrollTop = 0;
-  }, [activeAppPlaylistId, browsePlaylistId, mode, playlistLibrary]);
-
-  useEffect(() => {
-    if (!open) return;
-    const element = scrollRef.current;
-    if (!element) return;
-    const updateHeight = () => setVirtualViewportHeight(element.clientHeight || 560);
-    updateHeight();
-    const observer = new ResizeObserver(updateHeight);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [open, mode, playlistLibrary, activeAppPlaylistId, browsePlaylistId]);
-
-  useEffect(() => {
-    return () => {
-      if (scrollFrameRef.current != null) cancelAnimationFrame(scrollFrameRef.current);
-      if (scrollIdleTimerRef.current != null) clearTimeout(scrollIdleTimerRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
     if (!isPlaylistMode || !open || playlistLibrary !== "app") return;
     if (activeAppPlaylist || appPlaylists.length === 0) return;
     onOpenAppPlaylist(appPlaylists[0].id);
@@ -2109,50 +2041,6 @@ const CollectionDrawer = memo(function CollectionDrawer({
     previousActiveAppPlaylistIdRef.current = activeAppPlaylistId;
   }, [activeAppPlaylistId]);
 
-  const onScroll = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    if (!coverLoadingSuspendedRef.current) {
-      coverLoadingSuspendedRef.current = true;
-      setSuspendCoverLoading(true);
-    }
-    if (scrollIdleTimerRef.current != null) {
-      clearTimeout(scrollIdleTimerRef.current);
-    }
-    scrollIdleTimerRef.current = window.setTimeout(() => {
-      scrollIdleTimerRef.current = null;
-      coverLoadingSuspendedRef.current = false;
-      setSuspendCoverLoading(false);
-    }, 160);
-    if (scrollFrameRef.current == null) {
-      scrollFrameRef.current = requestAnimationFrame(() => {
-        scrollFrameRef.current = null;
-        const nextRow = Math.floor(el.scrollTop / ROW_HEIGHT);
-        setVirtualScrollRow((current) =>
-          Math.abs(current - nextRow) >= ROW_WINDOW_STEP ? nextRow : current,
-        );
-      });
-    }
-    const nearBottom = el.scrollTop + el.clientHeight > el.scrollHeight - 400;
-    if (nearBottom) {
-      if (!isAppBrowsing && listLoaded < listTotal && !listLoadingMore) {
-        isPlaylistMode ? onBrowseMore() : onLoadMore();
-      }
-    }
-  };
-
-  const virtualRange = getVirtualListRange(
-    list.length,
-    virtualScrollRow * ROW_HEIGHT,
-    virtualViewportHeight,
-    ROW_HEIGHT,
-    ROW_OVERSCAN,
-  );
-  const virtualStart = virtualRange.start;
-  const virtualEnd = virtualRange.end;
-  const visible = list.slice(virtualStart, virtualEnd);
-  const virtualTopHeight = virtualRange.topHeight;
-  const virtualBottomHeight = virtualRange.bottomHeight;
   const sourceCounts = useMemo(() => {
     const c = { all: playlists.length, netease: 0, qq: 0, kugou: 0 };
     for (const p of playlists) {
@@ -2261,16 +2149,66 @@ const CollectionDrawer = memo(function CollectionDrawer({
     setRenameValue("");
   };
 
-  const moveVisibleItem = (from: number, to: number) => {
-    if (isAppBrowsing && activeAppPlaylist) {
-      onMoveAppPlaylistSong(activeAppPlaylist.id, from, to);
-    } else if (!isPlaylistMode) {
-      onMoveQueueItem(from, to);
-    }
-  };
+  const moveVisibleItem = useCallback(
+    (from: number, to: number) => {
+      if (isAppBrowsing && activeAppPlaylist) {
+        onMoveAppPlaylistSong(activeAppPlaylist.id, from, to);
+      } else if (!isPlaylistMode) {
+        onMoveQueueItem(from, to);
+      }
+    },
+    [
+      activeAppPlaylist,
+      isAppBrowsing,
+      isPlaylistMode,
+      onMoveAppPlaylistSong,
+      onMoveQueueItem,
+    ],
+  );
+  const handleRowPlay = useCallback(
+    (song: Song, index: number) => {
+      if (isAppBrowsing && activeAppPlaylist) {
+        onPlayFromAppPlaylist(activeAppPlaylist, song);
+      } else if (isPlaylistMode) {
+        onPlayFromBrowse(song);
+      } else {
+        onSelect(index);
+      }
+    },
+    [
+      activeAppPlaylist,
+      isAppBrowsing,
+      isPlaylistMode,
+      onPlayFromAppPlaylist,
+      onPlayFromBrowse,
+      onSelect,
+    ],
+  );
+  const handleRowRemove = useCallback(
+    (index: number) => {
+      if (isAppBrowsing && activeAppPlaylist) {
+        onRemoveAppPlaylistSong(activeAppPlaylist.id, index);
+      } else {
+        onRemoveQueueItem(index);
+      }
+    },
+    [activeAppPlaylist, isAppBrowsing, onRemoveAppPlaylistSong, onRemoveQueueItem],
+  );
+  const handleRowDragStateChange = useCallback(
+    (index: number | null) => setDragIndex(index),
+    [],
+  );
 
   return (
     <AnimatePresence>
+      {open && !isPlaylistMode && (
+        <motion.div
+          key="queue-dismiss-layer"
+          className="absolute inset-0 z-40 no-drag"
+          aria-hidden="true"
+          onClick={onClose}
+        />
+      )}
       {open && (
         <motion.section
           key={mode}
@@ -2642,137 +2580,27 @@ const CollectionDrawer = memo(function CollectionDrawer({
                 )}
               </section>
             )}
-            <div
-              ref={scrollRef}
-              onScroll={onScroll}
-              className="context-panel-layer player-liquid-content flex-1 overflow-y-auto px-3 py-3 no-drag"
-              style={{
-                contain: "strict",
-                overscrollBehavior: "contain",
-                overflowAnchor: "none",
-                ["--context-layer" as string]: 2,
-              }}
-            >
-              {list.length === 0 && (
-                <p className="px-5 py-10 text-center text-sm text-white/35">
-                  {isPlaylistMode
-                    ? isBrowsing
-                      ? isAppBrowsing
-                        ? "自建歌单为空，可从搜索或歌曲菜单中添加"
-                        : browseLoadingMore
-                        ? "正在读取歌单…"
-                        : "歌单为空或读取失败"
-                      : "请选择一个歌单查看歌曲"
-                    : "队列为空"}
-                </p>
-              )}
-              {virtualTopHeight > 0 && <div aria-hidden style={{ height: virtualTopHeight }} />}
-              {visible.map((s, visibleIndex) => {
-                const i = virtualStart + visibleIndex;
-                const liveSong = queue[activeIndex];
-                const active = isBrowsing
-                  ? !!liveSong && sameSong(liveSong, s)
-                  : i === activeIndex;
-                const reorderable = isAppBrowsing || !isPlaylistMode;
-                return (
-                  <div
-                    key={getSongKey(s)}
-                    draggable={reorderable}
-                    onDragStart={(event) => {
-                      if (!reorderable) return;
-                      setDragIndex(i);
-                      event.dataTransfer.effectAllowed = "move";
-                    }}
-                    onDragOver={(event) => {
-                      if (reorderable) event.preventDefault();
-                    }}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      if (dragIndex != null) moveVisibleItem(dragIndex, i);
-                      setDragIndex(null);
-                    }}
-                    onDragEnd={() => setDragIndex(null)}
-                    className={`intent-surface app-liquid-row h-[58px] w-full flex items-center gap-2 rounded-2xl px-2 py-2 text-left transition-colors ${
-                      active ? "is-active" : ""
-                    } ${dragIndex === i ? "opacity-45" : ""} motion-off`}
-                  >
-                    <span
-                      className={`grid h-8 w-6 shrink-0 place-items-center ${
-                        reorderable ? "intent-hint cursor-grab text-white/45 active:cursor-grabbing" : "text-white/20"
-                      }`}
-                      title={reorderable ? "拖动调整顺序" : undefined}
-                    >
-                      {reorderable ? <GripVertical size={14} /> : <span className="text-[10px]">{i + 1}</span>}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (isAppBrowsing && activeAppPlaylist) onPlayFromAppPlaylist(activeAppPlaylist, s);
-                        else if (isPlaylistMode) onPlayFromBrowse(s);
-                        else onSelect(i);
-                      }}
-                      className="flex min-w-0 flex-1 items-center gap-3 rounded-xl text-left"
-                    >
-                      <span className="relative h-10 w-10 shrink-0 overflow-hidden rounded-md bg-white/5 ring-1 ring-white/10">
-                        <CollectionSongCover
-                          src={s.pic}
-                          suspendLoading={suspendCoverLoading}
-                        />
-                        {active && (
-                          <span className="absolute inset-0 grid place-items-center bg-black/25">
-                            <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
-                          </span>
-                        )}
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className={`block truncate text-sm ${
-                          active ? "font-medium text-white" : "text-white/80"
-                        }`}>
-                          {s.name}
-                        </span>
-                        <span className="block truncate text-xs text-white/40">
-                          {s.artist} · {AUTH_PLATFORM_LABEL[s.source ?? "netease"]}
-                        </span>
-                      </span>
-                    </button>
-                    <div className="intent-controls flex shrink-0 items-center">
-                      <button
-                        type="button"
-                        onClick={() => onOpenSongActions(s)}
-                        className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-white/35 hover:bg-white/10 hover:text-white"
-                        aria-label={`更多操作 ${s.name}`}
-                      >
-                        <MoreHorizontal size={15} />
-                      </button>
-                      {(isAppBrowsing || !isPlaylistMode) && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (isAppBrowsing && activeAppPlaylist) {
-                              onRemoveAppPlaylistSong(activeAppPlaylist.id, i);
-                            } else {
-                              onRemoveQueueItem(i);
-                            }
-                          }}
-                          className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-white/30 hover:bg-red-500/15 hover:text-red-200"
-                          aria-label={`删除 ${s.name}`}
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-              {virtualBottomHeight > 0 && <div aria-hidden style={{ height: virtualBottomHeight }} />}
-              {showLoadMoreFooter && (
-                <div className="py-4 text-center text-xs text-white/30">
-                  {listLoadingMore
-                    ? "加载中…"
-                    : `已加载 ${list.length} / ${listTotal}，向下滚动加载更多`}
-                </div>
-              )}
-            </div>
+            <CollectionSongVirtualList
+              open={open}
+              mode={mode}
+              list={list}
+              queue={queue}
+              activeIndex={activeIndex}
+              isBrowsing={isBrowsing}
+              isAppBrowsing={isAppBrowsing}
+              browseLoadingMore={browseLoadingMore}
+              scrollRef={scrollRef}
+              resetKey={`${activeAppPlaylistId ?? ""}:${browseSource ?? ""}:${browsePlaylistId ?? ""}:${mode}:${playlistLibrary}`}
+              dragIndex={dragIndex}
+              onPlay={handleRowPlay}
+              onOpenActions={onOpenSongActions}
+              onRemove={handleRowRemove}
+              onMove={moveVisibleItem}
+              onDragStateChange={handleRowDragStateChange}
+              listTotal={listTotal}
+              listLoadingMore={listLoadingMore}
+              showLoadMoreFooter={showLoadMoreFooter}
+            />
           </motion.section>
       )}
     </AnimatePresence>
@@ -2940,6 +2768,11 @@ const PlaylistCoverFlow = memo(function PlaylistCoverFlow({
   };
 
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const button = (e.target as HTMLElement).closest("button");
+    // Arrow buttons need their own click; capturing here retargets it to the
+    // carousel and prevents the button's handler from running.
+    if (button && !button.hasAttribute("data-cover-idx")) return;
     dragRef.current = { active: true, startX: e.clientX, startFocus: focus, moved: false, lastDelta: 0 };
     // Capture the pointer so we keep receiving move/up events even if it leaves
     // the element (e.g. dragged outside the window edge). Without this, a
@@ -3049,7 +2882,7 @@ const PlaylistCoverFlow = memo(function PlaylistCoverFlow({
       }`}
       style={{ perspective: "1300px", perspectiveOrigin: "50% 44%" }}
     >
-      <div className="absolute inset-0" style={{ transformStyle: "preserve-3d" }}>
+      <div className="pointer-events-none absolute inset-0" style={{ transformStyle: "preserve-3d" }}>
         {visiblePlaylists.map((playlist, visibleIndex) => {
           const i = coverRange.start + visibleIndex;
           const offset = i - focus;
@@ -3066,7 +2899,7 @@ const PlaylistCoverFlow = memo(function PlaylistCoverFlow({
               data-cover-idx={i}
               type="button"
               onClick={(e) => e.preventDefault()}
-              className="group absolute left-1/2 top-1/2"
+              className="pointer-events-auto group absolute left-1/2 top-1/2"
               style={{
                 width: CARD,
                 height: CARD,
@@ -3156,7 +2989,13 @@ const PlaylistCoverFlow = memo(function PlaylistCoverFlow({
       {/* nav arrows */}
       {focus > 0 && (
         <button
-          onClick={() => setFocus((i) => clamp(i - 1))}
+          onClick={() => {
+            const next = clamp(focus - 1);
+            setFocus(next);
+            focusRef.current = next;
+            const playlist = playlists[next];
+            if (playlist) openRef.current(playlist);
+          }}
           className="absolute left-2 top-1/2 z-[300] grid h-8 w-8 -translate-y-1/2 place-items-center rounded-full bg-white/10 text-white/80 backdrop-blur-md border border-white/10 hover:bg-white/20 hover:text-white transition-colors"
           title="上一个歌单"
         >
@@ -3165,7 +3004,13 @@ const PlaylistCoverFlow = memo(function PlaylistCoverFlow({
       )}
       {focus < playlists.length - 1 && (
         <button
-          onClick={() => setFocus((i) => clamp(i + 1))}
+          onClick={() => {
+            const next = clamp(focus + 1);
+            setFocus(next);
+            focusRef.current = next;
+            const playlist = playlists[next];
+            if (playlist) openRef.current(playlist);
+          }}
           className="absolute right-2 top-1/2 z-[300] grid h-8 w-8 -translate-y-1/2 place-items-center rounded-full bg-white/10 text-white/80 backdrop-blur-md border border-white/10 hover:bg-white/20 hover:text-white transition-colors"
           title="下一个歌单"
         >
@@ -3175,182 +3020,3 @@ const PlaylistCoverFlow = memo(function PlaylistCoverFlow({
     </div>
   );
 });
-
-/** Live multi-source search overlay (NetEase / QQ / Kugou). */
-function SearchOverlay({
-  open,
-  onClose,
-  onPick,
-  onOpenSongActions,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onPick: (s: Song) => void | Promise<void>;
-  onOpenSongActions: (song: Song) => void;
-}) {
-  const [q, setQ] = useState("");
-  const [results, setResults] = useState<Song[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [source, setSource] = useState<MusicSource>(loadMusicSource);
-  const resultsRef = useRef<HTMLDivElement>(null);
-  const searchGenerationRef = useRef(0);
-
-  useEffect(() => {
-    if (!open) return;
-    setQ("");
-    setResults([]);
-    setErr(null);
-    setSource(loadMusicSource());
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const kw = q.trim();
-    if (!kw) {
-      setResults([]);
-      setLoading(false);
-      setErr(null);
-      return;
-    }
-    setLoading(true);
-    setErr(null);
-    const searchGeneration = ++searchGenerationRef.current;
-    const ctrl = new AbortController();
-    const t = setTimeout(async () => {
-      try {
-        const r = await searchMusic(kw, source, 40, ctrl.signal);
-        if (searchGeneration !== searchGenerationRef.current) return;
-        setResults(r);
-        if (r.length === 0) setErr("没有找到相关歌曲");
-      } catch (e: any) {
-        if (searchGeneration === searchGenerationRef.current && e?.name !== "AbortError")
-          setErr(e?.message ? `搜索失败：${e.message}` : "搜索失败，请稍后重试");
-      } finally {
-        if (searchGeneration === searchGenerationRef.current) setLoading(false);
-      }
-    }, 380);
-    return () => {
-      clearTimeout(t);
-      ctrl.abort();
-      searchGenerationRef.current += 1;
-    };
-  }, [q, open, source]);
-
-  const sourceBadge = (s: Song) => {
-    const src = s.source ?? "netease";
-    if (src === "qq") return "QQ音乐";
-    if (src === "kugou") return "酷狗音乐";
-    return "网易云音乐";
-  };
-
-  return (
-    <AnimatePresence>
-      {open && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onClick={onClose}
-          className="absolute inset-0 z-50"
-        >
-          <motion.div
-            initial={{ x: 24, opacity: 0, scale: 0.985 }}
-            animate={{ x: 0, opacity: 1, scale: 1 }}
-            exit={{ x: 18, opacity: 0, scale: 0.985 }}
-            transition={{ type: "spring", stiffness: 320, damping: 28 }}
-            onClick={(e) => e.stopPropagation()}
-            className="context-panel context-panel--tab-page player-liquid-glass settings-player-page absolute flex flex-col overflow-hidden text-white"
-          >
-            <div className="player-liquid-content settings-player-header flex h-16 shrink-0 items-center gap-3 border-b border-white/6 px-7">
-              <Search size={20} className="text-white/40 shrink-0" />
-              <input
-                autoFocus
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") onClose();
-                  if (e.key === "Enter" && results[0]) void onPick(results[0]);
-                }}
-                placeholder="搜索歌曲、歌手…"
-                className="app-liquid-input h-10 min-w-0 flex-1 rounded-full px-4 outline-none text-white placeholder:text-white/35 text-base"
-              />
-              {loading && <Loader2 size={18} className="animate-spin text-white/40" />}
-              <button
-                onClick={onClose}
-                className="grid place-items-center w-8 h-8 rounded-full text-white/50 hover:text-white hover:bg-white/10"
-              >
-                <X size={16} />
-              </button>
-            </div>
-            <div className="player-liquid-content flex shrink-0 gap-1 border-b border-white/6 px-6 py-2">
-              {MUSIC_SOURCE_OPTIONS.map(({ value, label }) => (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => {
-                    setSource(value);
-                    saveMusicSource(value);
-                  }}
-                  className={`h-7 rounded-full px-3 text-[11px] font-bold transition-colors ${
-                    source === value
-                      ? "bg-white text-slate-950"
-                      : "text-white/50 hover:bg-white/8 hover:text-white"
-                  }`}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div ref={resultsRef} className="player-liquid-content min-h-0 flex-1 overflow-y-auto">
-              {err && !loading && (
-                <p className="px-5 py-8 text-center text-sm text-white/45">{err}</p>
-              )}
-              {!err && !loading && results.length === 0 && !q.trim() && (
-                <p className="px-5 py-8 text-center text-sm text-white/30">
-                  选择音源后输入关键词搜索（QQ / 酷狗需桌面端）
-                </p>
-              )}
-              {results.map((s) => (
-                <div
-                  key={getSongKey(s)}
-                  className="intent-surface app-liquid-row mx-2 my-1 flex w-auto items-center gap-3 rounded-2xl px-3 py-2.5 text-left transition-colors motion-off"
-                >
-                  <button
-                    type="button"
-                    onClick={() => void onPick(s)}
-                    className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                  >
-                    <span className="h-10 w-10 shrink-0 overflow-hidden rounded-md bg-white/5 ring-1 ring-white/10">
-                      {s.pic && <img src={s.pic} alt="" className="h-full w-full object-cover" referrerPolicy="no-referrer" />}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm text-white">{s.name}</span>
-                      <span className="block truncate text-xs text-white/45">{s.artist}</span>
-                    </span>
-                  </button>
-                  <span className="shrink-0 rounded-full bg-white/8 px-2 py-0.5 text-[10px] font-bold text-white/45">
-                    {sourceBadge(s)}
-                  </span>
-                  {s.album && (
-                    <span className="hidden sm:block truncate text-xs text-white/35 max-w-[120px]">
-                      {s.album}
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => onOpenSongActions(s)}
-                    className="intent-controls grid h-8 w-8 shrink-0 place-items-center rounded-full text-white/35 hover:bg-white/10 hover:text-white"
-                    aria-label={`更多操作 ${s.name}`}
-                  >
-                    <MoreHorizontal size={15} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
-  );
-}

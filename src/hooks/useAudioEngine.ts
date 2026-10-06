@@ -6,6 +6,7 @@ import {
   setMediaPositionState,
 } from "../lib/mediaSession";
 import { usePlayerStore } from "../store/playerStore";
+import { observeWindowInteraction } from "../lib/windowInteraction";
 
 /**
  * Wire the singleton <audio> element events into the Zustand store,
@@ -20,8 +21,13 @@ export function useAudioEngine() {
     let rafId = 0;
     let lastPublishedTime = -1;
     let lastMediaPositionTime = -1;
+    let interacting = false;
+    let pausedAnimations: Animation[] = [];
 
     const publishTime = (force = false) => {
+      // The media element keeps decoding/playing. Hold only the presentation
+      // clock (progress + lyric masks/glows) during the native move/size loop.
+      if (interacting) return;
       const t = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
       // Avoid flooding React for sub-frame noise; ~30Hz is plenty for lyrics.
       if (!force && Math.abs(t - lastPublishedTime) < 1 / 30) return;
@@ -57,9 +63,33 @@ export function useAudioEngine() {
     };
 
     const startRaf = () => {
-      if (rafId) return;
+      if (rafId || interacting) return;
       rafId = requestAnimationFrame(tick);
     };
+
+    const resumeAnimations = () => {
+      document.documentElement.classList.remove("is-window-interacting");
+      for (const animation of pausedAnimations) {
+        // Do not resurrect animations cancelled by a track/layout change.
+        if (animation.playState === "paused") animation.play();
+      }
+      pausedAnimations = [];
+    };
+    const stopObservingInteraction = observeWindowInteraction((active) => {
+      if (interacting === active) return;
+      interacting = active;
+      if (active) {
+        stopRaf();
+        document.documentElement.classList.add("is-window-interacting");
+        pausedAnimations = document.getAnimations().filter(a => a.playState === "running");
+        for (const animation of pausedAnimations) animation.pause();
+      } else {
+        resumeAnimations();
+        // Read the real audio clock once, with no replay of intermediate ticks.
+        publishTime(true);
+        if (!audio.paused && !audio.ended) startRaf();
+      }
+    });
 
     const onTime = () => publishTime();
     const onMeta = () => {
@@ -241,6 +271,8 @@ export function useAudioEngine() {
     if (!audio.paused) startRaf();
 
     return () => {
+      stopObservingInteraction();
+      resumeAnimations();
       stopRaf();
       unsub();
       audio.removeEventListener("timeupdate", onTime);

@@ -4,6 +4,12 @@
 // window plumbing plus NetEase web API requests so packaged builds work without
 // a separately running local API service.
 
+mod desktop_background;
+mod studio_files;
+#[cfg(target_os = "windows")]
+mod window_shape;
+use desktop_background::set_desktop_blur;
+
 use aes::Aes128;
 use ecb::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyInit};
 use reqwest::{
@@ -17,8 +23,11 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Mutex, OnceLock},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
@@ -42,6 +51,19 @@ struct NeteaseState {
     device_file: PathBuf,
     playlist_cache: Mutex<HashMap<i64, CachedPlaylist>>,
 }
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StemJob {
+    id: String,
+    state: String,
+    stage: String,
+    progress: f32,
+    output_path: Option<String>,
+    error: Option<String>,
+}
+
+type StemJobsState = std::sync::Arc<Mutex<HashMap<String, StemJob>>>;
 
 #[derive(Clone)]
 struct CachedPlaylist {
@@ -3972,12 +3994,16 @@ async fn kugou_playlist_page(args: KugouPlaylistPageArgs) -> Result<Value, Strin
 
 #[tauri::command]
 async fn netease_search(state: State<'_, NeteaseState>, args: SearchArgs) -> Result<Value, String> {
-    let limit = args.limit.unwrap_or(30).to_string();
+    let keyword = args.keyword.trim();
+    if keyword.is_empty() {
+        return Ok(json!({ "data": [] }));
+    }
+    let limit = args.limit.unwrap_or(30).clamp(1, 100).to_string();
     let env = post_form_json(
         &state,
         "/api/search/get/web",
         &[
-            ("s", args.keyword),
+            ("s", keyword.to_string()),
             ("type", "1".to_string()),
             ("limit", limit),
             ("offset", "0".to_string()),
@@ -3985,13 +4011,53 @@ async fn netease_search(state: State<'_, NeteaseState>, args: SearchArgs) -> Res
         true,
     )
     .await?;
-    let songs = env
-        .get("result")
-        .and_then(|v| v.get("songs"))
-        .and_then(Value::as_array)
-        .map(|songs| songs.iter().map(map_song).collect::<Vec<_>>())
-        .unwrap_or_default();
+    normalize_netease_search(&env)
+}
+
+fn normalize_netease_search(env: &Value) -> Result<Value, String> {
+    let code = env.get("code").and_then(Value::as_i64);
+    if code != Some(200) {
+        let message = env.get("message").or_else(|| env.get("msg"))
+            .and_then(Value::as_str).unwrap_or("接口未返回成功状态");
+        return Err(format!("网易云搜索失败（{}）：{}", code.unwrap_or(0), message));
+    }
+    let result = env.get("result").filter(|value| value.is_object())
+        .ok_or_else(|| "网易云搜索响应缺少 result".to_string())?;
+    let raw_songs = match result.get("songs") {
+        Some(Value::Array(songs)) => songs.clone(),
+        None | Some(Value::Null) if result.get("songCount").and_then(Value::as_i64) == Some(0) => Vec::new(),
+        _ => return Err("网易云搜索响应缺少歌曲列表".to_string()),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let songs: Vec<Value> = raw_songs.iter()
+        .filter(|song| song.get("id").and_then(Value::as_i64)
+            .is_some_and(|id| id > 0 && seen.insert(id)))
+        .map(map_song).collect();
     Ok(json!({ "data": songs }))
+}
+
+#[cfg(test)]
+mod netease_search_tests {
+    use super::*;
+
+    #[test]
+    fn distinguishes_failure_from_empty_results() {
+        assert!(normalize_netease_search(&json!({"code": 301, "message": "需要登录"})).unwrap_err().contains("需要登录"));
+        assert!(normalize_netease_search(&json!({"code": 200})).is_err());
+        assert!(normalize_netease_search(&json!({"code": 200, "result": {"songCount": 2}})).is_err());
+        assert_eq!(normalize_netease_search(&json!({"code": 200, "result": {"songCount": 0}})).unwrap(), json!({"data": []}));
+    }
+
+    #[test]
+    fn normalizes_and_deduplicates_tracks() {
+        let result = normalize_netease_search(&json!({"code": 200, "result": {"songs": [
+            {"id": 12, "name": "测试", "artists": [{"name": "歌手"}], "album": {"name": "专辑"}, "duration": 123000},
+            {"id": 12, "name": "重复"}, {"id": 0}, {"name": "无标识"}
+        ]}})).unwrap();
+        assert_eq!(result["data"].as_array().unwrap().len(), 1);
+        assert_eq!(result["data"][0]["artist"], "歌手");
+        assert_eq!(result["data"][0]["duration"], 123000);
+    }
 }
 
 #[tauri::command]
@@ -4078,17 +4144,20 @@ async fn netease_playlist_page(
     if let Ok(cached) = playlist_track_ids(&state, args.id).await {
         if !cached.track_ids.is_empty() {
             let ids = slice_track_ids(&cached.track_ids, args.offset, limit);
-            let tracks = batch_song_details(&state, &ids).await?;
-            return Ok(json!({
-                "data": {
-                    "playlist": {
-                        "tracks": tracks,
-                        "trackTotal": cached.total,
-                        "trackOffset": args.offset,
-                        "trackLimit": limit
-                    }
+            if let Ok(tracks) = batch_song_details(&state, &ids).await {
+                if !tracks.is_empty() {
+                    return Ok(json!({
+                        "data": {
+                            "playlist": {
+                                "tracks": tracks,
+                                "trackTotal": cached.total,
+                                "trackOffset": args.offset,
+                                "trackLimit": limit
+                            }
+                        }
+                    }));
                 }
-            }));
+            }
         }
     }
 
@@ -4108,7 +4177,7 @@ async fn netease_playlist_page(
         .get("trackCount")
         .and_then(Value::as_i64)
         .unwrap_or_default();
-    let tracks = playlist
+    let mut tracks = playlist
         .get("tracks")
         .and_then(Value::as_array)
         .map(|tracks| {
@@ -4120,6 +4189,30 @@ async fn netease_playlist_page(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let mut total = total;
+
+    // Some account-owned playlists return trackCount from the detail endpoint
+    // but omit `tracks`. The dedicated all-tracks endpoint still returns the
+    // actual songs, so use it before exposing an empty playlist to the UI.
+    if tracks.is_empty() && total > 0 {
+        if let Ok(all_env) = get_json(
+            &state,
+            &format!(
+                "/api/playlist/track/all?id={}&limit={}&offset={}",
+                args.id, limit, args.offset
+            ),
+            true,
+        )
+        .await
+        {
+            if let Some(all_songs) = all_env.get("songs").and_then(Value::as_array) {
+                tracks = all_songs.iter().map(map_song).collect();
+                if let Some(all_total) = all_env.get("total").and_then(Value::as_i64) {
+                    total = total.max(all_total);
+                }
+            }
+        }
+    }
     Ok(json!({
         "data": {
             "playlist": {
@@ -5204,6 +5297,10 @@ async fn kugou_search(args: KugouSearchArgs) -> Result<Value, String> {
             let name = item
                 .get("SongName")
                 .or_else(|| item.get("songname"))
+                .or_else(|| item.get("song_name"))
+                .or_else(|| item.get("name"))
+                .or_else(|| item.get("audio_name"))
+                .or_else(|| item.get("FileName"))
                 .and_then(Value::as_str)
                 .unwrap_or("未知歌曲");
             let artists = item
@@ -5211,7 +5308,9 @@ async fn kugou_search(args: KugouSearchArgs) -> Result<Value, String> {
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|s| s.get("name").and_then(Value::as_str))
+                        .filter_map(|s| {
+                            s.as_str().or_else(|| s.get("name").and_then(Value::as_str))
+                        })
                         .collect::<Vec<_>>()
                         .join(" / ")
                 })
@@ -5220,10 +5319,14 @@ async fn kugou_search(args: KugouSearchArgs) -> Result<Value, String> {
                         .and_then(Value::as_str)
                         .map(|s| s.replace('、', " / "))
                 })
+                .or_else(|| item.get("SingerName").and_then(Value::as_str).map(|s| s.replace('、', " / ")))
+                .or_else(|| item.get("artist").and_then(Value::as_str).map(str::to_string))
                 .unwrap_or_default();
             let album = item
                 .get("AlbumName")
                 .or_else(|| item.get("album_name"))
+                .or_else(|| item.get("albumname"))
+                .or_else(|| item.get("album"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let duration = value_i64(item.get("Duration").or_else(|| item.get("duration"))) * 1000;
@@ -5231,6 +5334,8 @@ async fn kugou_search(args: KugouSearchArgs) -> Result<Value, String> {
                 .get("Image")
                 .or_else(|| item.get("imgUrl"))
                 .or_else(|| item.get("album_sizable_cover"))
+                .or_else(|| item.get("album_img"))
+                .or_else(|| item.get("img"))
                 .and_then(Value::as_str)
                 .map(|s| s.replace("{size}", "400"))
                 .unwrap_or_default();
@@ -5313,10 +5418,17 @@ async fn kugou_song_play(args: KugouPlayArgs) -> Result<Value, String> {
             let name = data
                 .get("songName")
                 .or_else(|| data.pointer("/data/0/name"))
+                .or_else(|| data.get("songname"))
+                .or_else(|| data.get("name"))
+                .or_else(|| data.pointer("/data/0/songname"))
                 .and_then(Value::as_str);
             let artist = data
                 .get("choricSinger")
                 .or_else(|| data.pointer("/data/0/singername"))
+                .or_else(|| data.get("singername"))
+                .or_else(|| data.get("SingerName"))
+                .or_else(|| data.get("artist"))
+                .or_else(|| data.pointer("/data/0/SingerName"))
                 .and_then(Value::as_str);
             let quality_name = if is_preview {
                 format!("{qlabel}·试听")
@@ -5433,6 +5545,234 @@ struct SaveAppPlaylistsArgs {
 struct LoadAppPlaylistsResult {
     exists: bool,
     playlists: Vec<StoredAppPlaylist>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StudioPrepareArgs {
+    input_base64: Option<String>,
+    source_url: Option<String>,
+    file_name: Option<String>,
+    title: Option<String>,
+    runner_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StudioDownloadSourceArgs {
+    source_url: String,
+    file_name: Option<String>,
+}
+
+fn safe_file_name(name: Option<&str>) -> String {
+    let candidate = name.unwrap_or("input.ncm");
+    let clean = Path::new(candidate)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("input.ncm")
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ' | '(' | ')') { ch } else { '_' })
+        .collect::<String>();
+    if clean.is_empty() { "input.ncm".to_string() } else { clean }
+}
+
+fn update_stem_job(jobs: &StemJobsState, id: &str, update: impl FnOnce(&mut StemJob)) {
+    if let Ok(mut guard) = jobs.lock() {
+        if let Some(job) = guard.get_mut(id) { update(job); }
+    }
+}
+
+#[tauri::command]
+async fn studio_download_source(
+    args: StudioDownloadSourceArgs,
+    state: State<'_, NeteaseState>,
+) -> Result<Value, String> {
+    let parsed = reqwest::Url::parse(&args.source_url).map_err(|_| "当前歌曲下载地址无效".to_string())?;
+    let host = parsed.host_str().unwrap_or_default();
+    if parsed.scheme() != "https" || !(host == "music.126.net" || host.ends_with(".music.126.net")) {
+        return Err("当前歌曲下载地址不是网易云音乐 CDN 地址".into());
+    }
+    let response = state.client.get(parsed).send().await.map_err(|error| format!("下载原曲失败：{error}"))?;
+    if !response.status().is_success() { return Err(format!("下载原曲失败：HTTP {}", response.status())); }
+    let bytes = response.bytes().await.map_err(|error| format!("读取原曲失败：{error}"))?;
+    if bytes.len() > 512 * 1024 * 1024 { return Err("原曲文件超过 512 MiB 限制".into()); }
+    let name = args.file_name.unwrap_or_else(|| "original.mp3".into());
+    Ok(json!({
+        "name": name,
+        "mimeType": "audio/mpeg",
+        "base64": studio_files::encode_base64(&bytes),
+    }))
+}
+
+#[tauri::command]
+async fn studio_prepare_instrumental(
+    args: StudioPrepareArgs,
+    jobs: State<'_, StemJobsState>,
+    state: State<'_, NeteaseState>,
+) -> Result<Value, String> {
+    let id = format!("stem-{}-{}", timestamp_ms(), std::process::id());
+    let work_dir = app_data_dir().join("StudioJobs").join(&id);
+    let input_dir = work_dir.join("input");
+    let output_dir = work_dir.join("output");
+    fs::create_dir_all(&input_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    let file_name = args.file_name.clone().or_else(|| args.source_url.as_deref().and_then(|url| reqwest::Url::parse(url).ok().and_then(|parsed| parsed.path_segments().and_then(|mut segments| segments.next_back().map(str::to_string)))));
+    let input_path = input_dir.join(safe_file_name(file_name.as_deref()));
+    let input = if let Some(encoded) = args.input_base64.as_deref().filter(|value| !value.is_empty()) {
+        decode_base64(encoded).ok_or_else(|| "伴奏源文件不是有效的 Base64".to_string())?
+    } else if let Some(source_url) = args.source_url.as_deref() {
+        let parsed = reqwest::Url::parse(source_url).map_err(|_| "当前歌曲下载地址无效".to_string())?;
+        let host = parsed.host_str().unwrap_or_default();
+        if !matches!(parsed.scheme(), "http" | "https") || !(host == "music.126.net" || host.ends_with(".music.126.net")) {
+            return Err("当前歌曲下载地址不是网易云音乐 CDN 地址".into());
+        }
+        let response = state.client.get(parsed).send().await.map_err(|error| format!("下载当前歌曲失败：{error}"))?;
+        if !response.status().is_success() { return Err(format!("下载当前歌曲失败：HTTP {}", response.status())); }
+        response.bytes().await.map_err(|error| format!("读取当前歌曲失败：{error}"))?.to_vec()
+    } else {
+        return Err("没有可处理的歌曲输入".into());
+    };
+    if input.len() > 512 * 1024 * 1024 { return Err("伴奏源文件超过 512 MiB 限制".into()); }
+    fs::write(&input_path, input).map_err(|error| error.to_string())?;
+
+    let job = StemJob { id: id.clone(), state: "queued".into(), stage: "prepare".into(), progress: 0.0, output_path: None, error: None };
+    jobs.lock().map_err(|_| "伴奏任务状态锁定失败")?.insert(id.clone(), job);
+    let runner = args.runner_path.map(PathBuf::from).unwrap_or_else(|| {
+        let mut candidates = Vec::new();
+        // During development prefer the checked-in resource directory so
+        // runtime/model updates are picked up without copying a multi-GB
+        // Python environment into target/debug on every rebuild.
+        #[cfg(debug_assertions)]
+        candidates.extend([
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ncm2acc/ncm2acc-runner.exe"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ncm2acc/runner.py"),
+        ]);
+        candidates.extend(std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|dir| {
+                vec![
+                    dir.join("resources").join("ncm2acc").join("ncm2acc-runner.exe"),
+                    dir.join("resources").join("ncm2acc").join("runner.py"),
+                    dir.join("resources").join("ncm2acc-runner.exe"),
+                ]
+            }))
+            .unwrap_or_default());
+        candidates
+            .iter()
+            .find(|candidate| candidate.exists())
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("ncm2acc-runner.exe"))
+    });
+    let jobs_for_thread = jobs.inner().clone();
+    let id_for_thread = id.clone();
+    let title = args.title.unwrap_or_default();
+    thread::spawn(move || {
+        if jobs_for_thread.lock().ok().and_then(|jobs| jobs.get(&id_for_thread).map(|job| job.state == "cancelled")).unwrap_or(true) { return; }
+        update_stem_job(&jobs_for_thread, &id_for_thread, |job| { job.state = "running".into(); job.stage = "decrypt".into(); job.progress = 0.08; });
+        if !runner.exists() {
+            update_stem_job(&jobs_for_thread, &id_for_thread, |job| { job.state = "failed".into(); job.error = Some(format!("找不到 ncm2acc-runner.exe 或 runner.py：{}", runner.display())); });
+            return;
+        }
+        let is_python_script = runner.extension().and_then(|ext| ext.to_str()) == Some("py");
+        let mut command = if is_python_script {
+            let resource_root = runner.parent().unwrap_or_else(|| Path::new("."));
+            let python_candidates = [
+                resource_root.join(".venv/Scripts/python.exe"),
+                resource_root.join("python/python.exe"),
+                PathBuf::from("python.exe"),
+                PathBuf::from("py.exe"),
+            ];
+            if let Some(python) = python_candidates.iter().find(|candidate| candidate.exists()) {
+                let mut command = Command::new(python);
+                if python.file_name().and_then(|name| name.to_str()) == Some("py.exe") {
+                    command.arg("-3");
+                }
+                command.arg(&runner);
+                command
+            } else {
+                let mut command = Command::new("uv");
+                command.args(["run", "--with", "audio-separator[cpu]", "--python", "3.11"]);
+                command.arg(&runner);
+                command
+            }
+        } else {
+            Command::new(&runner)
+        };
+        #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
+        let spawn = command.arg("--input").arg(&input_path)
+            .arg("--output").arg(&output_dir)
+            .arg("--title").arg(title)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match spawn {
+            Ok(child) => child,
+            Err(error) => { update_stem_job(&jobs_for_thread, &id_for_thread, |job| { job.state = "failed".into(); job.error = Some(format!("启动伴奏运行包失败：{error}")); }); return; }
+        };
+        let event_jobs = jobs_for_thread.clone();
+        let event_id = id_for_thread.clone();
+        let stdout_thread = child.stdout.take().map(|stdout| thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                    let stage = event.get("stage").and_then(Value::as_str).unwrap_or("separate").to_string();
+                    let progress = event.get("progress").and_then(Value::as_f64).unwrap_or(0.35).clamp(0.0, 1.0) as f32;
+                    let output = event.get("outputPath").and_then(Value::as_str).map(str::to_string);
+                    let error = event.get("error").and_then(Value::as_str).map(str::to_string);
+                    update_stem_job(&event_jobs, &event_id, |job| { if job.state != "running" { return; } job.stage = stage.clone(); job.progress = job.progress.max(progress); if output.is_some() { job.output_path = output.clone(); } if error.is_some() { job.error = error.clone(); } });
+                }
+            }
+        }));
+        let stderr_thread = child.stderr.take().map(|mut stderr| thread::spawn(move || {
+            let mut tail = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(count) = stderr.read(&mut chunk) { if count == 0 { break; } tail.extend_from_slice(&chunk[..count]); if tail.len() > 8192 { tail.drain(..tail.len() - 8192); } }
+            String::from_utf8_lossy(&tail).into_owned()
+        }));
+        let result = loop {
+            let cancelled = jobs_for_thread.lock().ok().and_then(|jobs| jobs.get(&id_for_thread).map(|job| job.state == "cancelled")).unwrap_or(true);
+            if cancelled {
+                #[cfg(windows)] {
+                    use std::os::windows::process::CommandExt;
+                    let _ = Command::new("taskkill.exe").args(["/PID", &child.id().to_string(), "/T", "/F"]).creation_flags(0x08000000).output();
+                }
+                let _ = child.kill();
+                break child.wait();
+            }
+            match child.try_wait() { Ok(Some(status)) => break Ok(status), Err(error) => break Err(error), Ok(None) => thread::sleep(Duration::from_millis(100)) }
+        };
+        if let Some(handle) = stdout_thread { let _ = handle.join(); }
+        let stderr = stderr_thread.and_then(|handle| handle.join().ok()).unwrap_or_default();
+        update_stem_job(&jobs_for_thread, &id_for_thread, |job| {
+            if job.state == "cancelled" { return; }
+            match result {
+                Ok(status) if status.success() && job.output_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false) => { job.state = "completed".into(); job.stage = "finalize".into(); job.progress = 1.0; }
+                Ok(status) => { job.state = "failed".into(); if job.error.is_none() { job.error = Some(format!("伴奏运行包退出码 {}，输出缺失或分离失败。{}", status.code().unwrap_or(-1), stderr)); } }
+                Err(error) => { job.state = "failed".into(); job.error = Some(error.to_string()); }
+            }
+        });
+    });
+    Ok(json!({ "jobId": id }))
+}
+
+#[tauri::command]
+fn studio_job_status(job_id: String, jobs: State<'_, StemJobsState>) -> Result<StemJob, String> {
+    jobs.lock().map_err(|_| "伴奏任务状态锁定失败")?.get(&job_id).cloned().ok_or_else(|| "找不到伴奏任务".into())
+}
+
+#[tauri::command]
+fn studio_cancel_job(job_id: String, jobs: State<'_, StemJobsState>) -> Result<(), String> {
+    update_stem_job(&jobs.inner().clone(), &job_id, |job| { if matches!(job.state.as_str(), "queued" | "running") { job.state = "cancelled".into(); job.error = Some("用户取消了伴奏任务".into()); } });
+    Ok(())
+}
+
+#[tauri::command]
+fn studio_job_audio(job_id: String, jobs: State<'_, StemJobsState>) -> Result<Value, String> {
+    let job = jobs.lock().map_err(|_| "任务锁定失败")?.get(&job_id).cloned().ok_or("找不到伴奏任务")?;
+    if job.state != "completed" { return Err("伴奏尚未完成".into()); }
+    let path = PathBuf::from(job.output_path.ok_or("伴奏输出缺失")?).canonicalize().map_err(|e| e.to_string())?;
+    let allowed = app_data_dir().join("StudioJobs").join(&job.id).join("output").canonicalize().map_err(|e| e.to_string())?;
+    if !path.starts_with(allowed) { return Err("伴奏输出不在任务目录中".into()); }
+    Ok(json!({"name": path.file_name().unwrap().to_string_lossy(), "base64": studio_files::encode_base64(&fs::read(&path).map_err(|e| e.to_string())?)}))
 }
 
 fn proxy_url_allowed(url: &reqwest::Url) -> bool {
@@ -5626,6 +5966,7 @@ pub fn run() {
             device_file,
             playlist_cache: Mutex::new(HashMap::new()),
         })
+        .manage(std::sync::Arc::new(Mutex::new(HashMap::<String, StemJob>::new())))
         .manage(QqLoginState {
             pending: Mutex::new(None),
         })
@@ -5649,6 +5990,16 @@ pub fn run() {
                     let _ =
                         window.set_size(tauri::PhysicalSize::new(size.width + 1, size.height + 1));
                     let _ = window.set_size(tauri::PhysicalSize::new(size.width, size.height));
+                }
+                #[cfg(target_os = "windows")]
+                if let Ok(hwnd) = window.hwnd() {
+                    // Native rounding is optional on older Windows; material
+                    // requests report unsupported systems through their command.
+                    let _ = window_shape::sync(hwnd.0);
+                    desktop_background::register_events(app.handle().clone());
+                    if let Err(error) = desktop_background::install(hwnd.0) {
+                        eprintln!("{error}");
+                    }
                 }
             }
 
@@ -5705,6 +6056,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            set_desktop_blur,
             netease_qr_key,
             netease_qr_check,
             netease_login_status,
@@ -5734,7 +6086,24 @@ pub fn run() {
             kugou_search,
             kugou_song_play,
             load_app_playlists,
-            save_app_playlists
+            save_app_playlists,
+            studio_prepare_instrumental,
+            studio_download_source,
+            studio_job_status,
+            studio_cancel_job,
+            studio_files::studio_write_asset,
+            studio_files::studio_read_asset,
+            studio_files::studio_cache_read,
+            studio_files::studio_cache_write,
+            studio_files::studio_cache_remove,
+            studio_files::studio_save_project,
+            studio_files::studio_load_project,
+            studio_files::studio_list_projects,
+            studio_files::studio_delete_project,
+            studio_files::studio_export_package,
+            studio_files::studio_save_export,
+            studio_files::studio_encode_mp3,
+            studio_job_audio
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

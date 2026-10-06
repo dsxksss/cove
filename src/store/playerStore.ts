@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { LyricLine, RepeatMode, Song } from "../lib/types";
 import { getAudio, saveVolume } from "../lib/audio";
-import { getFavPlaylistId, getPlaylistPage, getSongMetadata } from "../lib/api";
+import { getAllPlaylistSongs, getFavPlaylistId, getSongMetadata } from "../lib/api";
 import { resolvePlayback, resolvePlaybackUrl, sameSong } from "../lib/musicSources";
 import { mergeTranslation, parseLrc, parseTranslation } from "../lib/lyric";
 import { extractAccent } from "../lib/color";
@@ -26,8 +26,10 @@ import {
   type LyricSourceMode,
 } from "../lib/lyrics/matchLyrics";
 import { LatestRequestGate } from "../lib/requestGate";
+import { loadPlaylistSongs } from "../lib/playlistCatalog";
+import type { PlaylistSummary } from "../lib/types";
 
-/** Page size for favorites playlist pagination (server-side). */
+/** Page size used by the all-tracks playlist loader. */
 const FAV_PAGE_SIZE = 100;
 const SHUFFLE_TRAIL_LIMIT = 200;
 const playbackGate = new LatestRequestGate();
@@ -99,6 +101,10 @@ async function warmNextTrack(): Promise<void> {
 
   const nextSong = queue[nextIndex];
   if (!nextSong) return;
+  // A studio handoff already has a local rendered file. It is intentionally
+  // kept out of the remote preloader so the player never replaces it with the
+  // original streaming source.
+  if (nextSong.localAudioUrl) return;
   try {
     const url = await resolvePlaybackUrl(nextSong, level);
     if (url) {
@@ -143,8 +149,7 @@ interface PlayerState {
   speed: number;
   /** Where the current lyrics came from (netease / qq / kugou / amll…). */
   lyricSourceLabel: string | null;
-  /** favorites playlist pagination: total tracks + how many loaded so far.
-   *  0 total = not loaded / unknown. */
+  /** Favorites playlist totals. Eager loading keeps loaded equal to total. */
   favTotal: number;
   favLoaded: number;
   favLoadingMore: boolean;
@@ -178,25 +183,21 @@ interface PlayerState {
   moveQueueItem: (from: number, to: number) => void;
   /** Stop playback and remove every item from the live queue. */
   clearQueue: () => void;
-  /** Load the user's "My Favorites" playlist as the queue (no autoplay).
-   *  Paginated: loads the first page fast, more on loadMoreFav(). */
+  /** Load the user's "My Favorites" playlist as the queue (no autoplay). */
   loadFavPlaylist: () => Promise<void>;
   /** Load any account playlist as the queue (no autoplay). */
   loadPlaylist: (id: number, source?: "favorites" | "playlist") => Promise<void>;
   /** Commit an already-loaded playlist's songs as the live queue and start
-   *  playing a given song from it. Unlike loadPlaylist, it does NOT refetch —
-   *  it reuses the provided songs — and fully sets queue/source/pagination so
-   *  next/prev/shuffle operate over the whole playlist. `total` is the true
-   *  playlist track count (may exceed songs.length if only partly loaded). */
+   *  playing a given song from it. Unlike loadPlaylist, it does NOT refetch. */
   playFromPlaylist: (playlistId: number, songs: Song[], song: Song, source?: "favorites" | "playlist", total?: number) => Promise<void>;
   /** Browse a playlist's songs WITHOUT affecting playback. Fills browseList
    *  only; index/isPlaying/currentTime/currentCover/lyrics are untouched. */
-  browsePlaylist: (id: number, source?: "netease" | "qq" | "kugou") => Promise<void>;
-  /** Append the next page of the currently-browsed playlist. */
+  browsePlaylist: (playlist: PlaylistSummary) => Promise<void>;
+  /** Compatibility action; eager loading means there is no next page. */
   browseMore: () => Promise<void>;
   /** Drop the browse list, reverting the drawer to the live queue. */
   clearBrowse: () => void;
-  /** Load the next page of favorites and append to the queue. */
+  /** Compatibility action; favorites are loaded eagerly. */
   loadMoreFav: () => Promise<void>;
   loadMorePlaylist: () => Promise<void>;
   toggle: () => void;
@@ -452,8 +453,22 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     const audio = getAudio();
     audio.pause();
     try {
-      // Multi-source resolve: NetEase / QQ / Kugou streaming + metadata.
-      const { url, meta } = await resolvePlayback(song, state.level);
+      // Studio mixes bypass the catalog resolver and use the rendered local
+      // file while keeping the original song metadata in the queue.
+      const { url, meta } = song.localAudioUrl
+        ? {
+            url: song.localAudioUrl,
+            meta: {
+              name: song.name,
+              ar_name: song.artist,
+              al_name: song.album,
+              pic: song.pic,
+              lyric: "",
+              tlyric: "",
+              lyric_source: "studio",
+            },
+          }
+        : await resolvePlayback(song, state.level);
       if (!playbackGate.isCurrent(requestToken)) return;
       // Prefer playlist/search pic when present — API often returns a different
       // CDN size/path for the same cover and causes a second visual change.
@@ -489,7 +504,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       // Provider LRC first (sync). External match (QQ/Kugou) runs AFTER play
       // starts — waiting on network lyrics previously froze progress/lyrics
       // for multi-source tracks until the match finished.
-      let lrc = parseLrc(rawLrc);
+      let lrc = song.localLyrics?.map((line) => ({ ...line })) ?? parseLrc(rawLrc);
       let merged = rawTr ? mergeTranslation(lrc, parseTranslation(rawTr)) : lrc;
       let lyricSourceLabel: string | null =
         merged.length > 0
@@ -554,7 +569,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
         mode === "kugou" ||
         (mode === "auto" && merged.length < 2);
 
-      if (needsExternal) {
+      if (needsExternal && !song.localAudioUrl) {
         const playToken = song;
         void (async () => {
           try {
@@ -624,9 +639,9 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   loadPlaylist: async (pid, source = "playlist") => {
     const requestToken = playlistLoadGate.next();
     try {
-      // Paginated: fetch only the first page (100 tracks) for a fast initial
-      // load. More pages load on demand when the queue drawer scrolls near the bottom.
-      const page = await getPlaylistPage(pid, FAV_PAGE_SIZE, 0);
+      // Load the complete playlist before exposing it to the queue. The drawer
+      // remains virtualized, so scrolling never starts network requests.
+      const page = await getAllPlaylistSongs(pid, FAV_PAGE_SIZE);
       if (!playlistLoadGate.isCurrent(requestToken)) return;
       if (page.songs.length === 0) {
         set({ error: "歌单为空或读取失败，请稍后重试" });
@@ -703,8 +718,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       idx = 0;
     }
     const isFav = source === "favorites";
-    // true total may be larger than loaded when browsing only fetched page 1;
-    // pass it so loadMorePlaylist can still fetch the remaining pages.
+    // The browse list is fully loaded before this action, so total normally
+    // equals q.length. Keep the total argument for compatibility with callers.
     const realTotal = total ?? q.length;
     // Commit the whole playlist as the live queue with full pagination state,
     // then play the picked song. This makes next/prev/shuffle operate over the
@@ -734,21 +749,18 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     // Keep browseList/browsePlaylistId intact. Playback and browsing are
     // independent contexts: choosing a track must not close the playlist page
     // or discard its pagination/scroll state.
-    // If the playlist has more pages than we loaded, fetch the rest in the
-    // background so shuffle/next cover the full playlist.
-    if (realTotal > q.length) {
-      void get().loadMorePlaylist();
-    }
     await get().playSong(song);
   },
 
-  browsePlaylist: async (pid, source = "netease") => {
+  browsePlaylist: async (playlist) => {
+    const pid = playlist.id;
+    const source = playlist.source ?? "netease";
     const cur = get();
     // already browsing this exact platform playlist? no-op (avoid refetch flicker)
     if (
       cur.browsePlaylistId === pid &&
       cur.browseSource === source &&
-      cur.browseList.length > 0
+      (cur.browseList.length > 0 || cur.browseLoadingMore)
     ) {
       return;
     }
@@ -765,7 +777,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       error: null,
     });
     try {
-      const page = await getPlaylistPage(pid, FAV_PAGE_SIZE, 0);
+      const page = await loadPlaylistSongs(playlist);
       if (!browseGate.isCurrent(requestToken)) return;
       // NOTE: deliberately does NOT touch index / isPlaying / currentTime /
       // currentCover / lyrics — playback keeps running undisturbed.
@@ -795,27 +807,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   },
 
   browseMore: async () => {
-    const { browsePlaylistId, browseSource, browseLoadingMore, browseLoaded, browseTotal } = get();
-    if (browsePlaylistId == null || browseLoadingMore) return;
-    if (browseLoaded >= browseTotal) return;
-    const requestToken = browseMoreGate.next();
-    set({ browseLoadingMore: true });
-    try {
-      const page = await getPlaylistPage(browsePlaylistId, FAV_PAGE_SIZE, browseLoaded);
-      const latest = get();
-      if (
-        !browseMoreGate.isCurrent(requestToken) ||
-        latest.browsePlaylistId !== browsePlaylistId ||
-        latest.browseSource !== browseSource
-      ) return;
-      set({
-        browseList: [...latest.browseList, ...page.songs],
-        browseLoaded: latest.browseLoaded + page.songs.length,
-        browseLoadingMore: false,
-      });
-    } catch {
-      if (browseMoreGate.isCurrent(requestToken)) set({ browseLoadingMore: false });
-    }
+    // All platform tracks are loaded when the playlist opens. Retain this
+    // action for older callers, but never issue a scroll-triggered request.
   },
 
   clearBrowse: () => {
@@ -836,38 +829,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   },
 
   loadMorePlaylist: async () => {
-    const {
-      activePlaylistId,
-      playlistLoadingMore,
-      playlistLoaded,
-      playlistTotal,
-      favSongIds,
-      queue,
-      queueSource,
-    } = get();
-    // already loading, or nothing more to load
-    if (!activePlaylistId || playlistLoadingMore || playlistLoaded >= playlistTotal) return;
-    set({ playlistLoadingMore: true, favLoadingMore: true });
-    try {
-      const page = await getPlaylistPage(activePlaylistId, FAV_PAGE_SIZE, playlistLoaded);
-      if (page.songs.length > 0) {
-        const nextFavSongIds = Array.from(
-          new Set([...favSongIds, ...page.songs.map((song) => String(song.id))])
-        );
-        set({
-          queue: [...queue, ...page.songs],
-          playlistLoaded: playlistLoaded + page.songs.length,
-          playlistTotal: page.total || playlistTotal,
-          favLoaded: playlistLoaded + page.songs.length,
-          favTotal: page.total || playlistTotal,
-          favSongIds: queueSource === "favorites" ? nextFavSongIds : favSongIds,
-        });
-      }
-    } catch {
-      /* load-more is best-effort; don't surface a hard error */
-    } finally {
-      set({ playlistLoadingMore: false, favLoadingMore: false });
-    }
+    // Playlist loading is eager, so queue scrolling never appends tracks or
+    // starts another request. Retain the action for compatibility.
   },
 
   toggle: () => {
@@ -1061,6 +1024,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     // Re-resolve stream at the new quality if something is already loaded.
     const song = get().currentSong();
     if (!song) return;
+    // Rendered studio audio is local and has no remote quality variant.
+    if (song.localAudioUrl) return;
     const audio = getAudio();
     const wasPlaying = !audio.paused;
     const t = audio.currentTime;

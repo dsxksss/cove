@@ -24,9 +24,10 @@ import {
   Gauge,
   Sparkles,
   ListMusic,
+  Mic2,
 } from 'lucide-react';
-// LiquidGlassCanvas (WebGL glass) removed for performance — pure CSS
-// backdrop-filter is used on the player card instead.
+// Windows composes the optional desktop material behind this alpha tint.
+// WebView filters apply only to the opt-in cover image.
 import { LyricMotionStyle, Song, PlayerLayout } from './playerTypes';
 import { getLyricLineMotion, isFoliaAbsoluteStyle } from './lyricMotion';
 import FoliaLyricsRail from './FoliaLyricsRail';
@@ -199,6 +200,7 @@ interface GlassPlayerProps {
   onNext: () => void;
   onPrev: () => void;
   onOpenQueue: () => void;
+  onOpenStudio: () => void;
   onLyricsPanelHoverChange?: (hovered: boolean) => void;
   onSeek: (time: number) => void;
   layout: PlayerLayout;
@@ -241,6 +243,7 @@ export default function GlassPlayer({
   onNext,
   onPrev,
   onOpenQueue,
+  onOpenStudio,
   onLyricsPanelHoverChange,
   onSeek,
   layout,
@@ -677,12 +680,10 @@ export default function GlassPlayer({
         {
           width: "100%",
           height: "100%",
-          borderRadius: "20px",
-          /* Pure-CSS liquid glass — fast (WebView2 native backdrop-filter).
-             No WebGL/Canvas, no cover background, no theme glow.
-             Desktop wallpaper shows through, frosted + saturated by this. */
-           // Cheap transparency: alpha-only tint, with no desktop blur or
-           // full-window filter pass. At 0% the player surface is transparent.
+          borderRadius: "var(--window-radius, 8px)",
+          ["--player-radius" as string]: "var(--window-radius, 8px)",
+           // Alpha tint over the optional native material; no WebView backdrop
+           // filter pass. At 0% the player tint itself is transparent.
            background: `rgba(8, 10, 14, ${glassTintOpacity})`,
            backdropFilter: "none",
            WebkitBackdropFilter: "none",
@@ -741,8 +742,9 @@ export default function GlassPlayer({
         </div>
       )}
       {useCoverBackground && backgroundImageUrl && (
-        <div className="absolute inset-0 z-0 overflow-hidden rounded-[20px] pointer-events-none">
+        <div className="absolute inset-0 z-0 overflow-hidden pointer-events-none" style={{ borderRadius: "inherit" }}>
           <img
+            data-cover-background
             key={backgroundImageUrl}
             src={backgroundImageUrl}
             alt=""
@@ -974,6 +976,21 @@ export default function GlassPlayer({
                       <Volume1 size={17} />
                     </motion.button>
                   </div>
+
+                  <motion.button
+                    type="button"
+                    whileHover={{ scale: 1.06 }}
+                    whileTap={{ scale: 0.94 }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={onOpenStudio}
+                    disabled={!canUseSongActions}
+                    title="翻唱工作室"
+                    aria-label="打开翻唱工作室"
+                    className="liquid-glass-solid flex items-center justify-center cursor-pointer disabled:cursor-not-allowed disabled:opacity-35"
+                    style={{ ["--lg-solid-size" as string]: "2.25rem" }}
+                  >
+                    <Mic2 size={17} />
+                  </motion.button>
 
                   <div ref={moreMenuRef} className="relative shrink-0">
                   <motion.button
@@ -1433,7 +1450,7 @@ export default function GlassPlayer({
                 />
                 {/* Synced Lyrics — Folia absolute rail (莫奈/浮名/流光) or scroll list */}
                 {suspendVisuals ? null : isFoliaAbsoluteStyle(lyricRenderStyle) ? (
-                  <div className="relative flex-1 min-h-0 flex flex-col pb-14 pt-10">
+                  <div className="relative flex-1 min-h-0 w-[88%] max-w-[760px] self-center flex flex-col pb-14 pt-10">
                     <div className="relative flex-1 min-h-0 no-drag">
                       <FoliaLyricsRail
                         style={lyricRenderStyle}
@@ -1456,7 +1473,7 @@ export default function GlassPlayer({
                   ref={lyricScrollRef}
                   onScroll={handleLyricScroll}
                   onWheel={handleLyricWheel}
-                  className="relative flex-1 min-h-0 overflow-y-auto pr-2 pb-24 pt-16 no-drag [scrollbar-width:none] [-ms-overflow-style:none]"
+                  className="relative flex-1 min-h-0 w-[88%] max-w-[760px] self-center overflow-y-auto pr-2 pb-24 pt-16 no-drag [scrollbar-width:none] [-ms-overflow-style:none]"
                   style={{
                     maskImage: 'linear-gradient(to bottom, transparent 0%, white 12%, white 78%, transparent 100%)',
                     WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, white 12%, white 78%, transparent 100%)'
