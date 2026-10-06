@@ -61,9 +61,26 @@ struct StemJob {
     progress: f32,
     output_path: Option<String>,
     error: Option<String>,
+    message: Option<String>,
+    elapsed_sec: Option<f32>,
+    indeterminate: bool,
 }
 
 type StemJobsState = std::sync::Arc<Mutex<HashMap<String, StemJob>>>;
+
+// Only one model may run at a time, including download/preparation and the
+// interval after cancellation while the previous process is still exiting.
+static STEM_JOB_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct StemJobPermit;
+impl StemJobPermit {
+    fn acquire() -> Result<Self, String> {
+        STEM_JOB_ACTIVE.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .map(|_| Self).map_err(|_| "已有伴奏任务正在处理或停止中，请稍后重试".into())
+    }
+}
+impl Drop for StemJobPermit {
+    fn drop(&mut self) { STEM_JOB_ACTIVE.store(false, std::sync::atomic::Ordering::Release); }
+}
 
 #[derive(Clone)]
 struct CachedPlaylist {
@@ -5610,6 +5627,7 @@ async fn studio_prepare_instrumental(
     jobs: State<'_, StemJobsState>,
     state: State<'_, NeteaseState>,
 ) -> Result<Value, String> {
+    let permit = StemJobPermit::acquire()?;
     let id = format!("stem-{}-{}", timestamp_ms(), std::process::id());
     let work_dir = app_data_dir().join("StudioJobs").join(&id);
     let input_dir = work_dir.join("input");
@@ -5635,7 +5653,7 @@ async fn studio_prepare_instrumental(
     if input.len() > 512 * 1024 * 1024 { return Err("伴奏源文件超过 512 MiB 限制".into()); }
     fs::write(&input_path, input).map_err(|error| error.to_string())?;
 
-    let job = StemJob { id: id.clone(), state: "queued".into(), stage: "prepare".into(), progress: 0.0, output_path: None, error: None };
+    let job = StemJob { id: id.clone(), state: "queued".into(), stage: "prepare".into(), progress: 0.0, output_path: None, error: None, message: Some("准备伴奏任务…".into()), elapsed_sec: None, indeterminate: false };
     jobs.lock().map_err(|_| "伴奏任务状态锁定失败")?.insert(id.clone(), job);
     let runner = args.runner_path.map(PathBuf::from).unwrap_or_else(|| {
         let mut candidates = Vec::new();
@@ -5667,8 +5685,9 @@ async fn studio_prepare_instrumental(
     let id_for_thread = id.clone();
     let title = args.title.unwrap_or_default();
     thread::spawn(move || {
+        let _permit = permit;
         if jobs_for_thread.lock().ok().and_then(|jobs| jobs.get(&id_for_thread).map(|job| job.state == "cancelled")).unwrap_or(true) { return; }
-        update_stem_job(&jobs_for_thread, &id_for_thread, |job| { job.state = "running".into(); job.stage = "decrypt".into(); job.progress = 0.08; });
+        update_stem_job(&jobs_for_thread, &id_for_thread, |job| { job.state = "running".into(); job.stage = "decrypt".into(); job.progress = 0.08; job.message = Some("正在启动伴奏处理…".into()); });
         if !runner.exists() {
             update_stem_job(&jobs_for_thread, &id_for_thread, |job| { job.state = "failed".into(); job.error = Some(format!("找不到 ncm2acc-runner.exe 或 runner.py：{}", runner.display())); });
             return;
@@ -5718,7 +5737,10 @@ async fn studio_prepare_instrumental(
                     let progress = event.get("progress").and_then(Value::as_f64).unwrap_or(0.35).clamp(0.0, 1.0) as f32;
                     let output = event.get("outputPath").and_then(Value::as_str).map(str::to_string);
                     let error = event.get("error").and_then(Value::as_str).map(str::to_string);
-                    update_stem_job(&event_jobs, &event_id, |job| { if job.state != "running" { return; } job.stage = stage.clone(); job.progress = job.progress.max(progress); if output.is_some() { job.output_path = output.clone(); } if error.is_some() { job.error = error.clone(); } });
+                    let message = event.get("message").and_then(Value::as_str).map(str::to_string);
+                    let elapsed_sec = event.get("elapsedSec").and_then(Value::as_f64).map(|value| value as f32);
+                    let indeterminate = event.get("indeterminate").and_then(Value::as_bool).unwrap_or(false);
+                    update_stem_job(&event_jobs, &event_id, |job| { if job.state != "running" { return; } job.stage = stage.clone(); job.progress = job.progress.max(progress); if output.is_some() { job.output_path = output.clone(); } if error.is_some() { job.error = error.clone(); } if message.is_some() { job.message = message.clone(); } if elapsed_sec.is_some() { job.elapsed_sec = elapsed_sec; } job.indeterminate = indeterminate; });
                 }
             }
         }));
@@ -5745,7 +5767,7 @@ async fn studio_prepare_instrumental(
         update_stem_job(&jobs_for_thread, &id_for_thread, |job| {
             if job.state == "cancelled" { return; }
             match result {
-                Ok(status) if status.success() && job.output_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false) => { job.state = "completed".into(); job.stage = "finalize".into(); job.progress = 1.0; }
+                Ok(status) if status.success() && job.output_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false) => { job.state = "completed".into(); job.stage = "finalize".into(); job.progress = 1.0; job.message = Some("伴奏已生成".into()); job.indeterminate = false; }
                 Ok(status) => { job.state = "failed".into(); if job.error.is_none() { job.error = Some(format!("伴奏运行包退出码 {}，输出缺失或分离失败。{}", status.code().unwrap_or(-1), stderr)); } }
                 Err(error) => { job.state = "failed".into(); job.error = Some(error.to_string()); }
             }

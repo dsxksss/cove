@@ -126,6 +126,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [jobId, setJobId] = useState<string | null>(null);
   const [stemProgress, setStemProgress] = useState(0);
   const [stemStage, setStemStage] = useState("准备文件");
+  const [stemIndeterminate, setStemIndeterminate] = useState(false);
   const [savedProjects, setSavedProjects] = useState<Array<{ id: string; title: string; artist: string }>>([]);
   const persistedProjectIdsRef = useRef(new Set<string>());
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
@@ -433,16 +434,19 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setNcmStatus("准备伴奏任务…");
     setStemStage("准备文件");
     setStemProgress(0.02);
+    setStemIndeterminate(false);
     void (async () => {
       try {
         const started = await invokeNative<{ jobId: string }>("studio_prepare_instrumental", { args: { ...input, title: currentProject.title } });
         setJobId(started.jobId);
         const poll = async () => {
           try {
-            const status = await invokeNative<{ state: string; stage: string; progress: number; outputPath?: string; error?: string }>("studio_job_status", { jobId: started.jobId });
+            const status = await invokeNative<{ state: string; stage: string; progress: number; outputPath?: string; error?: string; message?: string; elapsedSec?: number; indeterminate?: boolean }>("studio_job_status", { jobId: started.jobId });
             setStemStage(status.stage);
             setStemProgress(Math.max(0, Math.min(1, status.progress)));
-            setNcmStatus(`${status.stage} ${Math.round(status.progress * 100)}%`);
+            setStemIndeterminate(Boolean(status.indeterminate));
+            const elapsed = typeof status.elapsedSec === "number" ? ` · 已用时 ${Math.floor(status.elapsedSec / 60)}:${String(Math.floor(status.elapsedSec % 60)).padStart(2, "0")}` : "";
+            setNcmStatus(`${status.message ?? `${status.stage} ${Math.round(status.progress * 100)}%`}${elapsed}`);
             if (status.state === "running" || status.state === "queued") { window.setTimeout(() => void poll(), 800); return; }
             setJobId(null);
             if (status.state === "completed") {
@@ -461,7 +465,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                   // The generated accompaniment is still usable in this
                   // project when the optional shared cache cannot be written.
                 }
-                setStemProgress(1);
+                setStemProgress(1); setStemIndeterminate(false);
                 setNcmStatus("伴奏已生成并缓存");
                 resolve();
               } catch (error) { reject(error instanceof Error ? error : new Error(`伴奏已生成：${status.outputPath ?? "请导入输出文件"}`)); }
@@ -654,7 +658,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
           <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/70 hover:bg-white/15"><Upload size={14} />导入音频<input type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importAudio(file); event.currentTarget.value = ""; }} /></label>
           <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 px-3 py-2 text-xs font-bold text-white/55 hover:bg-white/8"><Upload size={14} />选择 .ncm 生成伴奏<input type="file" accept=".ncm" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void handleNcm(file); event.currentTarget.value = ""; }} /></label>
           {lastAsset(currentProject.tracks.find((track) => track.id === "instrumental")?.assets ?? []) && currentProject.source === "netease" && <button type="button" disabled={Boolean(jobId)} onClick={() => void handleCurrentSong()} className="flex w-full items-center justify-center rounded-xl border border-white/10 px-3 py-1.5 text-[11px] font-bold text-white/45 transition hover:bg-white/8 hover:text-white/75 disabled:cursor-wait disabled:opacity-40">重新生成伴奏</button>}
-          {ncmStatus && <div className="space-y-2 rounded-xl border border-white/8 bg-black/15 p-2.5"><div className="flex items-start gap-2"><p className="min-w-0 flex-1 break-words text-[10px] leading-relaxed text-white/55">{ncmStatus}{jobId ? ` · ${stemStage}` : ""}</p>{jobId && <button type="button" onClick={() => void cancelNcm()} className="shrink-0 rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-white/50 hover:bg-white/15">取消</button>}</div><div className="h-1.5 overflow-hidden rounded-full bg-white/10" role="progressbar" aria-label="伴奏准备进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(stemProgress * 100)}><div className="h-full rounded-full bg-lime-200 transition-[width] duration-500" style={{ width: `${Math.max(2, stemProgress * 100)}%` }} /></div></div>}
+          {ncmStatus && <div className="space-y-2 rounded-xl border border-white/8 bg-black/15 p-2.5"><div className="flex items-start gap-2"><p className="min-w-0 flex-1 break-words text-[10px] leading-relaxed text-white/55">{ncmStatus}{jobId ? ` · ${stemStage}` : ""}</p>{jobId && <button type="button" onClick={() => void cancelNcm()} className="shrink-0 rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-white/50 hover:bg-white/15">取消</button>}</div><div className="h-1.5 overflow-hidden rounded-full bg-white/10" role="progressbar" aria-label="伴奏准备进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(stemProgress * 100)}><div className={`h-full rounded-full bg-lime-200 transition-[width] duration-500 ${stemIndeterminate ? "animate-pulse" : ""}`} style={{ width: `${Math.max(2, stemProgress * 100)}%` }} /></div></div>}
         </div>
       </aside>
       <main className="flex min-w-0 flex-1 flex-col">

@@ -18,6 +18,6 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1
 
 已有本次版本的 release 主程序时，可加 `-SkipAppBuild` 仅重新打包。大文件安装器输出到 `.tmp/Cove-<版本>-Windows-x64`，附 SHA-256 文件清单。安装器资源和产物不提交到 Git。
 
-安装验收使用 `/COVEVERIFY=1 /CURRENTUSER /DIR=<测试目录>`，会用独立测试 AppId，并把桌面和开始菜单快捷方式写入测试目录。该参数只用于隔离验收，不用于用户分发说明。
+安装验收使用管理员 PowerShell 执行 `/COVEVERIFY=1 /DIR=<测试目录>`，会用独立测试 AppId，并把桌面和开始菜单快捷方式写入测试目录。该参数只用于隔离验收，不用于用户分发说明。
 
 打包工具文档：[Inno Setup](https://jrsoftware.org/isinfo.php)。单文件压缩体积须小于 4.2GB；超过时应改用原生安装器分卷，由安装器自动读取，不能把普通自解压包当成已验证的自动安装器。

@@ -42,6 +42,8 @@ DEFAULTS = {
     "model_dir": HERE / "models",                                 # 模型缓存目录（首次自动下载）
     "fmt":       "MP3",                                           # 伴奏输出格式
     "bitrate":   "320k",                                          # 伴奏 mp3 码率
+    "chunk_duration": 60.0,                                       # 分块处理，降低内存峰值
+    "threads":   2,                                               # CPU/OpenMP 线程上限
     "poll":      3.0,                                             # 轮询间隔（秒）
     "stable":    2,                                               # 文件大小连续 N 次不变才视为写入完成
     "dedup":     "record",                                        # 去重方式：record（哈希清单）/ move（移动文件）
@@ -239,6 +241,15 @@ def process_one(ncm: Path, cfg: dict, separator) -> bool:
 def make_separator(cfg: dict):
     """构建并加载 audio-separator（首次会自动下载模型）。"""
     try:
+        import torch
+        threads = max(1, int(cfg.get("threads", 2)))
+        try:
+            torch.set_num_threads(threads)
+            torch.set_num_interop_threads(threads)
+        except RuntimeError:
+            # PyTorch may already have initialized its pools; environment
+            # variables still cap the native libraries in that case.
+            pass
         from audio_separator.separator import Separator
     except ImportError:
         log.error("未安装 audio-separator。请先运行：")
@@ -252,6 +263,12 @@ def make_separator(cfg: dict):
         output_bitrate=cfg["bitrate"],
         output_single_stem="Instrumental",   # 只要伴奏
         model_file_dir=str(cfg["model_dir"]),
+        chunk_duration=float(cfg.get("chunk_duration", 60.0)),
+        use_autocast=bool(cfg.get("use_autocast", False)) and torch.cuda.is_available(),
+        # The shipped model uses dim_t=801. Bounding the inference window
+        # matters much more than full-song splitting for attention memory.
+        mdxc_params={"segment_size": 256, "override_model_segment_size": True,
+                     "batch_size": 1, "overlap": 2, "pitch_shift": 0},
     )
     sep.load_model(model_filename=cfg["model"])
     log.info("模型就绪。")
@@ -362,11 +379,17 @@ def parse_args() -> dict:
                     help="去重方式：record=原文件留在原地用哈希清单 / move=移到 processed")
     ap.add_argument("--once",    action="store_true",                help="批处理一次后退出")
     a = ap.parse_args()
+    env_chunk = os.environ.get("COVE_NCM2ACC_CHUNK_DURATION")
+    env_threads = os.environ.get("COVE_NCM2ACC_THREADS")
+    env_autocast = os.environ.get("COVE_NCM2ACC_USE_AUTOCAST")
     return {
         "watch": a.watch, "output": a.output, "ncmdump": a.ncmdump,
         "model": a.model, "model_dir": base["model_dir"],
         "fmt": a.fmt, "bitrate": a.bitrate, "poll": a.poll,
         "stable": a.stable, "dedup": a.dedup, "once": a.once,
+        "chunk_duration": max(10.0, float(env_chunk or base.get("chunk_duration", 60.0))),
+        "threads": max(1, int(env_threads or base.get("threads", 2))),
+        "use_autocast": env_autocast in ("1", "auto"),
     }
 
 
