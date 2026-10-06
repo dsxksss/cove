@@ -120,7 +120,9 @@ def main() -> int:
     parser.add_argument("--title", default="")
     parser.add_argument("--format", default="WAV")
     parser.add_argument("--model", default="")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    # CPU is the portable default. Bundled CUDA/PyTorch can report a CUDA
+    # build even when the target machine has no usable NVIDIA device.
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu")
     parser.add_argument("--chunk-duration", type=float, default=DEFAULT_CHUNK_DURATION)
     parser.add_argument("--timeout-minutes", type=float, default=DEFAULT_TIMEOUT_MINUTES)
     parser.add_argument("--memory-floor-mib", type=int, default=DEFAULT_MEMORY_FLOOR_MIB)
@@ -174,14 +176,16 @@ def main() -> int:
         for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "TORCH_NUM_THREADS"):
             environment[name] = "2"
         environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        if args.device == "cpu":
-            environment["CUDA_VISIBLE_DEVICES"] = ""
+        if args.device != "cuda":
+            # `-1` is required on Windows; an empty value can still leave the
+            # CUDA runtime visible to some PyTorch builds.
+            environment["CUDA_VISIBLE_DEVICES"] = "-1"
         # Let PyTorch validate GPU compatibility; a missing nvidia-smi in PATH
         # does not mean CUDA is unavailable. Avoid mixed precision on CPU.
         environment["PYTHONUNBUFFERED"] = "1"
         environment["COVE_NCM2ACC_CHUNK_DURATION"] = str(max(10.0, args.chunk_duration))
         environment["COVE_NCM2ACC_THREADS"] = "2"
-        environment["COVE_NCM2ACC_USE_AUTOCAST"] = "auto" if args.device != "cpu" else "0"
+        environment["COVE_NCM2ACC_USE_AUTOCAST"] = "1" if args.device == "cuda" else "0"
         # Model loading and CPU separation can take several minutes.  Do not
         # leave the UI at the initial 8% while waiting for a subprocess that
         # intentionally produces no stdout until it finishes.

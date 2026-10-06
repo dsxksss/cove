@@ -5768,7 +5768,7 @@ async fn studio_prepare_instrumental(
             if job.state == "cancelled" { return; }
             match result {
                 Ok(status) if status.success() && job.output_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false) => { job.state = "completed".into(); job.stage = "finalize".into(); job.progress = 1.0; job.message = Some("伴奏已生成".into()); job.indeterminate = false; }
-                Ok(status) => { job.state = "failed".into(); if job.error.is_none() { job.error = Some(format!("伴奏运行包退出码 {}，输出缺失或分离失败。{}", status.code().unwrap_or(-1), stderr)); } }
+                Ok(status) => { job.state = "failed".into(); if job.error.is_none() { let code = status.code().unwrap_or(-1); let hint = if code == 120 { " Python 120 通常表示解释器关闭输出流时失败；请使用最新版完整安装包，并确认安装目录可写。" } else { "" }; job.error = Some(format!("伴奏运行包退出码 {}，输出缺失或分离失败。{}{}", code, hint, stderr)); } }
                 Err(error) => { job.state = "failed".into(); job.error = Some(error.to_string()); }
             }
         });
