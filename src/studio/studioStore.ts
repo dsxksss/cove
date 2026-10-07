@@ -42,7 +42,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   inputDeviceId: "default",
   monitorInput: false,
   recordingTrackId: null,
-  setProject: (project) => set({ project, currentTime: 0, isPlaying: false }),
+  setProject: (project) => set({ project, currentTime: 0, isPlaying: false, recordingTrackId: null }),
   setCurrentTime: (currentTime) => set({ currentTime: Math.max(0, currentTime) }),
   setPlaying: (isPlaying) => set({ isPlaying }),
   setInputDeviceId: (inputDeviceId) => set({ inputDeviceId }),

@@ -1,10 +1,11 @@
 /** Studio regression with real Web Audio, synthetic audio and local IPC fixtures. */
 import { chromium } from "playwright";
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const base = process.env.COVE_TEST_URL || "http://127.0.0.1:1420";
+const csp = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8")).app.security.csp;
 const output = new URL("../.tmp/studio-ui-regression/", import.meta.url);
 mkdirSync(output, { recursive: true });
 const browser = await chromium.launch({ headless: true, args: ["--autoplay-policy=no-user-gesture-required"] });
@@ -12,7 +13,7 @@ const page = await browser.newPage({ viewport: { width: 1080, height: 700 } });
 const errors = [];
 page.on("pageerror", (error) => errors.push(error.message));
 try {
-  await page.route("**/__studio_regression", (route) => route.fulfill({ contentType: "text/html", body: '<html><body style="margin:0"><div id="root" style="height:100vh;width:100vw"></div></body></html>' }));
+  await page.route("**/__studio_regression", (route) => route.fulfill({ contentType: "text/html", headers: { "Content-Security-Policy": csp }, body: '<html><body style="margin:0"><div id="root" style="height:100vh;width:100vw"></div></body></html>' }));
   await page.goto(`${base}/__studio_regression`);
   await page.evaluate(async () => {
     const refresh = (await import("/@react-refresh")).default;
@@ -23,10 +24,12 @@ try {
     await import("/src/index.css?import");
     const React = (await import("/node_modules/.vite/deps/react.js")).default;
     const { createRoot } = (await import("/node_modules/.vite/deps/react-dom_client.js")).default;
-    const { StudioAudioEngine } = await import("/src/lib/studioAudio.ts");
+    const { default: Workspace } = await import("/src/components/StudioWorkspace.tsx");
+    const moduleUrl = (path) => performance.getEntriesByType("resource").filter((entry) => new URL(entry.name).pathname === path).at(-1)?.name ?? path;
+    const { StudioAudioEngine } = await import(moduleUrl("/src/lib/studioAudio.ts"));
     const subscribe = StudioAudioEngine.prototype.subscribePlayback;
     StudioAudioEngine.prototype.subscribePlayback = function (listener) { window.studioEngine = this; return subscribe.call(this, listener); };
-    const { useStudioStore } = await import("/src/studio/studioStore.ts");
+    const { useStudioStore } = await import(moduleUrl("/src/studio/studioStore.ts"));
     window.studioStore = useStudioStore;
     window.__TAURI_INTERNALS__ = { invoke: async (command) => { if (command === "studio_list_projects") return []; return null; } };
     Object.defineProperty(navigator.mediaDevices, "enumerateDevices", { value: async () => [
@@ -41,7 +44,6 @@ try {
     const asset = { id: "test-audio", url: URL.createObjectURL(blob), name: "Won't Go Home Without You (伴奏).wav", mimeType: "audio/wav", durationSec: 12 };
     project.tracks[0].assets = [asset]; project.instrumental = asset;
     project.tracks[0].clips = [{ id: "clip", assetId: asset.id, startSec: 0, offsetSec: 0, durationSec: 12 }];
-    const { default: Workspace } = await import("/src/components/StudioWorkspace.tsx");
     createRoot(document.getElementById("root")).render(React.createElement(Workspace, { project, onBack() {}, onPlayInPlayer() {} }));
   });
   const play = page.getByRole("button", { name: "播放工作室", exact: true });

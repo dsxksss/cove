@@ -288,8 +288,11 @@ fn write_project_zip(project_dir: &Path, output: &Path) -> Result<(), String> {
     if bytes.len() as u64 > MAX_PROJECT_JSON_BYTES { return Err("工程描述文件过大".into()); }
     let project: Value = serde_json::from_slice(&bytes).map_err(|e| format!("工程描述文件无效：{e}"))?;
     validate_project(&project)?;
-    for asset_id in project_asset_ids(&project)? {
-        if !project_dir.join("assets").join(format!("{asset_id}.audio")).is_file() {
+    let asset_ids = project_asset_ids(&project)?;
+    for asset_id in &asset_ids {
+        let path = project_dir.join("assets").join(format!("{asset_id}.audio"));
+        let metadata = fs::symlink_metadata(&path).map_err(|_| format!("工程缺少音频资产：{asset_id}，请先等待保存完成"))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(format!("工程缺少音频资产：{asset_id}，请先等待保存完成"));
         }
     }
@@ -298,10 +301,16 @@ fn write_project_zip(project_dir: &Path, output: &Path) -> Result<(), String> {
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     writer.start_file("project.json", options).map_err(|e| e.to_string())?;
     writer.write_all(&bytes).map_err(|e| e.to_string())?;
-    for directory in ["assets", "waveform"] {
-        let path = project_dir.join(directory);
-        if path.is_dir() { append_directory_to_zip(&mut writer, &path, directory)?; }
+    // Replacing a take or accompaniment leaves recoverable files on disk. The
+    // package must include only assets declared by its own project manifest.
+    for asset_id in &asset_ids {
+        let name = format!("assets/{asset_id}.audio");
+        writer.start_file(&name, options).map_err(|e| e.to_string())?;
+        let mut input = fs::File::open(project_dir.join(&name)).map_err(|e| e.to_string())?;
+        io::copy(&mut input, &mut writer).map_err(|e| e.to_string())?;
     }
+    let waveform = project_dir.join("waveform");
+    if waveform.is_dir() { append_directory_to_zip(&mut writer, &waveform, "waveform")?; }
     writer.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -478,6 +487,34 @@ pub fn studio_encode_mp3(project_id: String, input_base64: String) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exports_only_declared_assets_after_replacement() {
+        let dir = std::env::temp_dir().join(format!("cove-zip-test-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        let project = json!({"id": "test", "version": 1, "tracks": [{"id": "instrumental", "assets": [{"id": "current"}], "clips": [{"id": "clip", "assetId": "current"}]}]});
+        fs::write(dir.join("project.json"), serde_json::to_vec(&project).unwrap()).unwrap();
+        fs::write(dir.join("assets/old.audio"), b"old accompaniment").unwrap();
+        fs::write(dir.join("assets/current.audio"), b"current accompaniment").unwrap();
+        let output = dir.join("test.cove-studio");
+        write_project_zip(&dir, &output).unwrap();
+        let mut archive = ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        let ids = project_asset_ids(&project).unwrap();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            validate_imported_archive_entry(entry.name(), Some(&ids)).unwrap();
+            if entry.name() == "assets/current.audio" {
+                let mut bytes = Vec::new(); entry.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"current accompaniment");
+            }
+        }
+        assert!(archive.by_name("assets/old.audio").is_err());
+        assert!(dir.join("assets/old.audio").is_file());
+        drop(archive);
+        // This unique test-created directory is the only cleanup target.
+        assert!(dir.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test] fn rejects_traversal() { for id in ["../outside", "a/b", "a\\b", "", "."] { assert!(component(id).is_err()); } }
     #[test] fn base64_round_trip() { for data in [b"".as_slice(), b"a", b"ab", b"abc", &[0, 255, 128, 1]] { assert_eq!(super::super::decode_base64(&encode_base64(data)).unwrap(), data); } }
     #[test]

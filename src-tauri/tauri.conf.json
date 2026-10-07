@@ -29,7 +29,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; img-src 'self' data: http: https:; media-src 'self' data: blob: http: https:; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+      "csp": "default-src 'self'; script-src 'self'; img-src 'self' data: http: https:; media-src 'self' data: blob: http: https:; connect-src 'self' blob: ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
     },
     "macOSPrivateApi": true
   },

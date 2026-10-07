@@ -1,6 +1,7 @@
-import type { StudioProject, StudioTrack } from "../studio/types";
+import type { StudioAsset, StudioProject, StudioTrack } from "../studio/types";
 import { createTrackGraph, type TrackGraph } from "./studioDsp";
-import { getClipDuration, getProjectDuration } from "./studioSchedule";
+import { getClipDuration, getProjectDuration, isTrackAudible } from "./studioSchedule";
+import { decodeStudioAsset } from "./studioAssetAudio";
 
 type LoadedAsset = { buffer: AudioBuffer; url: string };
 type ScheduledSource = { source: AudioBufferSourceNode; trackId: string };
@@ -16,6 +17,7 @@ export class StudioAudioEngine {
   private project: StudioProject | null = null;
   private graphs = new Map<string, TrackGraph>();
   private loaded = new Map<string, LoadedAsset>();
+  private loadErrors = new Map<string, Error>();
   private sources: ScheduledSource[] = [];
   private loadRevision = 0;
   private structureKey = "";
@@ -61,6 +63,7 @@ export class StudioAudioEngine {
     }
 
     const revision = ++this.loadRevision;
+    this.loadErrors.clear();
     // Editing clips must not erase the user's play intent between rapid edits.
     // A project switch, unlike an edit, always stops and resets the transport.
     if (previousProjectId !== project.id) { this.pause(); this.position = 0; }
@@ -73,23 +76,22 @@ export class StudioAudioEngine {
     this.structureKey = nextKey;
     this.updateGraphs(project.tracks);
 
-    const requested = new Map<string, { id: string; url: string }>();
+    const requested = new Map<string, StudioAsset>();
     for (const track of project.tracks) {
       for (const asset of track.assets) {
-        if (!asset.url || requested.has(asset.id) || this.loaded.get(asset.id)?.url === asset.url) continue;
-        requested.set(asset.id, { id: asset.id, url: asset.url });
+        if (requested.has(asset.id) || this.loaded.get(asset.id)?.url === asset.url) continue;
+        requested.set(asset.id, asset);
       }
     }
-    const loading = Promise.all([...requested.values()].map(async ({ id, url }) => {
+    const loading = Promise.all([...requested.values()].map(async (asset) => {
+      const { id, url } = asset;
       try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`无法读取音频资产：${response.status}`);
-        const arrayBuffer = await response.arrayBuffer();
-        const buffer = await this.context.decodeAudioData(arrayBuffer.slice(0));
+        const buffer = await decodeStudioAsset(this.context, asset);
         if (revision === this.loadRevision && this.project?.id === project.id) this.loaded.set(id, { buffer, url });
-      } catch {
-        // Missing assets are skipped deliberately. Never substitute another
-        // asset from the same track, since that makes takes play incorrectly.
+      } catch (error) {
+        if (revision === this.loadRevision && this.project?.id === project.id) {
+          this.loadErrors.set(id, error instanceof Error ? error : new Error(String(error)));
+        }
       }
     }));
     this.pendingLoad = loading;
@@ -144,6 +146,14 @@ export class StudioAudioEngine {
     try {
       await Promise.all([this.context.resume(), this.pendingLoad]);
       if (transportRevision !== this.transportRevision || !this.playing) return;
+      const hasSolo = this.project?.tracks.some((track) => track.mixer.solo) ?? false;
+      for (const track of this.project?.tracks ?? []) {
+        if (!isTrackAudible(track, hasSolo)) continue;
+        for (const clip of track.clips) {
+          const error = this.loadErrors.get(clip.assetId);
+          if (error && clip.startSec + clip.durationSec > startPosition) throw error;
+        }
+      }
       const origin = this.context.currentTime + 0.015;
       const scheduled = this.project ? this.buildSources(this.project, startPosition, origin) : [];
       if (!allowEmpty && scheduled.length === 0) throw new Error("此位置没有可播放音频，请先导入音频或回到开头");
@@ -209,6 +219,7 @@ export class StudioAudioEngine {
     this.pause();
     this.clearGraphs();
     this.loaded.clear();
+    this.loadErrors.clear();
     this.project = null;
     this.playbackListeners.clear();
     this.analyser.disconnect();

@@ -2,12 +2,7 @@ import type { StudioProject } from "../studio/types";
 import { createTrackGraph } from "./studioDsp";
 import { encodePcmWav } from "./studioWav";
 import { getClipDuration, getProjectDuration, hasAudibleClips, isTrackAudible } from "./studioSchedule";
-
-async function decodeAsset(context: BaseAudioContext, url: string): Promise<AudioBuffer> {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`无法读取音频资产：${response.status}`);
-  return context.decodeAudioData((await response.arrayBuffer()).slice(0));
-}
+import { decodeStudioAsset } from "./studioAssetAudio";
 
 export async function renderStudioMix(project: StudioProject): Promise<Blob> {
   if (!hasAudibleClips(project)) throw new Error("没有可导出的音频，请检查音轨是否静音或尚未导入音频");
@@ -27,7 +22,7 @@ export async function renderStudioMix(project: StudioProject): Promise<Blob> {
       if (!asset) continue;
       let buffer = decoded.get(asset.id);
       if (!buffer) {
-        buffer = await decodeAsset(offline, asset.url);
+        buffer = await decodeStudioAsset(offline, asset);
         decoded.set(asset.id, buffer);
       }
       const offset = Math.min(buffer.duration, Math.max(0, clip.offsetSec));

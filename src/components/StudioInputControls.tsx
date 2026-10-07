@@ -13,6 +13,7 @@ type Props = {
   countdown: boolean;
   onCountdownChange: () => void;
   recording: boolean;
+  saving?: boolean;
   onRecord: () => void;
 };
 
@@ -59,9 +60,9 @@ export function StudioInputControls(props: Props) {
         className={`flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-[10px] font-bold ${props.countdown ? "bg-lime-200/15 text-lime-100" : "bg-white/8 text-white/45"}`}>
         <span className={`relative h-3.5 w-6 rounded-full ${props.countdown ? "bg-lime-200/70" : "bg-white/20"}`}><span className={`absolute top-0.5 h-2.5 w-2.5 rounded-full bg-white transition-all ${props.countdown ? "left-3" : "left-0.5"}`} /></span>倒计时
       </button>
-      <button type="button" onClick={props.onRecord} aria-label={props.recording ? "停止录音" : "开始录音"}
+      <button type="button" disabled={props.saving} onClick={props.onRecord} aria-label={props.saving ? "正在保存录音" : props.recording ? "停止录音" : "开始录音"}
         className={`flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 text-xs font-bold ${props.recording ? "bg-red-400/20 text-red-100" : "bg-white/10 text-white/80 hover:bg-white/15"}`}>
-        {props.recording ? <Square size={13} fill="currentColor" /> : <Mic2 size={14} />}{props.recording ? "停止" : "录音"}
+        {props.recording ? <Square size={13} fill="currentColor" /> : <Mic2 size={14} />}{props.saving ? "保存中" : props.recording ? "停止" : "录音"}
       </button>
     </div>
   </section>;

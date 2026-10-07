@@ -15,6 +15,16 @@ function setup() {
 describe("studio editing state", () => {
   afterEach(() => useStudioStore.getState().setProject(null));
 
+  it("clears stale recording locks when opening or closing a project", () => {
+    const { project, vocalId } = setup();
+    useStudioStore.getState().setRecordingTrackId(vocalId);
+    useStudioStore.getState().setProject(project);
+    expect(useStudioStore.getState().recordingTrackId).toBe(null);
+    useStudioStore.getState().setRecordingTrackId(vocalId);
+    useStudioStore.getState().setProject(null);
+    expect(useStudioStore.getState().recordingTrackId).toBe(null);
+  });
+
   it("applies mute and solo with deterministic priority", () => {
     const { vocalId } = setup();
     useStudioStore.getState().updateMixer(vocalId, { solo: true });

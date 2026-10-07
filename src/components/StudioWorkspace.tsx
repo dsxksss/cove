@@ -131,6 +131,9 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const engineRef = useRef<StudioAudioEngine | null>(null);
   const recorderRef = useRef<StudioRecorder | null>(null);
   const recordStartRef = useRef(0);
+  const recordingSessionRef = useRef(0);
+  const recordSavingRef = useRef(false);
+  const [savingRecording, setSavingRecording] = useState(false);
   const countdownAbortRef = useRef(false);
   const [selectedTrackId, setSelectedTrackId] = useState("instrumental");
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -189,7 +192,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       unsubscribe();
       mountedRef.current = false;
       countdownAbortRef.current = true;
+      recordingSessionRef.current += 1;
+      recordSavingRef.current = false;
       recorderRef.current?.dispose();
+      recorderRef.current = null;
+      useStudioStore.getState().setRecordingTrackId(null);
       if (stemJobRef.current) void invokeNative("studio_cancel_job", { jobId: stemJobRef.current }).catch(() => undefined);
       // StrictMode replays effects synchronously; keep the context for that replay.
       queueMicrotask(() => {
@@ -295,6 +302,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, [recordingTrackId]);
 
   useEffect(() => { recorderRef.current?.update(inputGain, monitorInput); }, [inputGain, monitorInput]);
+
+  useEffect(() => {
+    if (recordingTrackId) { setProjectMenuOpen(false); setExportMenuOpen(false); }
+  }, [recordingTrackId]);
 
   const beginScrub = useCallback(() => {
     if (scrubRef.current || useStudioStore.getState().recordingTrackId) return;
@@ -487,22 +498,28 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   };
 
   const startRecording = async () => {
-    if (!navigator.mediaDevices?.getUserMedia || !engineRef.current) { setNcmStatus("当前 WebView 不支持麦克风录音"); return; }
+    if (recordSavingRef.current) return;
+    if (!navigator.mediaDevices?.getUserMedia || !engineRef.current) { setNcmStatus("当前 WebView 不支持麦克风录音"); setRecordingTrackId(null); return; }
+    const recorder = new StudioRecorder(engineRef.current.context);
+    const projectId = currentProject.id;
+    recordingSessionRef.current += 1;
+    recorderRef.current = recorder;
     try {
       countdownAbortRef.current = false;
-      const recorder = new StudioRecorder(engineRef.current.context);
       await recorder.prepare(inputDeviceId, inputGain, monitorInput);
+      if (!isCurrentProject(projectId) || recorderRef.current !== recorder) { recorder.dispose(); return; }
       recorder.onDeviceLost(() => {
         if (recorderRef.current !== recorder) return;
         recorder.dispose();
         recorderRef.current = null;
+        countdownAbortRef.current = true;
+        setCountdownValue(null);
         engineRef.current?.pause();
         setPlaying(false);
         setMicLevel({ rms: 0, peak: 0, clipping: false });
         setNcmStatus("麦克风已断开，录音已停止");
         setRecordingTrackId(null);
       });
-      recorderRef.current = recorder;
       if (countdownAbortRef.current) {
         recorder.dispose();
         recorderRef.current = null;
@@ -513,22 +530,26 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         for (let value = 3; value >= 1; value -= 1) {
           setCountdownValue(value);
           await new Promise<void>((resolve) => window.setTimeout(resolve, 800));
-          if (countdownAbortRef.current) {
+          if (countdownAbortRef.current || recorderRef.current !== recorder || !isCurrentProject(projectId)) {
             recorder.dispose();
-            recorderRef.current = null;
-            setCountdownValue(null);
             return;
           }
         }
         setCountdownValue(null);
       }
       const scheduleAt = (engineRef.current?.context.currentTime ?? 0) + 0.015;
-      recordStartRef.current = recorder.start(scheduleAt);
-      await engineRef.current?.play(currentTime, true);
+      // AudioContext time measures the lifetime of the device; clips use the
+      // song playhead, which can be reset or seeked independently.
+      recordStartRef.current = useStudioStore.getState().currentTime;
+      recorder.start(scheduleAt);
+      await engineRef.current?.play(recordStartRef.current, true);
+      if (recorderRef.current !== recorder || !isCurrentProject(projectId)) return;
       setNcmStatus("正在录音，再次点击停止");
     } catch (error) {
-      recorderRef.current?.dispose();
+      recorder.dispose();
+      if (recorderRef.current !== recorder || !isCurrentProject(projectId)) return;
       recorderRef.current = null;
+      setCountdownValue(null);
       engineRef.current?.pause();
       setPlaying(false);
       setMicLevel({ rms: 0, peak: 0, clipping: false });
@@ -538,23 +559,37 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   };
 
   const stopRecording = () => {
-    if (!recorderRef.current && recordingTrackId) {
-      countdownAbortRef.current = true;
-      setRecordingTrackId(null);
-      setNcmStatus("已取消录音准备");
-      return;
-    }
-    if (countdownValue !== null) {
+    if (recordSavingRef.current) return;
+    if (!recorderRef.current || recorderRef.current.startedAt === null) {
       countdownAbortRef.current = true;
       recorderRef.current?.dispose();
       recorderRef.current = null;
       setCountdownValue(null);
       setRecordingTrackId(null);
-      setNcmStatus("已取消录音倒计时");
+      setNcmStatus("已取消录音准备");
       return;
     }
-    const recorder = recorderRef.current; recorderRef.current = null; engineRef.current?.pause(); setPlaying(false); setNcmStatus("正在保存录音 take…");
-    if (recorder) void recorder.stop().then(async (blob) => { const file = new File([blob], `${currentProject.title}-${Date.now()}.wav`, { type: "audio/wav" }); await importAudio(file, recordingTrackId ?? selectedTrackId, Math.max(0, recordStartRef.current - currentProject.inputLatencyMs / 1000)); setRecordingTrackId(null); }).catch((error) => { setRecordingTrackId(null); setNcmStatus(error instanceof Error ? error.message : "保存录音失败"); });
+    const recorder = recorderRef.current;
+    const projectId = currentProject.id;
+    const session = recordingSessionRef.current;
+    const trackId = recordingTrackId ?? selectedTrackId;
+    const startSec = Math.max(0, recordStartRef.current - currentProject.inputLatencyMs / 1000);
+    recorderRef.current = null;
+    recordSavingRef.current = true;
+    setSavingRecording(true);
+    engineRef.current?.pause(); setPlaying(false); setNcmStatus("正在保存录音 take…");
+    const isCurrentSession = () => isCurrentProject(projectId) && session === recordingSessionRef.current;
+    void recorder.stop().then(async (blob) => {
+      if (!isCurrentSession()) return;
+      const file = new File([blob], `${currentProject.title}-${Date.now()}.wav`, { type: "audio/wav" });
+      await importAudio(file, trackId, startSec);
+      if (isCurrentSession()) setNcmStatus("录音已添加到音轨");
+    }).catch((error) => {
+      if (isCurrentSession()) setNcmStatus(error instanceof Error ? error.message : "保存录音失败");
+    }).finally(() => {
+      if (!isCurrentSession()) return;
+      recordSavingRef.current = false; setSavingRecording(false); setRecordingTrackId(null);
+    });
   };
 
   const startStemJob = (input: { inputBase64?: string; sourceUrl?: string; fileName: string }) => new Promise<void>((resolve, reject) => {
@@ -693,6 +728,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     } catch { setNcmStatus("工程保存失败，请检查应用数据目录权限"); }
   };
   const exportFile = async (extension: "wav" | "mp3" | "cove-studio") => {
+    if (useStudioStore.getState().recordingTrackId) { setNcmStatus("请先停止录音，等待音轨保存后再导出"); return; }
     if (exportBusyRef.current) return;
     exportBusyRef.current = true;
     setExporting(true);
@@ -729,6 +765,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   };
 
   const playMixInPlayer = async () => {
+    if (useStudioStore.getState().recordingTrackId) { setNcmStatus("请先停止录音，等待音轨保存后再播放翻唱"); return; }
     if (exportBusyRef.current) return;
     exportBusyRef.current = true;
     setExporting(true);
@@ -770,13 +807,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   return <div className="relative flex h-full w-full flex-col overflow-hidden bg-slate-950/90 text-white">
     <header ref={headerMenuRef} data-tauri-drag-region className="flex h-16 shrink-0 items-center gap-3 border-b border-white/10 px-5">
-      <button type="button" onClick={() => onBack(useStudioStore.getState().project ?? currentProject)} className="grid h-9 w-9 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white" aria-label="返回播放器"><ArrowLeft size={18} /></button>
+      <button type="button" disabled={Boolean(recordingTrackId)} title={recordingTrackId ? "请先停止录音" : "返回播放器"} onClick={() => onBack(useStudioStore.getState().project ?? currentProject)} className="grid h-9 w-9 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white disabled:opacity-40" aria-label="返回播放器"><ArrowLeft size={18} /></button>
       {currentProject.coverUrl ? <img src={currentProject.coverUrl} alt="" className="h-10 w-10 rounded-xl object-cover" /> : <div className="grid h-10 w-10 place-items-center rounded-xl bg-white/10"><Disc3 size={18} /></div>}
       <div className="min-w-0 flex-1">{renamingProject ? <input autoFocus value={projectTitleDraft} onChange={(event) => setProjectTitleDraft(event.target.value)} onBlur={commitProjectRename} onKeyDown={(event) => { if (event.key === "Enter") commitProjectRename(); if (event.key === "Escape") { setProjectTitleDraft(currentProject.title); setRenamingProject(false); } }} aria-label="工程名称" className="no-drag w-full max-w-xs rounded-lg bg-white/10 px-2 py-1 text-sm font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <div className="flex min-w-0 items-center gap-1"><h1 className="truncate text-sm font-bold">{currentProject.title}</h1><button type="button" onClick={() => { setProjectTitleDraft(currentProject.title); setRenamingProject(true); }} className="no-drag shrink-0 rounded p-1 text-white/35 transition hover:bg-white/10 hover:text-white/80" aria-label="重命名工程" title="重命名工程"><Pencil size={12} /></button></div>}<p className="truncate text-xs text-white/45">{currentProject.artist} · 翻唱工作室</p></div>
       <label className="hidden items-center gap-2 text-xs text-white/45 lg:flex">输入延迟 <input type="text" inputMode="decimal" aria-label="输入延迟毫秒" value={currentProject.inputLatencyMs} onChange={(event) => { const value = event.target.value.replace(/[^0-9.-]/g, ""); if (value === "" || value === "-" || value === "." || /^-?\d*\.?\d*$/.test(value)) updateLatency(value === "" || value === "-" || value === "." ? 0 : Number(value)); }} className="studio-latency-input no-drag w-16 rounded-lg bg-white/8 px-2 py-1 text-right font-mono text-white outline-none transition focus:bg-white/12 focus:ring-1 focus:ring-lime-200/60" /> ms</label>
       <button type="button" onClick={saveProject} className="flex items-center gap-1.5 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/15"><Save size={14} />保存</button>
       <div className="relative no-drag">
-        <button type="button" aria-haspopup="menu" aria-expanded={projectMenuOpen} onClick={() => { setProjectMenuOpen((open) => !open); setMicMenuOpen(false); setExportMenuOpen(false); }} className="flex items-center justify-between gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/75 transition hover:bg-white/15"><span>工程</span><ChevronDown size={14} className={`transition-transform ${projectMenuOpen ? "rotate-180" : ""}`} /></button>
+        <button type="button" disabled={Boolean(recordingTrackId)} title={recordingTrackId ? "请先停止录音" : undefined} aria-haspopup="menu" aria-expanded={projectMenuOpen} onClick={() => { setProjectMenuOpen((open) => !open); setMicMenuOpen(false); setExportMenuOpen(false); }} className="flex items-center justify-between gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/75 transition hover:bg-white/15 disabled:opacity-40"><span>工程</span><ChevronDown size={14} className={`transition-transform ${projectMenuOpen ? "rotate-180" : ""}`} /></button>
         {projectMenuOpen && <div role="menu" className="absolute right-0 top-full z-[100] mt-2 max-h-60 w-64 overflow-y-auto rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
           <p className="px-3 pt-2 text-[10px] text-white/35">打开本地工程</p>
           <button type="button" role="menuitem" onClick={() => void importProjectPackage()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-bold text-lime-100/80 hover:bg-lime-200/10"><Upload size={13} />导入 .cove-studio 工程包</button>
@@ -786,7 +823,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         </div>}
       </div>
       <div className="relative no-drag">
-        <button type="button" disabled={exporting} aria-haspopup="menu" aria-expanded={exportMenuOpen} onClick={() => { setExportMenuOpen((open) => !open); setProjectMenuOpen(false); setMicMenuOpen(false); }} className="flex items-center gap-2 rounded-xl bg-lime-200 px-3 py-2 text-xs font-bold text-slate-950 transition hover:bg-lime-100 disabled:cursor-wait disabled:opacity-60"><Download size={14} />{exporting ? "正在导出…" : "导出"}<ChevronDown size={14} /></button>
+        <button type="button" disabled={exporting || Boolean(recordingTrackId)} title={recordingTrackId ? "请先停止录音，等待音轨保存后再导出" : undefined} aria-haspopup="menu" aria-expanded={exportMenuOpen} onClick={() => { setExportMenuOpen((open) => !open); setProjectMenuOpen(false); setMicMenuOpen(false); }} className="flex items-center gap-2 rounded-xl bg-lime-200 px-3 py-2 text-xs font-bold text-slate-950 transition hover:bg-lime-100 disabled:opacity-60"><Download size={14} />{exporting ? "正在导出…" : "导出"}<ChevronDown size={14} /></button>
         {exportMenuOpen && <div role="menu" aria-label="导出格式" className="absolute right-0 top-full z-[100] mt-2 w-60 rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
           <button type="button" role="menuitem" disabled={exporting || !hasRenderableAudio} onClick={() => void playMixInPlayer()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition hover:bg-lime-200/10 disabled:cursor-not-allowed disabled:opacity-50"><Play size={14} fill="currentColor" className="text-lime-200" /><span className="min-w-0 flex-1"><span className="block text-xs font-bold text-white/90">在播放器中播放翻唱</span><span className="mt-0.5 block text-[10px] text-white/40">{hasRenderableAudio ? "沿用原歌曲封面、歌名和歌词" : "请先导入伴奏或录音"}</span></span></button>
           <div className="my-1 border-t border-white/10" />
@@ -890,7 +927,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             {selectedTrack && <EffectPanel track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} onReset={() => resetEffects(selectedTrack.id)} />}
             <StudioInputControls devices={devices} deviceId={inputDeviceId} deviceLabel={micLabel} menuOpen={micMenuOpen}
               onMenuChange={(open) => { setMicMenuOpen(open); if (open) setProjectMenuOpen(false); }} onDeviceChange={setInputDeviceId}
-              level={micLevel} countdown={countdownEnabled} recording={Boolean(recordingTrackId)}
+                level={micLevel} countdown={countdownEnabled} recording={Boolean(recordingTrackId)} saving={savingRecording}
               onCountdownChange={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* optional preference */ } }}
               onRecord={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") { setRecordingTrackId(selectedTrack.id); void startRecording(); } else setNcmStatus("请先添加并选择人声轨"); }} />
           </div>

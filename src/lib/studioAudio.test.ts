@@ -127,4 +127,21 @@ describe("studio transport state", () => {
     expect(failed).toBe(true); expect(playing).toBe(false); expect(engine.isPlaying).toBe(false);
     engine.dispose();
   });
+
+  it("reports the failed asset instead of claiming the project has no audio", async () => {
+    const engine = new StudioAudioEngine();
+    globalThis.fetch = async () => { throw new Error("Failed to fetch"); };
+    const value = project();
+    await engine.setProject(value);
+    let message = "";
+    try { await engine.play(0); } catch (error) { message = (error as Error).message; }
+    expect(message.includes("audio.wav")).toBe(true);
+    expect(message.includes("Failed to fetch")).toBe(true);
+    expect(engine.isPlaying).toBe(false);
+    globalThis.fetch = (async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(1) })) as typeof fetch;
+    value.tracks[0].assets[0].url = "blob:replacement";
+    await engine.setProject(value); await engine.play(0);
+    expect(engine.isPlaying).toBe(true);
+    engine.dispose();
+  });
 });
