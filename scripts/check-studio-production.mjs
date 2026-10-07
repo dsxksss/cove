@@ -116,12 +116,15 @@ try {
   const saved = new Map(), assets = new Map();
   let failSave = false, failAssetWrite = false, vocalCache = null;
   let holdAssetWrite = false, releaseAssetWrite = null;
+  let exportOutcome = "success", holdExport = false, releaseExport = null;
   await page.exposeFunction("testNative", async (command, args) => {
     if (command === "studio_list_projects") return [];
     if (command === "test_fail_save") { failSave = args.enabled; return; }
     if (command === "test_fail_asset_write") { failAssetWrite = args.enabled; return; }
     if (command === "test_hold_asset_write") { holdAssetWrite = args.enabled; if (!holdAssetWrite) { releaseAssetWrite?.(); releaseAssetWrite = null; } return; }
     if (command === "test_asset_write_pending") return Boolean(releaseAssetWrite);
+    if (command === "test_export_outcome") { exportOutcome = args.outcome; return; }
+    if (command === "test_hold_export") { holdExport = args.enabled; if (!holdExport) { releaseExport?.(); releaseExport = null; } return; }
     if (command === "test_vocal_cache") { vocalCache = args; return; }
     if (command === "studio_cache_read") return args.stem === "vocals" ? vocalCache : null;
     if (command === "studio_save_project") {
@@ -152,10 +155,18 @@ try {
     }
     if (command === "studio_save_export") {
       assert.ok(["wav", "mp3"].includes(args.extension));
+      if (holdExport) await new Promise(resolve => { releaseExport = resolve; });
+      if (exportOutcome === "cancel") return null;
+      if (exportOutcome === "error") throw new Error("模拟导出失败");
       const path = new URL(`ui-export.${args.extension}`, output);
       writeFileSync(path, Buffer.from(args.inputBase64, "base64"));
       exports.push(args.extension);
       return fileURLToPath(path);
+    }
+    if (command === "studio_export_package_to_file") {
+      if (exportOutcome === "cancel") return null;
+      if (exportOutcome === "error") throw new Error("模拟导出失败");
+      return fileURLToPath(new URL("export.cove-studio", output));
     }
     return null;
   });
@@ -328,15 +339,41 @@ try {
   await page.getByText("人声 1", { exact: true }).first().click();
   console.log("Studio tools PASS: signed latency/offset, pan, normalization, real FFmpeg denoise, restore after edits/new take, distinct cached vocal reference, explicit save/discard/cancel and failed-save guard.");
   for (const label of ["WAV 音频", "MP3 音频"]) {
+    await page.evaluate(() => window.testNative("test_hold_export", { enabled: true }));
     await page.getByRole("button", { name: "导出", exact: true }).click();
     await page.getByRole("menuitem", { name: new RegExp(label) }).click();
+    await page.getByText("请选择导出文件夹和文件名…", { exact: true }).waitFor();
+    const progress = page.getByRole("progressbar", { name: "导出进度", exact: true });
+    await progress.waitFor();
+    assert.equal(await progress.getAttribute("aria-valuenow"), null, "export must not reuse the last accompaniment percentage");
+    await page.evaluate(() => window.testNative("test_hold_export", { enabled: false }));
     await page.getByText(/已导出到：/).waitFor();
+    await page.getByRole("button", { name: "导出", exact: true }).waitFor();
+    assert.equal(await page.getByRole("progressbar").count(), 0, "completed export leaves its result text without a stale progress bar");
   }
   assert.deepEqual(exports, ["wav", "mp3"]);
   const exportedWav = readFileSync(new URL("ui-export.wav", output));
   assert.equal(exportedWav.readUInt16LE(34), 24);
   const mp3 = readFileSync(new URL("ui-export.mp3", output));
   assert.ok(mp3.length > 30000);
+  for (const label of ["WAV 音频", "工作室工程包"]) {
+    for (const outcome of ["cancel", "error"]) {
+      await page.evaluate(outcome => window.testNative("test_export_outcome", { outcome }), outcome);
+      await page.getByRole("button", { name: "导出", exact: true }).click();
+      await page.getByRole("menuitem", { name: new RegExp(label) }).click();
+      await page.getByText(outcome === "cancel" ? "已取消导出" : "模拟导出失败", { exact: true }).waitFor();
+      await page.getByRole("button", { name: "导出", exact: true }).waitFor();
+      assert.equal(await page.getByRole("progressbar").count(), 0, "cancelled/failed exports must remove progress without hiding their message");
+    }
+  }
+  await page.evaluate(() => window.testNative("test_export_outcome", { outcome: "success" }));
+  await page.getByRole("button", { name: "导出", exact: true }).click();
+  await page.getByRole("menuitem", { name: /工作室工程包/ }).click();
+  await page.getByText(/工程包已导出到：/).waitFor();
+  await page.getByRole("button", { name: "导出", exact: true }).waitFor();
+  assert.equal(await page.getByRole("progressbar").count(), 0);
+  await page.screenshot({ path: fileURLToPath(new URL("export-complete.png", output)) });
+  console.log("Export progress PASS: running export animation, no stale stem percentage, success/cancel/error cleanup for audio and project packages, result text retained.");
   await page.getByRole("button", { name: "导出", exact: true }).click();
   await page.getByRole("menuitem", { name: /在播放器中播放翻唱/ }).click();
   await page.waitForFunction(() => window.playerMix);
