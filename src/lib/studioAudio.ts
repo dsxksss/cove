@@ -137,7 +137,7 @@ export class StudioAudioEngine {
     this.sources = [];
   }
 
-  async play(time: number, allowEmpty = false): Promise<void> {
+  async play(time: number, allowEmpty = false, onScheduled?: (contextTime: number) => void): Promise<void> {
     const transportRevision = ++this.transportRevision;
     this.clearSources();
     const startPosition = Number.isFinite(time) ? Math.max(0, time) : 0;
@@ -161,6 +161,10 @@ export class StudioAudioEngine {
       const origin = this.context.currentTime + 0.015;
       const scheduled = this.project ? this.buildSources(this.project, startPosition, origin) : [];
       if (!allowEmpty && scheduled.length === 0) throw new Error("此位置没有可播放音频，请先导入音频或回到开头");
+      // Start capture only after resume/decode is ready, at the exact same
+      // AudioContext timestamp as the accompaniment. Awaiting play after
+      // starting the recorder used to add that entire wait to the take.
+      onScheduled?.(origin);
       this.startContextTime = origin;
       for (const item of scheduled) {
         item.source.start(item.when, item.offset, item.duration);

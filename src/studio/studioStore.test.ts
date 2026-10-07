@@ -15,6 +15,32 @@ function setup() {
 describe("studio editing state", () => {
   afterEach(() => useStudioStore.getState().setProject(null));
 
+  it("applies positive input compensation at zero without altering the full take", () => {
+    const { vocalId } = setup();
+    const asset = { id: "compensated", name: "vocal.wav", url: "blob:vocal", mimeType: "audio/wav", durationSec: 3 };
+    useStudioStore.getState().addAssetToTrack(vocalId, asset, undefined, -0.1);
+    const track = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    const clip = track.clips[track.clips.length - 1];
+    expect(clip.startSec).toBe(0);
+    expect(clip.offsetSec).toBe(0.1);
+    expect(clip.durationSec).toBe(2.9);
+    expect(track.assets[track.assets.length - 1].durationSec).toBe(3);
+    expect(track.takes[track.takes.length - 1].assetId).toBe("compensated");
+  });
+
+  it("delays a negative-compensated take without trimming, including a short recording", () => {
+    const { vocalId } = setup();
+    const asset = { id: "delayed", name: "short.wav", url: "blob:short", mimeType: "audio/wav", durationSec: 0.05 };
+    useStudioStore.getState().addAssetToTrack(vocalId, asset, undefined, 0.1);
+    let track = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    expect(track.clips[track.clips.length - 1].startSec).toBe(0.1);
+    expect(track.clips[track.clips.length - 1].offsetSec).toBe(0);
+    useStudioStore.getState().addAssetToTrack(vocalId, { ...asset, id: "short-advanced" }, undefined, -0.1);
+    track = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    expect(track.clips[track.clips.length - 1].durationSec).toBe(0);
+    expect(track.assets[track.assets.length - 1].durationSec).toBe(0.05);
+  });
+
   it("keeps full-song and vocal reference channels distinct and persists mix adjustments", () => {
     setup();
     const store = useStudioStore.getState();

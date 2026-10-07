@@ -78,6 +78,37 @@ describe("studio transport state", () => {
     engine.dispose();
   });
 
+  it("starts recording at the playback origin after slow resume and decoding", async () => {
+    const engine = new StudioAudioEngine(); const context = engine.context as unknown as Context;
+    const decoding = deferred(), resuming = deferred();
+    context.decodeAudioData = async () => { await decoding.promise; return { duration: 60 }; };
+    context.resume = () => resuming.promise;
+    const loading = engine.setProject(project());
+    const origins: number[] = [];
+    const playback = engine.play(7, true, (origin) => origins.push(origin));
+    context.currentTime += 0.1;
+    resuming.resolve();
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(origins.length).toBe(0);
+    context.currentTime += 0.15;
+    decoding.resolve(); await loading; await playback;
+    expect(origins.length).toBe(1);
+    expect(origins[0]).toBeCloseTo(5.265);
+    expect(origins[0]).toBe(context.sources[0].starts[0][0]);
+    engine.dispose();
+  });
+
+  it("does not start the microphone for a cancelled playback preparation", async () => {
+    const engine = new StudioAudioEngine(); const context = engine.context as unknown as Context;
+    await engine.setProject(project());
+    const pending = deferred(); context.resume = () => pending.promise;
+    let started = false;
+    const playback = engine.play(0, true, () => { started = true; });
+    engine.pause(); pending.resolve(); await playback;
+    expect(started).toBe(false);
+    engine.dispose();
+  });
+
   it("ignores an old resume failure after a newer seek has started", async () => {
     const engine = new StudioAudioEngine(); const context = engine.context as unknown as Context;
     await engine.setProject(project());

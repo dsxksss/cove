@@ -10,12 +10,12 @@ export function trapStudioDialogTab(event: React.KeyboardEvent<HTMLElement>) {
   else if (!event.shiftKey && (document.activeElement === last || !controls.includes(document.activeElement as HTMLElement))) { event.preventDefault(); first.focus(); }
 }
 
-export function SignedMilliseconds({ label, value, onChange, limit = 30000 }: { label: string; value: number; onChange: (value: number) => void; limit?: number }) {
+export function SignedMilliseconds({ label, value, onChange, limit = 30000, disabled = false }: { label: string; value: number; onChange: (value: number) => void; limit?: number; disabled?: boolean }) {
   const [draft, setDraft] = useState(String(value));
   const [focused, setFocused] = useState(false);
   useEffect(() => { if (!focused) setDraft(String(value)); }, [value, focused]);
   const commit = () => { const next = Math.round(Math.max(-limit, Math.min(limit, Number(draft) || 0))); onChange(next); setDraft(String(next)); setFocused(false); };
-  return <label className="flex items-center gap-2 text-xs text-white/50"><span>{label}</span><input type="text" inputMode="text" aria-label={label} value={draft} onFocus={() => setFocused(true)} onBlur={commit} onKeyDown={(event) => { if (event.key === "Enter") { commit(); event.currentTarget.blur(); } }} onChange={(event) => {
+  return <label className="flex items-center gap-2 text-xs text-white/50"><span>{label}</span><input type="text" inputMode="text" aria-label={label} disabled={disabled} value={draft} onFocus={() => setFocused(true)} onBlur={commit} onKeyDown={(event) => { if (event.key === "Enter") { commit(); event.currentTarget.blur(); } }} onChange={(event) => {
     const text = event.target.value;
     if (!/^-?\d*$/.test(text)) return;
     setDraft(text);

@@ -139,7 +139,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const updateLatency = useStudioStore((state) => state.updateLatency);
   const engineRef = useRef<StudioAudioEngine | null>(null);
   const recorderRef = useRef<StudioRecorder | null>(null);
-  const recordStartRef = useRef(0);
+  const recordStartRef = useRef({ songTime: 0, contextTime: 0, inputLatencyMs: 0 });
   const recordingSessionRef = useRef(0);
   const recordSavingRef = useRef(false);
   const [savingRecording, setSavingRecording] = useState(false);
@@ -553,12 +553,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         }
         setCountdownValue(null);
       }
-      const scheduleAt = (engineRef.current?.context.currentTime ?? 0) + 0.015;
-      // AudioContext time measures the lifetime of the device; clips use the
-      // song playhead, which can be reset or seeked independently.
-      recordStartRef.current = useStudioStore.getState().currentTime;
-      recorder.start(scheduleAt);
-      await engineRef.current?.play(recordStartRef.current, true);
+      const engine = engineRef.current;
+      const state = useStudioStore.getState();
+      const songTime = engine.isPlaying ? engine.currentTime : state.currentTime;
+      await engine.play(songTime, true, (contextTime) => {
+        if (countdownAbortRef.current || recorderRef.current !== recorder || !isCurrentProject(projectId)) throw new DOMException("录音准备已取消", "AbortError");
+        recordStartRef.current = { songTime, contextTime, inputLatencyMs: state.project?.inputLatencyMs ?? 0 };
+        recorder.start(contextTime);
+      });
       if (recorderRef.current !== recorder || !isCurrentProject(projectId)) return;
       setNcmStatus("正在录音，再次点击停止");
     } catch (error) {
@@ -578,6 +580,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     if (recordSavingRef.current) return;
     if (!recorderRef.current || recorderRef.current.startedAt === null) {
       countdownAbortRef.current = true;
+      engineRef.current?.pause();
       recorderRef.current?.dispose();
       recorderRef.current = null;
       setCountdownValue(null);
@@ -589,7 +592,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const projectId = currentProject.id;
     const session = recordingSessionRef.current;
     const trackId = recordingTrackId ?? selectedTrackId;
-    const startSec = Math.max(0, recordStartRef.current - currentProject.inputLatencyMs / 1000);
+    const anchor = recordStartRef.current;
+    const captureDelay = (recorder.startedAt ?? anchor.contextTime) - anchor.contextTime;
+    // Preserve signed placement: addAssetToTrack converts a negative start
+    // into a source offset while retaining the complete, unmodified recording.
+    const startSec = anchor.songTime + captureDelay - anchor.inputLatencyMs / 1000;
     recorderRef.current = null;
     recordSavingRef.current = true;
     setSavingRecording(true);
@@ -1027,7 +1034,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                 level={micLevel} countdown={countdownEnabled} recording={Boolean(recordingTrackId)} saving={savingRecording}
               onCountdownChange={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* optional preference */ } }}
               onRecord={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") { setRecordingTrackId(selectedTrack.id); void startRecording(); } else setNcmStatus("请先添加并选择人声轨"); }} />
-            <div className="flex items-center justify-between gap-2"><button disabled={!selectedTrack || Boolean(recordingTrackId)} onClick={() => setTrackToolsOpen(true)} className="shrink-0 rounded-lg bg-white/10 px-2.5 py-1.5 text-[11px] font-bold text-lime-100 disabled:opacity-40">音轨调整</button><div title="录音补偿：正数让录音提前，负数让录音延后"><SignedMilliseconds label="输入延迟" value={currentProject.inputLatencyMs} onChange={updateLatency} limit={5000} /></div></div>
+            <div className="flex items-center justify-between gap-2"><button disabled={!selectedTrack || Boolean(recordingTrackId)} onClick={() => setTrackToolsOpen(true)} className="shrink-0 rounded-lg bg-white/10 px-2.5 py-1.5 text-[11px] font-bold text-lime-100 disabled:opacity-40">音轨调整</button><div title="仅影响之后的新录音：正数提前，负数延后。已有录音请使用音轨偏移。"><SignedMilliseconds label="输入延迟" disabled={Boolean(recordingTrackId)} value={currentProject.inputLatencyMs} onChange={updateLatency} limit={5000} /></div></div>
           </div>
         </div>
       </main>

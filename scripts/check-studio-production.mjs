@@ -185,7 +185,7 @@ try {
   assert.equal(await page.getByRole("button", { name: "正在保存录音", exact: true }).isDisabled(), true);
   assert.ok(await page.evaluate(() => window.store.getState().recordingTrackId), "duplicate stop must not unlock the session during save");
   await page.waitForFunction(() => !window.store.getState().recordingTrackId && window.store.getState().project.tracks.some((track) => track.kind === "vocal" && track.clips.length));
-  assert.equal(await page.evaluate(() => window.store.getState().project.tracks.find((track) => track.kind === "vocal").clips[0].startSec), 7, "recorded takes must use the song playhead, not AudioContext time");
+  assert.ok(Math.abs(await page.evaluate(() => window.store.getState().project.tracks.find((track) => track.kind === "vocal").clips[0].startSec) - 7) < 128 / 48000, "recorded takes must use the song playhead, allowing only worklet frame alignment");
   assert.equal(await page.evaluate(() => window.store.getState().project.tracks.find((track) => track.kind === "vocal").takes.length), 1);
   const latency = page.getByRole("textbox", { name: "输入延迟", exact: true });
   await latency.fill("-"); assert.equal(await latency.inputValue(), "-");
@@ -300,6 +300,49 @@ try {
   await page.waitForFunction(() => !window.store.getState().recordingTrackId);
   await play.click();
   await page.waitForFunction(() => window.engine.isPlaying);
+  await page.getByRole("button", { name: "暂停工作室播放", exact: true }).click();
+  await page.getByRole("button", { name: "人声轨", exact: true }).click();
+  await page.getByText("人声 1", { exact: true }).first().click();
+  await page.evaluate(() => {
+    const resume = window.engine.context.resume.bind(window.engine.context);
+    window.engine.context.resume = async () => { await new Promise(resolve => setTimeout(resolve, 100)); return resume(); };
+  });
+  for (const scenario of [{ from: 0, latency: 100, start: 0, offset: 0.1 }, { from: 0, latency: -100, start: 0.1, offset: 0 }, { from: 3, latency: 100, start: 2.9, offset: 0 }]) {
+    await page.evaluate(({ from, latency }) => { window.store.getState().updateLatency(latency); window.store.getState().setCurrentTime(from); window.engine.seek(from); }, scenario);
+    await page.getByRole("button", { name: "开始录音", exact: true }).click();
+    await page.getByText("正在录音，再次点击停止", { exact: true }).waitFor();
+    await page.waitForTimeout(350);
+    assert.equal(await page.getByRole("textbox", { name: "输入延迟", exact: true }).isDisabled(), true);
+    await page.getByRole("button", { name: "停止录音", exact: true }).click();
+    await page.waitForFunction(() => !window.store.getState().recordingTrackId);
+    const take = await page.evaluate(() => {
+      const track = window.store.getState().project.tracks.find(t => t.kind === "vocal");
+      const clip = track.clips.at(-1), asset = track.assets.find(a => a.id === clip.assetId);
+      return { clip, duration: asset.durationSec };
+    });
+    assert.ok(Math.abs(take.clip.startSec - scenario.start) < 128 / 48000, `record placement ${JSON.stringify(scenario)}`);
+    assert.ok(Math.abs(take.clip.offsetSec - scenario.offset) < 128 / 48000, `zero-start compensation ${JSON.stringify(scenario)}`);
+    assert.ok(Math.abs(take.clip.durationSec + take.clip.offsetSec - take.duration) < 0.0001, "full source take must remain available after input compensation");
+  }
+  await page.evaluate(() => {
+    const resume = window.engine.context.resume.bind(window.engine.context);
+    let count = 0;
+    window.engine.context.resume = async () => {
+      if (++count === 2) await new Promise(resolve => { window.releaseRecordResume = resolve; });
+      await resume();
+      if (count >= 2) window.recordResumeReleased = true;
+    };
+  });
+  await page.getByRole("button", { name: "开始录音", exact: true }).click();
+  await page.waitForFunction(() => window.releaseRecordResume);
+  assert.equal(await page.evaluate(() => window.engine.isPlaying), true);
+  await page.getByRole("button", { name: "停止录音", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.engine.isPlaying), false, "cancelling pending recording must stop transport immediately");
+  await page.evaluate(() => window.releaseRecordResume());
+  await page.waitForFunction(() => window.recordResumeReleased);
+  assert.equal(await page.evaluate(() => window.engine.isPlaying), false);
+  assert.equal(await page.evaluate(() => window.store.getState().recordingTrackId), null);
+  console.log("Recording latency PASS: shared origin after 100ms preparation delay, +100/-100 compensation at zero, nonzero placement, immutable capture setting, full source preservation and cancelling a pending start.");
   assert.deepEqual(runtimeErrors, []);
   console.log("Studio export UI PASS: real AudioWorklet take at song time, recording guards/reset, WAV, bundled FFmpeg MP3, player audio and metadata under production CSP (native dialogs mocked).");
 } finally { await browser.close(); }

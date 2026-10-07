@@ -119,7 +119,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     return { project: touch({ ...state.project, instrumental: trackId === "instrumental" ? asset : state.project.instrumental, tracks: state.project.tracks.map((track) => {
       if (track.id !== trackId) return track;
       const nextTake = take ?? { id: `take-${Date.now()}`, assetId: asset.id, createdAt: new Date().toISOString(), label: `Take ${track.takes.length + 1}` };
-      return { ...track, assets: [...track.assets, asset], takes: track.kind === "vocal" ? [...track.takes, nextTake] : track.takes, clips: [...track.clips, { id: `clip-${Date.now()}`, assetId: asset.id, startSec: Math.max(0, startSec), offsetSec: 0, durationSec: asset.durationSec }] };
+      // Advancing a recording across song time zero must trim its audible
+      // head, not silently discard the compensation. Keep the full take.
+      const offsetSec = Math.min(asset.durationSec, Math.max(0, -startSec));
+      return { ...track, assets: [...track.assets, asset], takes: track.kind === "vocal" ? [...track.takes, nextTake] : track.takes, clips: [...track.clips, { id: `clip-${Date.now()}`, assetId: asset.id, startSec: Math.max(0, startSec), offsetSec, durationSec: Math.max(0, asset.durationSec - offsetSec) }] };
     }) }) };
   }),
   replaceAssetOnTrack: (trackId, asset, startSec = 0) => set((state) => {
