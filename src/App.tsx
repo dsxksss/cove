@@ -841,9 +841,18 @@ export default function App() {
     setSettingsOpen(false);
   }, [activeRaw, cover, level, lyrics, shown.artist, shown.duration, shown.title, studioProject]);
 
-  const playStudioMixInPlayer = useCallback(async (audioUrl: string, project: StudioProject) => {
-    if (studioPlayerUrlRef.current) URL.revokeObjectURL(studioPlayerUrlRef.current);
-    studioPlayerUrlRef.current = audioUrl;
+  const playStudioMixInPlayer = useCallback(async (audioUrl: string, project: StudioProject, returnProject: StudioProject) => {
+    const previous = usePlayerStore.getState();
+    const audio = getAudio();
+    const previousSrc = audio.getAttribute("src");
+    const previousTime = audio.currentTime;
+    const previousPlayback = {
+      queue: previous.queue, queueSource: previous.queueSource, activePlaylistId: previous.activePlaylistId,
+      index: previous.index, currentTime: previous.currentTime, duration: previous.duration,
+      currentCover: previous.currentCover, accent: previous.accent, lyrics: previous.lyrics,
+      lyricSourceLabel: previous.lyricSourceLabel, shuffleHistory: previous.shuffleHistory,
+      shuffleFuture: previous.shuffleFuture, isPlaying: false, loading: false, error: null,
+    };
     const localSong: Song = {
       // Keep this queue entry distinct from the catalog song so the player
       // cannot silently resolve the original stream after the handoff.
@@ -857,8 +866,30 @@ export default function App() {
       localAudioUrl: audioUrl,
       localLyrics: project.lyrics,
     };
-    await playSong(localSong, [localSong]);
-    setStudioProject(project);
+    try {
+      await playSong(localSong, [localSong]);
+      const player = usePlayerStore.getState();
+      if (player.currentSong()?.localAudioUrl !== audioUrl || audio.paused) {
+        throw new Error(player.error || "翻唱音频未能开始播放，请重试");
+      }
+    } catch (error) {
+      // A failed attempt must not leave the old queue pointing at a revoked
+      // mix URL. Only roll back our own request, never a newer song selection.
+      if (usePlayerStore.getState().currentSong()?.id === localSong.id) {
+        audio.pause();
+        if (previousSrc) {
+          audio.src = previousSrc;
+          audio.currentTime = Number.isFinite(previousTime) ? previousTime : 0;
+        } else { audio.removeAttribute("src"); audio.load(); }
+        usePlayerStore.setState(previousPlayback);
+      }
+      throw error;
+    }
+    if (studioPlayerUrlRef.current) URL.revokeObjectURL(studioPlayerUrlRef.current);
+    studioPlayerUrlRef.current = audioUrl;
+    // The player uses the current mix; reopening the editor restores the
+    // explicitly saved project, including after choosing not to save.
+    setStudioProject(returnProject);
     setStudioOpen(false);
   }, [playSong]);
 

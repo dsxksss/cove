@@ -17,7 +17,7 @@ import { getProjectDuration, hasAudibleClips, scheduledClip } from "../lib/studi
 type Props = {
   project: StudioProject;
   onBack: (project?: StudioProject) => void;
-  onPlayInPlayer: (audioUrl: string, project: StudioProject) => Promise<void> | void;
+  onPlayInPlayer: (audioUrl: string, project: StudioProject, returnProject: StudioProject) => Promise<void> | void;
 };
 
 function formatTime(value: number) {
@@ -125,7 +125,11 @@ function EffectPanel({ track, onChange, onReset, clipboardSource, onCopy, onPast
 export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Props) {
   const sessionProjectIdRef = useRef(project.id);
   const savedSnapshotRef = useRef(structuredClone(project));
-  const [exitPromptOpen, setExitPromptOpen] = useState(false);
+  const [exitIntent, setExitIntent] = useState<"back" | "play" | null>(null);
+  const exitPromptOpen = exitIntent !== null;
+  const [exiting, setExiting] = useState(false);
+  const exitBusyRef = useRef(false);
+  const exitOriginRef = useRef<HTMLElement | null>(null);
   const [savingProject, setSavingProject] = useState(false);
   const [exitError, setExitError] = useState<string | null>(null);
   const [trackTools, setTrackTools] = useState<{ trackId: string; rename?: boolean; tab?: "channel" | "effects" | "audio" } | null>(null);
@@ -185,6 +189,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const persistedProjectIdsRef = useRef(new Set<string>());
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const exportTriggerRef = useRef<HTMLButtonElement>(null);
   const [exporting, setExporting] = useState(false);
   const exportBusyRef = useRef(false);
   const headerMenuRef = useRef<HTMLElement | null>(null);
@@ -1025,13 +1030,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     finally { exportBusyRef.current = false; setExporting(false); }
   };
 
-  const playMixInPlayer = async () => {
-    if (useStudioStore.getState().recordingTrackId) { setNcmStatus("请先停止录音，等待音轨保存后再播放翻唱"); return; }
-    if (exportBusyRef.current) return;
+  const playMixInPlayer = async (snapshot: StudioProject, returnProject: StudioProject): Promise<boolean> => {
+    if (useStudioStore.getState().recordingTrackId || exportBusyRef.current) return false;
     exportBusyRef.current = true;
     setExporting(true);
     setExportMenuOpen(false);
-    const snapshot = currentProject;
     let audioUrl: string | null = null;
     try {
       engineRef.current?.pause();
@@ -1039,15 +1042,53 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       setNcmStatus("正在准备播放器音频…");
       const wav = await renderStudioMix(snapshot);
       audioUrl = URL.createObjectURL(wav);
-      await onPlayInPlayer(audioUrl, snapshot);
+      await onPlayInPlayer(audioUrl, snapshot, returnProject);
       audioUrl = null;
+      return true;
     } catch (error) {
       if (audioUrl) URL.revokeObjectURL(audioUrl);
-      setNcmStatus(error instanceof Error ? error.message : "无法切换到播放器");
+      const message = error instanceof Error ? error.message : "无法切换到播放器";
+      setNcmStatus(message); setExitError(message);
+      return false;
     } finally {
       exportBusyRef.current = false;
       setExporting(false);
     }
+  };
+
+  const requestExit = (intent: "back" | "play", origin: HTMLElement) => {
+    if (editLockedRef.current || exitBusyRef.current) return;
+    engineRef.current?.pause();
+    setExportMenuOpen(false);
+    setExitError(null);
+    exitOriginRef.current = origin;
+    setExitIntent(intent);
+  };
+  const cancelExit = () => {
+    if (exitBusyRef.current || savingProject) return;
+    setExitIntent(null); setExitError(null);
+    if (exitOriginRef.current?.isConnected) exitOriginRef.current.focus();
+    else exportTriggerRef.current?.focus();
+  };
+  const confirmExit = async (save: boolean) => {
+    if (!exitIntent || exitBusyRef.current || editLockedRef.current) return;
+    exitBusyRef.current = true; setExiting(true); setExitError(null);
+    const snapshot = structuredClone(useStudioStore.getState().project ?? currentProject);
+    const intent = exitIntent;
+    try {
+      const saved = save ? await saveProject() : null;
+      if (save && !saved) return;
+      if (!isCurrentProject(snapshot.id)) return;
+      const returnProject = structuredClone(saved ?? savedSnapshotRef.current);
+      if (intent === "play") {
+        if (!await playMixInPlayer(saved ?? snapshot, returnProject)) return;
+      } else onBack(returnProject);
+      if (!save) {
+        try { localStorage.removeItem(`cove.studio.draft.${snapshot.id}`); } catch { /* optional recovery */ }
+      }
+      setExitIntent(null);
+    } catch (error) { setExitError(error instanceof Error ? error.message : "无法退出工作室，请重试"); }
+    finally { exitBusyRef.current = false; setExiting(false); }
   };
 
   const commitProjectRename = () => {
@@ -1068,7 +1109,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   return <div className="relative flex h-full w-full flex-col overflow-hidden bg-slate-950/90 text-white">
     <header ref={headerMenuRef} data-tauri-drag-region className="flex h-16 shrink-0 items-center gap-3 border-b border-white/10 px-5">
-      <button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} title={recordingTrackId ? "请先停止录音" : "返回播放器"} onClick={() => { engineRef.current?.pause(); setExitError(null); setExitPromptOpen(true); }} className="grid h-9 w-9 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white disabled:opacity-40" aria-label="返回播放器"><ArrowLeft size={18} /></button>
+      <button type="button" disabled={editLocked || exiting} title={recordingTrackId ? "请先停止录音" : "返回播放器"} onClick={(event) => requestExit("back", event.currentTarget)} className="grid h-9 w-9 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white disabled:opacity-40" aria-label="返回播放器"><ArrowLeft size={18} /></button>
       {currentProject.coverUrl ? <img src={currentProject.coverUrl} alt="" className="h-10 w-10 rounded-xl object-cover" /> : <div className="grid h-10 w-10 place-items-center rounded-xl bg-white/10"><Disc3 size={18} /></div>}
       <div className="min-w-0 flex-1">{renamingProject ? <input autoFocus value={projectTitleDraft} onChange={(event) => setProjectTitleDraft(event.target.value)} onBlur={commitProjectRename} onKeyDown={(event) => { if (event.key === "Enter") commitProjectRename(); if (event.key === "Escape") { setProjectTitleDraft(currentProject.title); setRenamingProject(false); } }} aria-label="工程名称" className="no-drag w-full max-w-xs rounded-lg bg-white/10 px-2 py-1 text-sm font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <div className="flex min-w-0 items-center gap-1"><h1 className="truncate text-sm font-bold">{currentProject.title}</h1><button type="button" onClick={() => { setProjectTitleDraft(currentProject.title); setRenamingProject(true); }} className="no-drag shrink-0 rounded p-1 text-white/35 transition hover:bg-white/10 hover:text-white/80" aria-label="重命名工程" title="重命名工程"><Pencil size={12} /></button></div>}<p className="truncate text-xs text-white/45">{currentProject.artist} · 翻唱工作室</p></div>
       <button type="button" disabled={savingProject || Boolean(recordingTrackId)} onClick={() => void saveProject()} className="flex items-center gap-1.5 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/15 disabled:opacity-40"><Save size={14} />{savingProject ? "保存中…" : "保存"}</button>
@@ -1083,9 +1124,9 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         </div>}
       </div>
       <div className="relative no-drag">
-        <button type="button" disabled={exporting || Boolean(recordingTrackId)} title={recordingTrackId ? "请先停止录音，等待音轨保存后再导出" : undefined} aria-haspopup="menu" aria-expanded={exportMenuOpen} onClick={() => { setExportMenuOpen((open) => !open); setProjectMenuOpen(false); setMicMenuOpen(false); }} className="flex items-center gap-2 rounded-xl bg-lime-200 px-3 py-2 text-xs font-bold text-slate-950 transition hover:bg-lime-100 disabled:opacity-60"><Download size={14} />{exporting ? "正在导出…" : "导出"}<ChevronDown size={14} /></button>
+        <button ref={exportTriggerRef} type="button" disabled={exporting || Boolean(recordingTrackId)} title={recordingTrackId ? "请先停止录音，等待音轨保存后再导出" : undefined} aria-haspopup="menu" aria-expanded={exportMenuOpen} onClick={() => { setExportMenuOpen((open) => !open); setProjectMenuOpen(false); setMicMenuOpen(false); }} className="flex items-center gap-2 rounded-xl bg-lime-200 px-3 py-2 text-xs font-bold text-slate-950 transition hover:bg-lime-100 disabled:opacity-60"><Download size={14} />{exporting ? "正在导出…" : "导出"}<ChevronDown size={14} /></button>
         {exportMenuOpen && <div role="menu" aria-label="导出格式" className="absolute right-0 top-full z-[100] mt-2 w-60 rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
-          <button type="button" role="menuitem" disabled={exporting || !hasRenderableAudio} onClick={() => void playMixInPlayer()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition hover:bg-lime-200/10 disabled:cursor-not-allowed disabled:opacity-50"><Play size={14} fill="currentColor" className="text-lime-200" /><span className="min-w-0 flex-1"><span className="block text-xs font-bold text-white/90">在播放器中播放翻唱</span><span className="mt-0.5 block text-[10px] text-white/40">{hasRenderableAudio ? "沿用原歌曲封面、歌名和歌词" : "请先导入伴奏或录音"}</span></span></button>
+          <button type="button" role="menuitem" disabled={editLocked || !hasRenderableAudio} onClick={(event) => requestExit("play", event.currentTarget)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition hover:bg-lime-200/10 disabled:cursor-not-allowed disabled:opacity-50"><Play size={14} fill="currentColor" className="text-lime-200" /><span className="min-w-0 flex-1"><span className="block text-xs font-bold text-white/90">在播放器中播放翻唱</span><span className="mt-0.5 block text-[10px] text-white/40">{hasRenderableAudio ? "沿用原歌曲封面、歌名和歌词" : "请先导入伴奏或录音"}</span></span></button>
           <div className="my-1 border-t border-white/10" />
           {([
             ["wav", "WAV 音频", "24-bit · 无损混音"],
@@ -1232,7 +1273,19 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       onNormalize={() => void normalizeTrack(toolsTrack.id)} onDenoise={(strength) => void denoiseTrack(toolsTrack.id, strength)}
       onRestore={() => updateTrack(toolsTrack.id, { clips: toolsTrack.clips.map((clip) => ({ ...clip, assetId: toolsTrack.denoiseOriginalAssets?.[clip.assetId] ?? clip.assetId })), denoiseOriginalAssets: undefined, normalizationGain: undefined })}
       effects={<EffectPanel track={toolsTrack} onChange={(effects) => updateEffects(toolsTrack.id, effects)} onReset={() => resetEffects(toolsTrack.id)} clipboardSource={effectsClipboard?.sourceName} onCopy={() => copyEffects(toolsTrack.id)} onPaste={() => pasteEffects(toolsTrack.id)} />} />}
-    {exitPromptOpen && <div className="absolute inset-0 z-[240] grid place-items-center bg-black/60 p-5 backdrop-blur-sm" onKeyDown={(event) => { trapStudioDialogTab(event); if (event.key === "Escape" && !savingProject) setExitPromptOpen(false); }}><section role="dialog" aria-modal="true" aria-label="保存本次翻唱" className="w-full max-w-sm space-y-4 rounded-2xl border border-white/15 bg-slate-900 p-6 shadow-2xl"><h2 className="text-base font-bold">返回前保存本次翻唱？</h2><p className="text-xs leading-6 text-white/55">保存音轨、效果和时间调整，之后可从“工程”继续编辑。不保存将放弃上次保存后的编辑。</p>{exitError && <p role="alert" className="text-xs text-red-200">{exitError}</p>}<div className="flex flex-wrap justify-end gap-2"><button autoFocus disabled={savingProject} onClick={() => setExitPromptOpen(false)} className="rounded-lg px-3 py-2 text-xs text-white/60 hover:bg-white/10">取消</button><button disabled={savingProject} onClick={() => { try { localStorage.removeItem(`cove.studio.draft.${currentProject.id}`); } catch { /* optional recovery */ } onBack(structuredClone(savedSnapshotRef.current)); }} className="rounded-lg bg-white/10 px-3 py-2 text-xs">不保存返回</button><button disabled={savingProject} onClick={() => void saveProject().then((saved) => { if (saved) onBack(saved); })} className="rounded-lg bg-lime-200 px-3 py-2 text-xs font-bold text-slate-950">{savingProject ? "正在保存…" : "保存并返回"}</button></div></section></div>}
+    {exitPromptOpen && <div className="absolute inset-0 z-[240] grid place-items-center bg-black/60 p-5 backdrop-blur-sm" onKeyDown={(event) => { trapStudioDialogTab(event); if (event.key === "Escape") cancelExit(); }}>
+      <section role="dialog" aria-modal="true" aria-busy={exiting || savingProject} aria-label="保存本次翻唱" className="w-full max-w-sm space-y-4 rounded-2xl border border-white/15 bg-slate-900 p-6 shadow-2xl">
+        <h2 className="text-base font-bold">{exitIntent === "play" ? "播放翻唱前保存工程？" : "返回前保存本次翻唱？"}</h2>
+        <p className="text-xs leading-6 text-white/55">{exitIntent === "play" ? "此操作会离开工作室，使用播放器播放当前混音。不保存也可以试听，但本次工程编辑不会保存；再次进入将恢复上次保存的版本。" : "保存音轨、效果和时间调整，之后可从“工程”继续编辑。不保存将放弃上次保存后的编辑。"}</p>
+        {exitError && <p role="alert" className="text-xs text-red-200">{exitError}</p>}
+        {exiting && <p role="status" className="text-xs text-lime-100">{savingProject ? "正在保存工程…" : "正在准备播放器音频…"}</p>}
+        <div className="flex flex-wrap justify-end gap-2">
+          <button autoFocus disabled={exiting || savingProject} onClick={cancelExit} className="rounded-lg px-3 py-2 text-xs text-white/60 hover:bg-white/10 disabled:opacity-40">取消</button>
+          <button disabled={exiting || savingProject} onClick={() => void confirmExit(false)} className="rounded-lg bg-white/10 px-3 py-2 text-xs disabled:opacity-40">{exitIntent === "play" ? "不保存播放" : "不保存返回"}</button>
+          <button disabled={exiting || savingProject} onClick={() => void confirmExit(true)} className="rounded-lg bg-lime-200 px-3 py-2 text-xs font-bold text-slate-950 disabled:opacity-40">{exitIntent === "play" ? "保存并播放" : "保存并返回"}</button>
+        </div>
+      </section>
+    </div>}
     {countdownValue !== null && <div className="pointer-events-none absolute inset-0 z-[200] grid place-items-center bg-slate-950/45 backdrop-blur-[2px]" role="status" aria-live="assertive"><div className="flex flex-col items-center gap-3"><div className="grid h-32 w-32 place-items-center rounded-full border border-lime-200/50 bg-slate-950/80 text-7xl font-black text-lime-100 shadow-[0_0_70px_rgba(190,242,100,.25)] animate-pulse">{countdownValue}</div><span className="rounded-full bg-black/40 px-4 py-1.5 text-xs font-bold tracking-[0.2em] text-white/70">准备录音</span></div></div>}
   </div>;
 }

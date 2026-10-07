@@ -212,9 +212,11 @@ try {
     project.instrumental = asset; project.tracks[0].assets = [asset];
     project.tracks[0].clips = [{ id: "clip", assetId: asset.id, startSec: 0, offsetSec: 0, durationSec: 12 }];
     const root = createRoot(document.getElementById("root"));
-    window.remount = (key) => root.render(React.createElement(Workspace, { key, project, onBack(snapshot) { window.exitedProject = snapshot; }, async onPlayInPlayer(url, snapshot) {
+    window.remount = (key) => root.render(React.createElement(Workspace, { key, project, onBack(snapshot) { window.exitedProject = snapshot; }, async onPlayInPlayer(url, snapshot, returnProject) {
+      window.playMixCalls = (window.playMixCalls ?? 0) + 1;
+      if (window.failMixPlayback) throw new Error("模拟播放器切换失败");
       const audio = new Audio(url); await audio.play();
-      window.playerMix = { title: snapshot.title, artist: snapshot.artist, lyrics: snapshot.lyrics, duration: audio.duration };
+      window.playerMix = { title: snapshot.title, artist: snapshot.artist, lyrics: snapshot.lyrics, duration: audio.duration, returnProject };
       audio.pause(); URL.revokeObjectURL(url);
     } }));
     localStorage.setItem("cove.studio.record-countdown", "0");
@@ -327,6 +329,7 @@ try {
   // tested against the same edited project.
   await page.evaluate(() => { window.exitedProject = null; });
   await page.evaluate(() => window.testNative("test_fail_save", { enabled: true }));
+  await page.getByRole("button", { name: "返回播放器", exact: true }).click();
   await page.getByRole("button", { name: "保存并返回", exact: true }).click();
   await page.getByRole("alert").waitFor();
   assert.equal(await page.evaluate(() => window.exitedProject), null);
@@ -334,7 +337,6 @@ try {
   await page.getByRole("button", { name: "保存并返回", exact: true }).click();
   await page.waitForFunction(() => window.exitedProject);
   assert.equal(await page.evaluate(() => window.exitedProject.title), "未保存的编辑");
-  await page.getByRole("button", { name: "取消", exact: true }).click();
   await page.evaluate(() => window.store.getState().updateProjectTitle("Production test"));
   await page.getByText("人声 1", { exact: true }).first().click();
   console.log("Studio tools PASS: signed latency/offset, pan, normalization, real FFmpeg denoise, restore after edits/new take, distinct cached vocal reference, explicit save/discard/cancel and failed-save guard.");
@@ -374,12 +376,51 @@ try {
   assert.equal(await page.getByRole("progressbar").count(), 0);
   await page.screenshot({ path: fileURLToPath(new URL("export-complete.png", output)) });
   console.log("Export progress PASS: running export animation, no stale stem percentage, success/cancel/error cleanup for audio and project packages, result text retained.");
-  await page.getByRole("button", { name: "导出", exact: true }).click();
-  await page.getByRole("menuitem", { name: /在播放器中播放翻唱/ }).click();
+  const savedBeforePlayback = structuredClone([...saved.values()].at(-1));
+  await page.evaluate(() => window.store.getState().updateProjectTitle("未保存试听"));
+  await page.waitForTimeout(600);
+  const requestPlayerMix = async () => {
+    await page.getByRole("button", { name: "导出", exact: true }).click();
+    await page.getByRole("menuitem", { name: /在播放器中播放翻唱/ }).click();
+    await page.getByRole("dialog", { name: "保存本次翻唱", exact: true }).waitFor();
+  };
+  await requestPlayerMix();
+  assert.equal(await page.evaluate(() => window.playMixCalls ?? 0), 0, "opening confirmation must not render/play or save");
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.store.getState().project.title), "未保存试听");
+  await requestPlayerMix(); await page.keyboard.press("Escape");
+  assert.equal(await page.getByRole("dialog", { name: "保存本次翻唱", exact: true }).count(), 0);
+  assert.equal(await page.evaluate(() => window.playMixCalls ?? 0), 0);
+  assert.deepEqual([...saved.values()].at(-1), savedBeforePlayback);
+  await requestPlayerMix();
+  await page.evaluate(() => window.testNative("test_fail_save", { enabled: true }));
+  await page.getByRole("button", { name: "保存并播放", exact: true }).click();
+  await page.getByRole("alert").waitFor();
+  assert.equal(await page.evaluate(() => window.playMixCalls ?? 0), 0, "a failed save cannot hand off playback");
+  await page.evaluate(() => window.testNative("test_fail_save", { enabled: false }));
+  await page.evaluate(() => { window.failMixPlayback = true; });
+  await page.getByRole("button", { name: "不保存播放", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "模拟播放器切换失败" }).waitFor();
+  assert.equal(await page.getByRole("dialog", { name: "保存本次翻唱", exact: true }).count(), 1);
+  assert.equal(await page.evaluate(() => window.store.getState().project.title), "未保存试听");
+  assert.equal(await page.evaluate(() => localStorage.getItem(`cove.studio.draft.${window.store.getState().project.id}`) !== null), true, "failed handoff must preserve recovery draft");
+  await page.evaluate(() => { window.failMixPlayback = false; });
+  await page.getByRole("button", { name: "不保存播放", exact: true }).click();
   await page.waitForFunction(() => window.playerMix);
   const mix = await page.evaluate(() => window.playerMix);
-  assert.equal(mix.title, "Production test"); assert.equal(mix.artist, "Test artist");
+  assert.equal(mix.title, "未保存试听"); assert.equal(mix.artist, "Test artist");
   assert.equal(mix.lyrics[0].text, "Test lyric"); assert.ok(mix.duration >= 12);
+  assert.equal(mix.returnProject.title, savedBeforePlayback.title);
+  assert.deepEqual([...saved.values()].at(-1), savedBeforePlayback, "no-save preview must not persist unsaved edits");
+  assert.equal(await page.getByRole("dialog", { name: "保存本次翻唱", exact: true }).count(), 0);
+  await page.evaluate(() => { window.playerMix = null; window.store.getState().updateProjectTitle("保存后试听"); });
+  await requestPlayerMix();
+  await page.getByRole("button", { name: "保存并播放", exact: true }).click();
+  await page.waitForFunction(() => window.playerMix);
+  assert.equal([...saved.values()].at(-1).title, "保存后试听");
+  assert.equal(await page.evaluate(() => window.playerMix.returnProject.title), "保存后试听");
+  assert.equal(await page.evaluate(() => window.playerMix.title), "保存后试听");
+  console.log("Player preview confirmation PASS: cancel/Escape, no implicit save/play, save failure, handoff failure with draft retention, current unsaved mix plus saved editor baseline, explicit save then play.");
   await page.getByRole("switch", { name: "录音倒计时", exact: true }).click();
   await page.getByRole("button", { name: "开始录音", exact: true }).click();
   await page.getByText("准备录音", { exact: true }).waitFor();

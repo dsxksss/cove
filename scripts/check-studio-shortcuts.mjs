@@ -173,6 +173,83 @@ try {
   await page.waitForFunction((count) => window.shortcutCalls.toggle === count + 1, original.toggle);
   await page.evaluate(() => window.shortcutMediaHandlers.play({}));
   assert.equal((await calls()).mediaPlay, original.mediaPlay + 1, "ordinary media shortcuts restore on studio exit");
+  // Exercise the real App handoff: playback metadata comes from the current
+  // mix, while no-save reopening returns to the last explicitly saved edit.
+  await page.getByRole("button", { name: "打开翻唱工作室", exact: true }).click();
+  await page.getByRole("button", { name: "返回播放器", exact: true }).waitFor();
+  await page.evaluate(async (urls) => {
+    const { getAudio } = await import(urls["/src/lib/audio.ts"]);
+    window.handoffAudio = getAudio();
+    delete window.handoffAudio.play; delete window.handoffAudio.pause;
+    const { encodePcmWav } = await import("/src/lib/studioWav.ts");
+    const pcm = Float32Array.from({ length: 48000 * 2 }, (_, i) => 0.15 * Math.sin(2 * Math.PI * 220 * i / 48000));
+    const asset = { id: "handoff-audio", url: URL.createObjectURL(encodePcmWav([pcm], 48000, 16)), name: "handoff.wav", mimeType: "audio/wav", durationSec: 2 };
+    window.handoffAsset = asset;
+    window.shortcutStudioStore.getState().replaceAssetOnTrack("instrumental", asset);
+    window.shortcutStudioStore.getState().updateProjectTitle("已保存工程");
+  }, modules);
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await page.getByText("工程已保存到本地", { exact: true }).waitFor();
+  await page.evaluate(() => window.shortcutStudioStore.getState().updateProjectTitle("未保存试听"));
+  const requestMix = async () => {
+    await page.getByRole("button", { name: "导出", exact: true }).click();
+    await page.getByRole("menuitem", { name: /在播放器中播放翻唱/ }).click();
+    await page.getByRole("dialog", { name: "保存本次翻唱", exact: true }).waitFor();
+  };
+  await requestMix();
+  await page.screenshot({ path: fileURLToPath(new URL("playback-save-confirmation.png", output)) });
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.shortcutPlayerStore.getState().currentSong()?.localAudioUrl ?? null), null);
+  await requestMix();
+  await page.evaluate(async () => {
+    const audio = window.handoffAudio;
+    window.previousPlayerQueue = window.shortcutPlayerStore.getState().queue;
+    window.previousPlayerSource = window.shortcutStudioStore.getState().project.tracks[0].assets[0].url;
+    audio.src = window.previousPlayerSource;
+    await new Promise((resolve, reject) => { audio.onloadedmetadata = resolve; audio.onerror = reject; });
+    audio.onloadedmetadata = null; audio.onerror = null; audio.currentTime = 0.5;
+  });
+  await page.evaluate(() => Object.defineProperty(window.handoffAudio, "play", { configurable: true, value: async () => { throw new Error("playback blocked"); } }));
+  await page.getByRole("button", { name: "不保存播放", exact: true }).click();
+  await page.getByRole("dialog", { name: "保存本次翻唱", exact: true }).getByRole("alert").waitFor();
+  assert.equal(await page.getByRole("button", { name: "返回播放器", exact: true }).count(), 1, "a swallowed HTMLMediaElement play failure must keep studio open");
+  assert.equal(await page.evaluate(() => JSON.stringify(window.shortcutPlayerStore.getState().queue) === JSON.stringify(window.previousPlayerQueue)), true);
+  assert.equal(await page.evaluate(() => window.handoffAudio.getAttribute("src") === window.previousPlayerSource), true);
+  await page.evaluate(() => { delete window.handoffAudio.play; });
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("button", { name: "返回播放器", exact: true }).click();
+  await page.getByRole("button", { name: "不保存返回", exact: true }).click();
+  await page.getByRole("button", { name: "打开翻唱工作室", exact: true }).waitFor();
+  await page.evaluate(async () => { await window.handoffAudio.play(); window.handoffAudio.pause(); });
+  assert.equal(await page.evaluate(() => window.handoffAudio.getAttribute("src") === window.previousPlayerSource), true, "previous audio remains playable after cancelling a failed handoff");
+  await page.getByRole("button", { name: "打开翻唱工作室", exact: true }).click();
+  await page.getByRole("button", { name: "返回播放器", exact: true }).waitFor();
+  // The original catalog song starts a new studio session. Restore its local
+  // fixture and saved baseline before testing a successful preview handoff.
+  await page.evaluate(() => {
+    window.shortcutStudioStore.getState().replaceAssetOnTrack("instrumental", window.handoffAsset);
+    window.shortcutStudioStore.getState().updateProjectTitle("已保存工程");
+  });
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await page.getByText("工程已保存到本地", { exact: true }).waitFor();
+  await page.evaluate(() => window.shortcutStudioStore.getState().updateProjectTitle("未保存试听"));
+  await requestMix();
+  await page.getByRole("button", { name: "不保存播放", exact: true }).click();
+  await page.getByRole("button", { name: "打开翻唱工作室", exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.shortcutPlayerStore.getState().currentSong().name), "未保存试听");
+  assert.equal(await page.evaluate(() => window.handoffAudio.paused), false);
+  await page.getByRole("button", { name: "打开翻唱工作室", exact: true }).click();
+  await page.getByRole("button", { name: "返回播放器", exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.shortcutStudioStore.getState().project.title), "已保存工程");
+  await page.evaluate(() => window.shortcutStudioStore.getState().updateProjectTitle("保存后播放"));
+  await requestMix();
+  await page.getByRole("button", { name: "保存并播放", exact: true }).click();
+  await page.getByRole("button", { name: "打开翻唱工作室", exact: true }).waitFor();
+  await page.getByRole("button", { name: "打开翻唱工作室", exact: true }).click();
+  await page.getByRole("button", { name: "返回播放器", exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.shortcutStudioStore.getState().project.title), "保存后播放");
+  assert.ok(await page.evaluate(() => window.shortcutIpc.some(([command, args]) => command === "studio_save_project" && args.project.title === "保存后播放")));
+  console.log("App preview handoff PASS: confirmation, cancel, real player failure retained, no-save current mix with saved editor baseline, explicit save/reopen.");
   assert.deepEqual(errors, [], "no full-App runtime errors");
   console.log("Studio shortcuts PASS: full App entry/exit, keyboard ownership, real studio audio, held/IME Space, range/native button focus, project/track text spaces, background shortcut isolation, MediaSession isolation/restoration.");
 } catch (error) {
