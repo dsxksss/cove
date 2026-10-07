@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ChevronDown, Disc3, Download, Headphones, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Square, Trash2, Upload, Volume2 } from "lucide-react";
 import { StudioInputControls } from "./StudioInputControls";
+import { SignedMilliseconds, StudioTrackTools, trapStudioDialogTab } from "./StudioTrackTools";
 import type { LyricsLine } from "./playerTypes";
 import { invokeNative } from "../lib/native";
 import { StudioAudioEngine } from "../lib/studioAudio";
-import { renderStudioMix } from "../lib/studioExport";
+import { normalizationGain, renderStudioMix } from "../lib/studioExport";
 import { StudioRecorder, type StudioInputLevel } from "../lib/studioRecorder";
 import { useStudioStore } from "../studio/studioStore";
 import { downloadStudioOriginal, resolveStudioSourceUrl } from "../studio/source";
 import type { StudioAsset, StudioClip, StudioEffects, StudioProject, StudioTrack } from "../studio/types";
-import { getProjectDuration, hasAudibleClips } from "../lib/studioSchedule";
+import { getProjectDuration, hasAudibleClips, scheduledClip } from "../lib/studioSchedule";
 
 type Props = {
   project: StudioProject;
@@ -64,7 +65,7 @@ function instrumentalCacheId(project: Pick<StudioProject, "source" | "songId">):
 }
 
 function TrackRow({ track, selected, onSelect, onMixer, onDelete, onRename }: { track: StudioTrack; selected: boolean; onSelect: () => void; onMixer: (patch: Partial<StudioTrack["mixer"]>) => void; onDelete: () => void; onRename: (name: string) => void }) {
-  const asset = lastAsset(track.assets);
+  const asset = track.assets.find((item) => item.id === track.clips[track.clips.length - 1]?.assetId) ?? lastAsset(track.assets);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(track.name);
   const commit = () => { const next = draft.trim(); if (next) onRename(next); else setDraft(track.name); setEditing(false); };
@@ -101,6 +102,13 @@ function EffectPanel({ track, onChange, onReset }: { track: StudioTrack; onChang
 
 export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Props) {
   const sessionProjectIdRef = useRef(project.id);
+  const savedSnapshotRef = useRef(structuredClone(project));
+  const [exitPromptOpen, setExitPromptOpen] = useState(false);
+  const [savingProject, setSavingProject] = useState(false);
+  const [exitError, setExitError] = useState<string | null>(null);
+  const [trackToolsOpen, setTrackToolsOpen] = useState(false);
+  const [processingTrack, setProcessingTrack] = useState(false);
+  const [loadingVocals, setLoadingVocals] = useState(false);
   const storedProject = useStudioStore((state) => state.project);
   const currentProject = storedProject?.id === sessionProjectIdRef.current ? storedProject : project;
   const projectDuration = getProjectDuration(currentProject);
@@ -116,6 +124,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const setInputDeviceId = useStudioStore((state) => state.setInputDeviceId);
   const setRecordingTrackId = useStudioStore((state) => state.setRecordingTrackId);
   const updateProjectTitle = useStudioStore((state) => state.updateProjectTitle);
+  const updateTrack = useStudioStore((state) => state.updateTrack);
   const renameTrack = useStudioStore((state) => state.renameTrack);
   const addVocalTrack = useStudioStore((state) => state.addVocalTrack);
   const addReferenceTrack = useStudioStore((state) => state.addReferenceTrack);
@@ -225,6 +234,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, [currentProject.id]);
 
   const openSavedProject = async (id: string) => {
+    if (savingProject || exporting || processingTrack || recordingTrackId) return;
     const previousId = currentProject.id;
     try {
       const loaded = await invokeNative<StudioProject>("studio_load_project", { projectId: id });
@@ -239,10 +249,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       setJobId(null);
       sessionProjectIdRef.current = loaded.id;
       persistedProjectIdsRef.current.add(loaded.id);
+      savedSnapshotRef.current = structuredClone(loaded);
       setProject(loaded); setSelectedTrackId("instrumental"); setProjectMenuOpen(false); setNcmStatus("已打开本地工程");
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "无法打开工程"); }
   };
   const importProjectPackage = async () => {
+    if (savingProject || exporting || processingTrack || recordingTrackId) return;
     try {
       const loaded = await invokeNative<StudioProject | null>("studio_import_package");
       if (!loaded || !isCurrentProject(currentProject.id)) return;
@@ -253,12 +265,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       sessionProjectIdRef.current = loaded.id;
       persistedProjectIdsRef.current.add(loaded.id);
       setProject(loaded);
+      savedSnapshotRef.current = structuredClone(loaded);
       setSelectedTrackId("instrumental");
       setProjectMenuOpen(false);
       setNcmStatus("工程包已导入");
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "工程包导入失败"); }
   };
   const deleteSavedProject = async (id: string) => {
+    if (savingProject || exporting || processingTrack || recordingTrackId) return;
     try {
       await invokeNative("studio_delete_project", { projectId: id });
       persistedProjectIdsRef.current.delete(id);
@@ -279,8 +293,9 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   useEffect(() => {
     if (!persistedProjectIdsRef.current.has(currentProject.id)) return;
     const timer = window.setTimeout(() => {
-      try { localStorage.setItem(`cove.studio.${currentProject.id}`, JSON.stringify(currentProject)); } catch { /* storage quota is non-fatal */ }
-      void waitForAssetWrites(currentProject.id).then(() => invokeNative("studio_save_project", { project: currentProject })).catch(() => undefined);
+      // Recovery drafts must never overwrite a formally saved project before
+      // the user chooses Save in the exit confirmation.
+      try { localStorage.setItem(`cove.studio.draft.${currentProject.id}`, JSON.stringify(currentProject)); } catch { /* storage quota is non-fatal */ }
     }, 450);
     return () => window.clearTimeout(timer);
   }, [currentProject]);
@@ -423,6 +438,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (exitPromptOpen || trackToolsOpen) return;
       if (event.key !== " " && event.code !== "Space") return;
       if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
       const target = event.target instanceof Element ? event.target : null;
@@ -434,7 +450,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlayback]);
+  }, [togglePlayback, exitPromptOpen, trackToolsOpen]);
 
   const importAudio = async (file: File, trackId = "instrumental", startSec = 0) => {
     const projectId = currentProject.id;
@@ -459,7 +475,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const assetWrite = readFileAsBase64(file).then((inputBase64) => invokeNative("studio_write_asset", { projectId: currentProject.id, assetId: asset.id, inputBase64 }));
     const assetKey = `${currentProject.id}:${asset.id}`;
     assetWritesRef.current.set(assetKey, assetWrite);
-    void assetWrite.catch(() => undefined).finally(() => { if (assetWritesRef.current.get(assetKey) === assetWrite) assetWritesRef.current.delete(assetKey); });
+    void assetWrite.then(() => { if (assetWritesRef.current.get(assetKey) === assetWrite) assetWritesRef.current.delete(assetKey); }).catch(() => undefined);
     if (trackId === "instrumental" && durationSec > 0 && currentProject.durationSec === 0) setProject({ ...useStudioStore.getState().project!, durationSec });
     setSelectedTrackId(trackId);
   };
@@ -592,7 +608,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     });
   };
 
-  const startStemJob = (input: { inputBase64?: string; sourceUrl?: string; fileName: string }) => new Promise<void>((resolve, reject) => {
+  const startStemJob = (input: { inputBase64?: string; sourceUrl?: string; fileName: string }, target: "instrumental" | "vocals" = "instrumental") => new Promise<void>((resolve, reject) => {
     const projectId = currentProject.id;
     if (!isCurrentProject(projectId)) { resolve(); return; }
     setNcmStatus("准备伴奏任务…");
@@ -611,7 +627,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         const poll = async () => {
           try {
             if (!isCurrentProject(projectId)) { resolve(); return; }
-            const status = await invokeNative<{ state: string; stage: string; progress: number; outputPath?: string; error?: string; message?: string; elapsedSec?: number; indeterminate?: boolean }>("studio_job_status", { jobId: started.jobId });
+            const status = await invokeNative<{ state: string; stage: string; progress: number; outputPath?: string; vocalOutputPath?: string; error?: string; message?: string; elapsedSec?: number; indeterminate?: boolean }>("studio_job_status", { jobId: started.jobId });
             if (!isCurrentProject(projectId)) { resolve(); return; }
             setStemStage(status.stage);
             setStemProgress(Math.max(0, Math.min(1, status.progress)));
@@ -619,14 +635,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             const elapsed = typeof status.elapsedSec === "number" ? ` · 已用时 ${Math.floor(status.elapsedSec / 60)}:${String(Math.floor(status.elapsedSec % 60)).padStart(2, "0")}` : "";
             setNcmStatus(`${status.message ?? `${status.stage} ${Math.round(status.progress * 100)}%`}${elapsed}`);
             if (status.state === "running" || status.state === "queued") { window.setTimeout(() => void poll(), 800); return; }
-            setJobId(null);
-            stemJobRef.current = null;
             if (status.state === "completed") {
               try {
                 const audio = await invokeNative<{ name: string; base64: string }>("studio_job_audio", { jobId: started.jobId });
                 if (!isCurrentProject(projectId)) { resolve(); return; }
                 const bytes = Uint8Array.from(atob(audio.base64), (char) => char.charCodeAt(0));
-                await importAudio(new File([bytes], audio.name, { type: audio.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav" }));
+                if (target === "instrumental") await importAudio(new File([bytes], audio.name, { type: audio.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav" }));
                 if (!isCurrentProject(projectId)) { resolve(); return; }
                 try {
                   await invokeNative("studio_cache_write", {
@@ -640,11 +654,22 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                   // project when the optional shared cache cannot be written.
                 }
                 if (!isCurrentProject(projectId)) { resolve(); return; }
+                if (status.vocalOutputPath) {
+                  const vocals = await invokeNative<{ name: string; base64: string }>("studio_job_audio", { jobId: started.jobId, stem: "vocals" });
+                  if (!isCurrentProject(projectId)) { resolve(); return; }
+                  try { await invokeNative("studio_cache_write", { cacheId: instrumentalCacheId(currentProject), stem: "vocals", name: vocals.name, mimeType: "audio/wav", inputBase64: vocals.base64 }); } catch { /* importing remains possible without a shared cache */ }
+                  if (!isCurrentProject(projectId)) { resolve(); return; }
+                  if (target === "vocals") {
+                    const trackId = addReferenceTrack("vocals");
+                    if (trackId) await importAudio(new File([Uint8Array.from(atob(vocals.base64), ch => ch.charCodeAt(0))], vocals.name, { type: "audio/wav" }), trackId);
+                  }
+                } else if (target === "vocals") throw new Error("运行包未输出人声，请先安装本次人声分离脚本补丁后重试");
                 setStemProgress(1); setStemIndeterminate(false);
-                setNcmStatus("伴奏已生成并缓存");
+                setNcmStatus(target === "vocals" ? "原曲人声已导入参考轨，点击 S 独奏试听" : "伴奏已生成并缓存");
                 resolve();
               } catch (error) { reject(error instanceof Error ? error : new Error(`伴奏已生成：${status.outputPath ?? "请导入输出文件"}`)); }
-            } else reject(new Error(status.error ?? "伴奏任务失败"));
+              finally { if (isCurrentProject(projectId)) { setJobId(null); stemJobRef.current = null; } }
+            } else { setJobId(null); stemJobRef.current = null; reject(new Error(status.error ?? "伴奏任务失败")); }
           } catch (error) { if (!isCurrentProject(projectId)) { resolve(); return; } stemJobRef.current = null; setJobId(null); reject(error instanceof Error ? error : new Error("伴奏任务状态读取失败")); }
         };
         void poll();
@@ -683,6 +708,32 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     return true;
   };
 
+  const importVocalReference = async (file?: File) => {
+    if (loadingVocals || jobId) return;
+    setLoadingVocals(true);
+    const projectId = currentProject.id;
+    try {
+      if (!file) {
+        const cached = await invokeNative<{ name: string; mimeType: string; base64: string } | null>("studio_cache_read", { cacheId: instrumentalCacheId(currentProject), stem: "vocals" });
+        if (!isCurrentProject(projectId)) return;
+        if (cached?.base64) {
+          const trackId = addReferenceTrack("vocals");
+          if (trackId) await importAudio(new File([Uint8Array.from(atob(cached.base64), ch => ch.charCodeAt(0))], cached.name, { type: cached.mimeType }), trackId);
+          setNcmStatus("已导入缓存原曲人声，默认静音，点击 S 独奏试听");
+          return;
+        }
+        if (currentProject.source !== "netease") throw new Error("尚无人声缓存，请点击“本地提取”选择对应的原曲文件");
+        setNcmStatus("旧缓存仅有伴奏，正在提取原曲人声…");
+        const sourceUrl = await resolveStudioSourceUrl(currentProject);
+        if (!isCurrentProject(projectId)) return;
+        await startStemJob({ sourceUrl, fileName: `${currentProject.title.replace(/[\\/:*?"<>|]/g, "_")}.mp3` }, "vocals");
+      } else {
+        await startStemJob({ inputBase64: await readFileAsBase64(file), fileName: file.name }, "vocals");
+      }
+    } catch (error) { if (isCurrentProject(projectId)) setNcmStatus(error instanceof Error ? error.message : "无法提取原曲人声"); }
+    finally { setLoadingVocals(false); }
+  };
+
   useEffect(() => {
     if (autoPrepareRef.current === currentProject.id || lastAsset(currentProject.tracks.find((track) => track.id === "instrumental")?.assets ?? [])) return;
     autoPrepareRef.current = currentProject.id;
@@ -714,18 +765,62 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const writes = [...assetWritesRef.current.entries()].filter(([key]) => key.startsWith(`${projectId}:`)).map(([, promise]) => promise);
     if (writes.length) await Promise.all(writes);
   };
-  const saveProject = async () => {
+  const normalizeSelectedTrack = async () => {
+    if (!selectedTrack || processingTrack) return;
+    if (selectedTrack.normalizationGain != null) { updateTrack(selectedTrack.id, { normalizationGain: undefined }); return; }
+    const snapshot = currentProject, track = selectedTrack;
+    setProcessingTrack(true);
     try {
-      await waitForAssetWrites(currentProject.id);
-      await invokeNative("studio_save_project", { project: currentProject });
-      persistedProjectIdsRef.current.add(currentProject.id);
-      try { localStorage.setItem(`cove.studio.${currentProject.id}`, JSON.stringify(currentProject)); } catch { /* native project remains authoritative */ }
+      const gain = await normalizationGain(snapshot, track.id);
+      if (isCurrentProject(snapshot.id)) { updateTrack(track.id, { normalizationGain: gain }); setNcmStatus(`${track.name} 已归一化至 −1 dB 输入峰值`); }
+    } catch (error) { setNcmStatus(error instanceof Error ? error.message : "归一化失败"); }
+    finally { setProcessingTrack(false); }
+  };
+  const denoiseSelectedTrack = async (strength: number) => {
+    if (!selectedTrack || processingTrack) return;
+    const snapshot = currentProject, track = selectedTrack;
+    const originals = track.clips.map((clip) => ({ ...clip, assetId: track.denoiseOriginalAssets?.[clip.assetId] ?? clip.assetId }));
+    setProcessingTrack(true); engineRef.current?.pause();
+    setNcmStatus("正在降噪，原始音频会保留…");
+    try {
+      await waitForAssetWrites(snapshot.id);
+      const replacements = new Map<string, StudioAsset>();
+      for (const assetId of new Set(originals.map((clip) => clip.assetId))) {
+        const source = track.assets.find((asset) => asset.id === assetId);
+        if (!source) throw new Error("降噪原始音频缺失");
+        const encoded = await invokeNative<string>("studio_denoise_asset", { projectId: snapshot.id, assetId, strength });
+        if (!isCurrentProject(snapshot.id)) return;
+        const file = new File([Uint8Array.from(atob(encoded), ch => ch.charCodeAt(0))], `${source.name.replace(/\.[^.]+$/, "")} (降噪).wav`, { type: "audio/wav" });
+        const asset = assetFromFile(file, source.durationSec);
+        await invokeNative("studio_write_asset", { projectId: snapshot.id, assetId: asset.id, inputBase64: encoded });
+        replacements.set(assetId, asset);
+      }
+      if (!isCurrentProject(snapshot.id)) return;
+      updateTrack(track.id, { assets: [...track.assets, ...replacements.values()], denoiseOriginalAssets: Object.fromEntries([...replacements].map(([originalId, processed]) => [processed.id, originalId])), normalizationGain: undefined,
+        clips: originals.map((clip) => ({ ...clip, assetId: replacements.get(clip.assetId)!.id })) });
+      setNcmStatus("降噪完成，可在音轨调整中恢复降噪前的版本");
+    } catch (error) { setNcmStatus(error instanceof Error ? error.message : "降噪失败"); }
+    finally { setProcessingTrack(false); }
+  };
+  const saveProject = async (): Promise<StudioProject | null> => {
+    if (savingProject) return null;
+    setSavingProject(true);
+    setExitError(null);
+    const snapshot = structuredClone(useStudioStore.getState().project ?? currentProject);
+    try {
+      await waitForAssetWrites(snapshot.id);
+      await invokeNative("studio_save_project", { project: snapshot });
+      persistedProjectIdsRef.current.add(snapshot.id);
+      if (isCurrentProject(snapshot.id)) savedSnapshotRef.current = snapshot;
+      try { localStorage.removeItem(`cove.studio.draft.${snapshot.id}`); } catch { /* native project remains authoritative */ }
       setSavedProjects((items) => {
-        const next = { id: currentProject.id, title: currentProject.title, artist: currentProject.artist };
+        const next = { id: snapshot.id, title: snapshot.title, artist: snapshot.artist };
         return [next, ...items.filter((item) => item.id !== next.id)];
       });
       setNcmStatus("工程已保存到本地");
-    } catch { setNcmStatus("工程保存失败，请检查应用数据目录权限"); }
+      return snapshot;
+    } catch (error) { const message = error instanceof Error ? error.message : "工程保存失败，请检查应用数据目录权限"; setNcmStatus(message); setExitError(message); return null; }
+    finally { setSavingProject(false); }
   };
   const exportFile = async (extension: "wav" | "mp3" | "cove-studio") => {
     if (useStudioStore.getState().recordingTrackId) { setNcmStatus("请先停止录音，等待音轨保存后再导出"); return; }
@@ -743,6 +838,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         setSavedProjects((items) => [{ id: snapshot.id, title: snapshot.title, artist: snapshot.artist }, ...items.filter((item) => item.id !== snapshot.id)]);
         await waitForAssetWrites(snapshot.id);
         await invokeNative("studio_save_project", { project: snapshot });
+        if (isCurrentProject(snapshot.id)) savedSnapshotRef.current = structuredClone(snapshot);
         const path = await invokeNative<string | null>("studio_export_package_to_file", { projectId: snapshot.id, fileName: `${snapshot.title}.cove-studio` });
         setNcmStatus(path ? `工程包已导出到：${path}` : "已取消导出");
         return;
@@ -807,13 +903,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   return <div className="relative flex h-full w-full flex-col overflow-hidden bg-slate-950/90 text-white">
     <header ref={headerMenuRef} data-tauri-drag-region className="flex h-16 shrink-0 items-center gap-3 border-b border-white/10 px-5">
-      <button type="button" disabled={Boolean(recordingTrackId)} title={recordingTrackId ? "请先停止录音" : "返回播放器"} onClick={() => onBack(useStudioStore.getState().project ?? currentProject)} className="grid h-9 w-9 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white disabled:opacity-40" aria-label="返回播放器"><ArrowLeft size={18} /></button>
+      <button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} title={recordingTrackId ? "请先停止录音" : "返回播放器"} onClick={() => { engineRef.current?.pause(); setExitError(null); setExitPromptOpen(true); }} className="grid h-9 w-9 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white disabled:opacity-40" aria-label="返回播放器"><ArrowLeft size={18} /></button>
       {currentProject.coverUrl ? <img src={currentProject.coverUrl} alt="" className="h-10 w-10 rounded-xl object-cover" /> : <div className="grid h-10 w-10 place-items-center rounded-xl bg-white/10"><Disc3 size={18} /></div>}
       <div className="min-w-0 flex-1">{renamingProject ? <input autoFocus value={projectTitleDraft} onChange={(event) => setProjectTitleDraft(event.target.value)} onBlur={commitProjectRename} onKeyDown={(event) => { if (event.key === "Enter") commitProjectRename(); if (event.key === "Escape") { setProjectTitleDraft(currentProject.title); setRenamingProject(false); } }} aria-label="工程名称" className="no-drag w-full max-w-xs rounded-lg bg-white/10 px-2 py-1 text-sm font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <div className="flex min-w-0 items-center gap-1"><h1 className="truncate text-sm font-bold">{currentProject.title}</h1><button type="button" onClick={() => { setProjectTitleDraft(currentProject.title); setRenamingProject(true); }} className="no-drag shrink-0 rounded p-1 text-white/35 transition hover:bg-white/10 hover:text-white/80" aria-label="重命名工程" title="重命名工程"><Pencil size={12} /></button></div>}<p className="truncate text-xs text-white/45">{currentProject.artist} · 翻唱工作室</p></div>
-      <label className="hidden items-center gap-2 text-xs text-white/45 lg:flex">输入延迟 <input type="text" inputMode="decimal" aria-label="输入延迟毫秒" value={currentProject.inputLatencyMs} onChange={(event) => { const value = event.target.value.replace(/[^0-9.-]/g, ""); if (value === "" || value === "-" || value === "." || /^-?\d*\.?\d*$/.test(value)) updateLatency(value === "" || value === "-" || value === "." ? 0 : Number(value)); }} className="studio-latency-input no-drag w-16 rounded-lg bg-white/8 px-2 py-1 text-right font-mono text-white outline-none transition focus:bg-white/12 focus:ring-1 focus:ring-lime-200/60" /> ms</label>
-      <button type="button" onClick={saveProject} className="flex items-center gap-1.5 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/15"><Save size={14} />保存</button>
+      <button type="button" disabled={savingProject || Boolean(recordingTrackId)} onClick={() => void saveProject()} className="flex items-center gap-1.5 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/15 disabled:opacity-40"><Save size={14} />{savingProject ? "保存中…" : "保存"}</button>
       <div className="relative no-drag">
-        <button type="button" disabled={Boolean(recordingTrackId)} title={recordingTrackId ? "请先停止录音" : undefined} aria-haspopup="menu" aria-expanded={projectMenuOpen} onClick={() => { setProjectMenuOpen((open) => !open); setMicMenuOpen(false); setExportMenuOpen(false); }} className="flex items-center justify-between gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/75 transition hover:bg-white/15 disabled:opacity-40"><span>工程</span><ChevronDown size={14} className={`transition-transform ${projectMenuOpen ? "rotate-180" : ""}`} /></button>
+        <button type="button" disabled={Boolean(recordingTrackId) || savingProject || exporting || processingTrack} title={recordingTrackId ? "请先停止录音" : undefined} aria-haspopup="menu" aria-expanded={projectMenuOpen} onClick={() => { setProjectMenuOpen((open) => !open); setMicMenuOpen(false); setExportMenuOpen(false); }} className="flex items-center justify-between gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/75 transition hover:bg-white/15 disabled:opacity-40"><span>工程</span><ChevronDown size={14} className={`transition-transform ${projectMenuOpen ? "rotate-180" : ""}`} /></button>
         {projectMenuOpen && <div role="menu" className="absolute right-0 top-full z-[100] mt-2 max-h-60 w-64 overflow-y-auto rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
           <p className="px-3 pt-2 text-[10px] text-white/35">打开本地工程</p>
           <button type="button" role="menuitem" onClick={() => void importProjectPackage()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-bold text-lime-100/80 hover:bg-lime-200/10"><Upload size={13} />导入 .cove-studio 工程包</button>
@@ -839,6 +934,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     <div className="flex min-h-0 flex-1">
       <aside className="flex w-72 shrink-0 flex-col gap-3 overflow-y-auto border-r border-white/10 p-4">
         <div className="flex items-center justify-between gap-2"><span className="text-[11px] font-black tracking-[0.16em] text-white/35">轨道</span><div className="flex items-center gap-1"><button type="button" onClick={addVocalTrack} className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-[11px] font-bold text-white/70 hover:bg-white/15"><Plus size={13} />人声轨</button><button type="button" onClick={() => void importOriginalCurrentSong()} className="rounded-lg bg-amber-300/15 px-2 py-1 text-[11px] font-bold text-amber-100/80 hover:bg-amber-300/25">原曲</button><label className="cursor-pointer rounded-lg bg-white/8 px-2 py-1 text-[11px] font-bold text-white/55 hover:bg-white/15" title="选择本地原曲文件">本地<input type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importOriginalFile(file); event.currentTarget.value = ""; }} /></label></div></div>
+        <div className="flex items-center gap-2"><button disabled={loadingVocals || Boolean(jobId) || Boolean(recordingTrackId)} onClick={() => void importVocalReference()} className="flex-1 rounded-lg bg-amber-300/10 px-2 py-1.5 text-[11px] font-bold text-amber-100 disabled:opacity-40">{loadingVocals ? "正在提取人声…" : "原曲人声参考"}</button><label className="cursor-pointer rounded-lg bg-white/8 px-2 py-1.5 text-[11px] text-white/55">本地提取<input disabled={loadingVocals || Boolean(jobId) || Boolean(recordingTrackId)} type="file" accept="audio/*,.ncm,.mp3,.flac,.wav" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importVocalReference(file); event.currentTarget.value = ""; }} /></label></div>
         <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} />)}</div>
         <div className="mt-auto space-y-2 rounded-2xl border border-white/8 bg-white/[0.035] p-3">
           <p className="text-[10px] font-black tracking-[0.15em] text-white/35">伴奏输入</p>
@@ -872,8 +968,9 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                     {track.clips.length === 0 && <span className="pointer-events-none flex h-full items-center px-3 text-[10px] text-white/20">暂无音频</span>}
                     {track.clips.map((clip) => {
                       const asset = track.assets.find((item) => item.id === clip.assetId);
-                      const left = (clip.startSec / Math.max(projectDuration, 1)) * 100;
-                      const width = (clip.durationSec / Math.max(projectDuration, 1)) * 100;
+                      const placed = scheduledClip(clip, asset ?? { durationSec: clip.offsetSec + clip.durationSec }, track);
+                      const left = (placed.startSec / Math.max(projectDuration, 1)) * 100;
+                      const width = (placed.durationSec / Math.max(projectDuration, 1)) * 100;
                       return <div key={clip.id} role="button" tabIndex={0} aria-label={`音频片段 ${track.name}`}
                         title={`${asset?.name ?? "音频片段"} · ${formatTime(clip.startSec)} · ${formatTime(clip.durationSec)}`}
                         onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }}
@@ -930,10 +1027,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                 level={micLevel} countdown={countdownEnabled} recording={Boolean(recordingTrackId)} saving={savingRecording}
               onCountdownChange={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* optional preference */ } }}
               onRecord={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") { setRecordingTrackId(selectedTrack.id); void startRecording(); } else setNcmStatus("请先添加并选择人声轨"); }} />
+            <div className="flex items-center justify-between gap-2"><button disabled={!selectedTrack || Boolean(recordingTrackId)} onClick={() => setTrackToolsOpen(true)} className="shrink-0 rounded-lg bg-white/10 px-2.5 py-1.5 text-[11px] font-bold text-lime-100 disabled:opacity-40">音轨调整</button><div title="录音补偿：正数让录音提前，负数让录音延后"><SignedMilliseconds label="输入延迟" value={currentProject.inputLatencyMs} onChange={updateLatency} limit={5000} /></div></div>
           </div>
         </div>
       </main>
     </div>
+    {trackToolsOpen && selectedTrack && <StudioTrackTools track={selectedTrack} busy={processingTrack} onClose={() => setTrackToolsOpen(false)} onPan={(pan) => updateMixer(selectedTrack.id, { pan })} onOffset={(offsetMs) => updateTrack(selectedTrack.id, { offsetMs })} onNormalize={() => void normalizeSelectedTrack()} onDenoise={(strength) => void denoiseSelectedTrack(strength)} onRestore={() => updateTrack(selectedTrack.id, { clips: selectedTrack.clips.map((clip) => ({ ...clip, assetId: selectedTrack.denoiseOriginalAssets?.[clip.assetId] ?? clip.assetId })), denoiseOriginalAssets: undefined, normalizationGain: undefined })} />}
+    {exitPromptOpen && <div className="absolute inset-0 z-[240] grid place-items-center bg-black/60 p-5 backdrop-blur-sm" onKeyDown={(event) => { trapStudioDialogTab(event); if (event.key === "Escape" && !savingProject) setExitPromptOpen(false); }}><section role="dialog" aria-modal="true" aria-label="保存本次翻唱" className="w-full max-w-sm space-y-4 rounded-2xl border border-white/15 bg-slate-900 p-6 shadow-2xl"><h2 className="text-base font-bold">返回前保存本次翻唱？</h2><p className="text-xs leading-6 text-white/55">保存音轨、效果和时间调整，之后可从“工程”继续编辑。不保存将放弃上次保存后的编辑。</p>{exitError && <p role="alert" className="text-xs text-red-200">{exitError}</p>}<div className="flex flex-wrap justify-end gap-2"><button autoFocus disabled={savingProject} onClick={() => setExitPromptOpen(false)} className="rounded-lg px-3 py-2 text-xs text-white/60 hover:bg-white/10">取消</button><button disabled={savingProject} onClick={() => { try { localStorage.removeItem(`cove.studio.draft.${currentProject.id}`); } catch { /* optional recovery */ } onBack(structuredClone(savedSnapshotRef.current)); }} className="rounded-lg bg-white/10 px-3 py-2 text-xs">不保存返回</button><button disabled={savingProject} onClick={() => void saveProject().then((saved) => { if (saved) onBack(saved); })} className="rounded-lg bg-lime-200 px-3 py-2 text-xs font-bold text-slate-950">{savingProject ? "正在保存…" : "保存并返回"}</button></div></section></div>}
     {countdownValue !== null && <div className="pointer-events-none absolute inset-0 z-[200] grid place-items-center bg-slate-950/45 backdrop-blur-[2px]" role="status" aria-live="assertive"><div className="flex flex-col items-center gap-3"><div className="grid h-32 w-32 place-items-center rounded-full border border-lime-200/50 bg-slate-950/80 text-7xl font-black text-lime-100 shadow-[0_0_70px_rgba(190,242,100,.25)] animate-pulse">{countdownValue}</div><span className="rounded-full bg-black/40 px-4 py-1.5 text-xs font-bold tracking-[0.2em] text-white/70">准备录音</span></div></div>}
   </div>;
 }

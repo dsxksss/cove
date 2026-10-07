@@ -50,6 +50,20 @@ describe("studio transport state", () => {
   });
   afterEach(() => { globalThis.AudioContext = originalContext; globalThis.fetch = originalFetch; });
 
+  it("decodes only active clips while keeping restored originals playable", async () => {
+    const engine = new StudioAudioEngine(); const context = engine.context as unknown as Context;
+    const value = project();
+    value.tracks[0].assets.push({ ...value.tracks[0].assets[0], id: "original", url: "blob:original" });
+    await engine.setProject(value);
+    expect(context.decodes).toBe(1);
+    const restored = structuredClone(value);
+    restored.tracks[0].clips[0].assetId = "original";
+    await engine.setProject(restored); await engine.play(0);
+    expect(context.decodes).toBe(2);
+    expect(engine.isPlaying).toBe(true);
+    engine.dispose();
+  });
+
   it("keeps a pause authoritative when resume finishes later", async () => {
     const engine = new StudioAudioEngine(); const context = engine.context as unknown as Context;
     await engine.setProject(project());

@@ -39,6 +39,10 @@ export type StudioTrack = {
   id: string;
   name: string;
   kind: "instrumental" | "vocal" | "reference";
+  referenceStem?: "original" | "vocals";
+  offsetMs?: number;
+  normalizationGain?: number;
+  denoiseOriginalAssets?: Record<string, string>;
   color: string;
   clips: StudioClip[];
   takes: StudioTake[];
@@ -131,11 +135,12 @@ export function createVocalTrack(index: number): StudioTrack {
   };
 }
 
-export function createReferenceTrack(): StudioTrack {
+export function createReferenceTrack(stem: "original" | "vocals" = "original"): StudioTrack {
   return {
-    id: `reference-${Date.now()}`,
-    name: "原曲参考",
+    id: `reference-${stem}-${Date.now()}`,
+    name: stem === "vocals" ? "原曲人声参考" : "原曲参考",
     kind: "reference",
+    referenceStem: stem,
     color: "#fbbf24",
     clips: [],
     takes: [],

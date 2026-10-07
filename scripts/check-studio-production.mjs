@@ -23,7 +23,7 @@ try {
     const violations = [];
     document.addEventListener("securitypolicyviolation", (event) => violations.push(`${event.effectiveDirective}: ${event.blockedURI}`));
     const { StudioAudioEngine } = await import("/src/lib/studioAudio.ts");
-    const { renderStudioMix } = await import("/src/lib/studioExport.ts");
+    const { renderStudioMix, normalizationGain } = await import("/src/lib/studioExport.ts");
     const { encodePcmWav } = await import("/src/lib/studioWav.ts");
     const { createStudioProject } = await import("/src/studio/types.ts");
     const pcm = Float32Array.from({ length: 48000 * 2 }, (_, i) => 0.2 * Math.sin(2 * Math.PI * 220 * i / 48000));
@@ -44,15 +44,31 @@ try {
       const mix = await renderStudioMix(project);
       wav = await new Promise((resolve) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(",")[1]); reader.readAsDataURL(mix); });
     } catch (error) { exportError = error.message; }
+    const measured = await normalizationGain(project, "instrumental");
+    // Verify that normalization measures the dry input, independent of EQ,
+    // compression, fader and pan. Then exercise the same processing in export.
+    const track = project.tracks[0];
+    track.normalizationGain = measured;
+    track.mixer = { gain: 1, pan: -1, mute: false, solo: false };
+    track.effects.eq = { lowDb: 0, midDb: 0, highDb: 0 };
+    track.effects.compressor.ratio = 1; track.effects.reverb.mix = 0; track.effects.delay.mix = 0;
+    track.offsetMs = 250;
+    const processed = await engine.context.decodeAudioData(await (await renderStudioMix(project)).arrayBuffer());
+    const peak = (samples) => samples.reduce((n, v) => Math.max(n, Math.abs(v)), 0);
+    const offsetSample = processed.getChannelData(0).findIndex(v => Math.abs(v) > 0.005);
+    const dsp = { measured, expected: Math.pow(10, -1 / 20) / 0.2, left: peak(processed.getChannelData(0)), right: peak(processed.getChannelData(1)), beginsAt: offsetSample / processed.sampleRate };
     engine.dispose();
     URL.revokeObjectURL(asset.url);
-    return { playbackError, exportError, samples, wav, violations };
+    return { playbackError, exportError, samples, wav, violations, dsp };
   });
   console.log(JSON.stringify({ ...result, wav: result.wav ? "generated" : null }));
   assert.equal(result.playbackError, null, "packaged CSP must permit playback of local audio");
   assert.equal(result.exportError, null, "packaged CSP must permit offline export");
   assert.equal(result.samples, true, "realtime playback must produce audio samples");
   assert.deepEqual(result.violations, []);
+  assert.ok(Math.abs(result.dsp.measured - result.dsp.expected) < 0.005, "normalization must measure the summed dry source peak");
+  assert.ok(result.dsp.left > 0.5 && result.dsp.right < 0.0001, "export must honor per-track pan");
+  assert.ok(result.dsp.beginsAt >= 0.25 && result.dsp.beginsAt < 0.27, "export must honor millisecond track offset");
   const bytes = Buffer.from(result.wav, "base64");
   assert.equal(bytes.toString("ascii", 0, 4), "RIFF");
   assert.equal(bytes.readUInt16LE(34), 24);
@@ -63,8 +79,31 @@ try {
   // Exercise the real workspace buttons, worklet, offline mix and bundled MP3
   // encoder. Only native dialogs/IPC are substituted with this test directory.
   const exports = [];
+  const saved = new Map(), assets = new Map();
+  let failSave = false, vocalCache = null;
   await page.exposeFunction("testNative", (command, args) => {
     if (command === "studio_list_projects") return [];
+    if (command === "test_fail_save") { failSave = args.enabled; return; }
+    if (command === "test_vocal_cache") { vocalCache = args; return; }
+    if (command === "studio_cache_read") return args.stem === "vocals" ? vocalCache : null;
+    if (command === "studio_save_project") {
+      if (failSave) throw new Error("模拟磁盘写入失败");
+      saved.set(args.project.id, structuredClone(args.project));
+      return;
+    }
+    if (command === "studio_write_asset") {
+      const path = new URL(`${args.assetId}.wav`, output);
+      writeFileSync(path, Buffer.from(args.inputBase64, "base64"));
+      assets.set(args.assetId, path);
+      return;
+    }
+    if (command === "studio_denoise_asset") {
+      const input = assets.get(args.assetId);
+      assert.ok(input, "denoise must wait for the original asset to be written");
+      const path = new URL("ui-denoised.wav", output);
+      execFileSync(fileURLToPath(new URL("../src-tauri/resources/ncm2acc/ffmpeg.exe", import.meta.url)), ["-v", "error", "-y", "-i", fileURLToPath(input), "-af", `afftdn=nr=${[0,6,12,18][args.strength]}:nf=-40:tn=1`, "-c:a", "pcm_s24le", fileURLToPath(path)], { windowsHide: true });
+      return readFileSync(path).toString("base64");
+    }
     if (command === "studio_encode_mp3") {
       const wav = new URL("ui-mix.wav", output), mp3 = new URL("ui-mix.mp3", output);
       writeFileSync(wav, Buffer.from(args.inputBase64, "base64"));
@@ -121,7 +160,7 @@ try {
     project.instrumental = asset; project.tracks[0].assets = [asset];
     project.tracks[0].clips = [{ id: "clip", assetId: asset.id, startSec: 0, offsetSec: 0, durationSec: 12 }];
     const root = createRoot(document.getElementById("root"));
-    window.remount = (key) => root.render(React.createElement(Workspace, { key, project, onBack() {}, async onPlayInPlayer(url, snapshot) {
+    window.remount = (key) => root.render(React.createElement(Workspace, { key, project, onBack(snapshot) { window.exitedProject = snapshot; }, async onPlayInPlayer(url, snapshot) {
       const audio = new Audio(url); await audio.play();
       window.playerMix = { title: snapshot.title, artist: snapshot.artist, lyrics: snapshot.lyrics, duration: audio.duration };
       audio.pause(); URL.revokeObjectURL(url);
@@ -148,6 +187,88 @@ try {
   await page.waitForFunction(() => !window.store.getState().recordingTrackId && window.store.getState().project.tracks.some((track) => track.kind === "vocal" && track.clips.length));
   assert.equal(await page.evaluate(() => window.store.getState().project.tracks.find((track) => track.kind === "vocal").clips[0].startSec), 7, "recorded takes must use the song playhead, not AudioContext time");
   assert.equal(await page.evaluate(() => window.store.getState().project.tracks.find((track) => track.kind === "vocal").takes.length), 1);
+  const latency = page.getByRole("textbox", { name: "输入延迟", exact: true });
+  await latency.fill("-"); assert.equal(await latency.inputValue(), "-");
+  await latency.fill("-125"); await latency.press("Tab");
+  assert.equal(await page.evaluate(() => window.store.getState().project.inputLatencyMs), -125);
+  const latencyBox = await latency.boundingBox();
+  assert.ok(latencyBox.y > 400, "latency belongs beside the lower recording controls");
+  await page.getByRole("button", { name: "音轨调整", exact: true }).click();
+  const tools = page.getByRole("dialog", { name: "音轨调整", exact: true });
+  await tools.getByRole("textbox", { name: "音轨偏移", exact: true }).fill("-175");
+  await tools.getByRole("textbox", { name: "音轨偏移", exact: true }).press("Tab");
+  await tools.getByRole("slider", { name: "音轨声像", exact: true }).fill("-0.25");
+  await tools.getByRole("button", { name: "声音归一化", exact: true }).click();
+  await tools.getByRole("button", { name: "取消归一化", exact: true }).waitFor();
+  assert.ok(await page.evaluate(() => window.store.getState().project.tracks.find(t => t.kind === "vocal").normalizationGain > 1));
+  await tools.getByRole("button", { name: "应用降噪", exact: true }).click();
+  await tools.getByRole("button", { name: "恢复降噪前", exact: true }).waitFor();
+  await page.waitForFunction(() => !document.querySelector('[role="dialog"] fieldset').disabled);
+  // Subsequent edits and takes must survive both reprocessing and restoration.
+  await page.evaluate(() => {
+    const store = window.store.getState(), track = store.project.tracks.find(t => t.kind === "vocal");
+    const clip = track.clips[0];
+    window.denoiseOriginalId = track.denoiseOriginalAssets[clip.assetId];
+    store.updateClip(track.id, clip.id, { startSec: 6.5, durationSec: clip.durationSec / 2 });
+    const original = track.assets.find(a => a.id === window.denoiseOriginalId);
+    store.addAssetToTrack(track.id, { ...original, id: original.id }, undefined, 9);
+    window.editedClipPositions = window.store.getState().project.tracks.find(t => t.kind === "vocal").clips.map(({ startSec, offsetSec, durationSec }) => ({ startSec, offsetSec, durationSec }));
+  });
+  await tools.getByRole("button", { name: "应用降噪", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('[role="dialog"] fieldset').disabled);
+  await tools.getByRole("button", { name: "恢复降噪前", exact: true }).click();
+  const restored = await page.evaluate(() => {
+    const track = window.store.getState().project.tracks.find(t => t.kind === "vocal");
+    return { current: track.clips.map(({ startSec, offsetSec, durationSec }) => ({ startSec, offsetSec, durationSec })), expected: window.editedClipPositions, original: window.denoiseOriginalId, ids: track.clips.map(c => c.assetId), pan: track.mixer.pan, offset: track.offsetMs };
+  });
+  assert.deepEqual(restored.current, restored.expected);
+  assert.deepEqual(restored.ids, [restored.original, restored.original]);
+  assert.equal(restored.pan, -0.25); assert.equal(restored.offset, -175);
+  await page.screenshot({ path: fileURLToPath(new URL("track-tools.png", output)) });
+  await tools.getByRole("button", { name: "完成", exact: true }).click();
+  // A separate cached vocal channel must not overwrite either the accompaniment
+  // or the full original-song reference track.
+  await page.evaluate(async () => {
+    const asset = window.store.getState().project.tracks[0].assets[0];
+    const blob = await (await fetch(asset.url)).blob();
+    const base64 = await new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(",")[1]); reader.readAsDataURL(blob); });
+    await window.testNative("test_vocal_cache", { name: "原曲人声.wav", mimeType: "audio/wav", base64 });
+    window.store.getState().addReferenceTrack("original");
+    window.originalInstrumentalId = asset.id;
+  });
+  await page.getByRole("button", { name: "原曲人声参考", exact: true }).click();
+  await page.waitForFunction(() => window.store.getState().project.tracks.some(t => t.referenceStem === "vocals" && t.clips.length));
+  assert.equal(await page.evaluate(() => window.store.getState().project.tracks[0].assets[0].id === window.originalInstrumentalId), true);
+  assert.equal(await page.evaluate(() => window.store.getState().project.tracks.filter(t => t.kind === "reference").length), 2);
+  assert.equal(await page.evaluate(() => window.store.getState().project.tracks.find(t => t.referenceStem === "vocals").mixer.mute), true);
+  // Formal saving is explicit. Discard must restore the last saved baseline,
+  // including when the debounce for recovery drafts has elapsed.
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await page.getByText("工程已保存到本地", { exact: true }).waitFor();
+  await page.evaluate(() => window.store.getState().updateProjectTitle("未保存的编辑"));
+  await page.waitForTimeout(600);
+  assert.equal([...saved.values()].at(-1).title, "Production test");
+  await page.getByRole("button", { name: "返回播放器", exact: true }).click();
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.store.getState().project.title), "未保存的编辑");
+  await page.getByRole("button", { name: "返回播放器", exact: true }).click();
+  await page.getByRole("button", { name: "不保存返回", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.exitedProject.title), "Production test");
+  // The fixture records onBack without unmounting so the failure case can be
+  // tested against the same edited project.
+  await page.evaluate(() => { window.exitedProject = null; });
+  await page.evaluate(() => window.testNative("test_fail_save", { enabled: true }));
+  await page.getByRole("button", { name: "保存并返回", exact: true }).click();
+  await page.getByRole("alert").waitFor();
+  assert.equal(await page.evaluate(() => window.exitedProject), null);
+  await page.evaluate(() => window.testNative("test_fail_save", { enabled: false }));
+  await page.getByRole("button", { name: "保存并返回", exact: true }).click();
+  await page.waitForFunction(() => window.exitedProject);
+  assert.equal(await page.evaluate(() => window.exitedProject.title), "未保存的编辑");
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await page.evaluate(() => window.store.getState().updateProjectTitle("Production test"));
+  await page.getByText("人声 1", { exact: true }).first().click();
+  console.log("Studio tools PASS: signed latency/offset, pan, normalization, real FFmpeg denoise, restore after edits/new take, distinct cached vocal reference, explicit save/discard/cancel and failed-save guard.");
   for (const label of ["WAV 音频", "MP3 音频"]) {
     await page.getByRole("button", { name: "导出", exact: true }).click();
     await page.getByRole("menuitem", { name: new RegExp(label) }).click();

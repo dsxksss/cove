@@ -15,6 +15,27 @@ function setup() {
 describe("studio editing state", () => {
   afterEach(() => useStudioStore.getState().setProject(null));
 
+  it("keeps full-song and vocal reference channels distinct and persists mix adjustments", () => {
+    setup();
+    const store = useStudioStore.getState();
+    const original = store.addReferenceTrack("original")!;
+    const vocals = store.addReferenceTrack("vocals")!;
+    expect(original === vocals).toBe(false);
+    expect(store.addReferenceTrack("vocals")).toBe(vocals);
+    store.updateTrack(vocals, { offsetMs: -125, normalizationGain: 2.5 });
+    store.updateMixer(vocals, { pan: -0.2 });
+    store.updateLatency(-100);
+    const saved = JSON.parse(JSON.stringify(useStudioStore.getState().project));
+    store.setProject(saved);
+    const reopened = useStudioStore.getState().project!;
+    const track = reopened.tracks.find((item) => item.id === vocals)!;
+    expect(reopened.inputLatencyMs).toBe(-100);
+    expect(track.offsetMs).toBe(-125);
+    expect(track.normalizationGain).toBe(2.5);
+    expect(track.mixer.pan).toBe(-0.2);
+    expect(track.referenceStem).toBe("vocals");
+  });
+
   it("clears stale recording locks when opening or closing a project", () => {
     const { project, vocalId } = setup();
     useStudioStore.getState().setRecordingTrackId(vocalId);

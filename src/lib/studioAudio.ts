@@ -1,6 +1,6 @@
 import type { StudioAsset, StudioProject, StudioTrack } from "../studio/types";
 import { createTrackGraph, type TrackGraph } from "./studioDsp";
-import { getClipDuration, getProjectDuration, isTrackAudible } from "./studioSchedule";
+import { getProjectDuration, isTrackAudible, scheduledClip, trackOffsetSeconds } from "./studioSchedule";
 import { decodeStudioAsset } from "./studioAssetAudio";
 
 type LoadedAsset = { buffer: AudioBuffer; url: string };
@@ -71,17 +71,21 @@ export class StudioAudioEngine {
     this.clearSources();
     this.clearGraphs();
     if (previousProjectId !== project.id) this.loaded.clear();
-    const requestedUrls = new Map(project.tracks.flatMap((track) => track.assets.map((asset) => [asset.id, asset.url] as const)));
+    // Keep original takes for restoration without decoding every old denoise
+    // version into RAM. Only clips currently on the timeline need PCM buffers.
+    const activeAssets = project.tracks.flatMap((track) => {
+      const ids = new Set(track.clips.map((clip) => clip.assetId));
+      return track.assets.filter((asset) => ids.has(asset.id));
+    });
+    const requestedUrls = new Map(activeAssets.map((asset) => [asset.id, asset.url] as const));
     for (const [id, loaded] of this.loaded) if (requestedUrls.get(id) !== loaded.url) this.loaded.delete(id);
     this.structureKey = nextKey;
     this.updateGraphs(project.tracks);
 
     const requested = new Map<string, StudioAsset>();
-    for (const track of project.tracks) {
-      for (const asset of track.assets) {
+    for (const asset of activeAssets) {
         if (requested.has(asset.id) || this.loaded.get(asset.id)?.url === asset.url) continue;
         requested.set(asset.id, asset);
-      }
     }
     const loading = Promise.all([...requested.values()].map(async (asset) => {
       const { id, url } = asset;
@@ -151,7 +155,7 @@ export class StudioAudioEngine {
         if (!isTrackAudible(track, hasSolo)) continue;
         for (const clip of track.clips) {
           const error = this.loadErrors.get(clip.assetId);
-          if (error && clip.startSec + clip.durationSec > startPosition) throw error;
+          if (error && clip.startSec + trackOffsetSeconds(track) + clip.durationSec > startPosition) throw error;
         }
       }
       const origin = this.context.currentTime + 0.015;
@@ -180,9 +184,10 @@ export class StudioAudioEngine {
         const asset = track.assets.find((candidate) => candidate.id === clip.assetId);
         const loaded = asset ? this.loaded.get(asset.id) : undefined;
         if (!asset || !loaded) continue;
-        const clipStart = Math.max(0, Number.isFinite(clip.startSec) ? clip.startSec : 0);
-        const offset = Math.max(0, Number.isFinite(clip.offsetSec) ? clip.offsetSec : 0);
-        const duration = getClipDuration(clip, { durationSec: loaded.buffer.duration });
+        const scheduled = scheduledClip(clip, { durationSec: loaded.buffer.duration }, track);
+        const clipStart = scheduled.startSec;
+        const offset = scheduled.offsetSec;
+        const duration = scheduled.durationSec;
         if (duration <= 0 || clipStart + duration <= time) continue;
         const elapsed = Math.max(0, time - clipStart);
         const source = this.context.createBufferSource();
@@ -232,5 +237,6 @@ function projectStructureKey(project: StudioProject): string {
     id: track.id,
     assets: track.assets.map((asset) => [asset.id, asset.url]),
     clips: track.clips.map((clip) => [clip.id, clip.assetId, clip.startSec, clip.offsetSec, clip.durationSec]),
+    offsetMs: track.offsetMs ?? 0,
   })));
 }

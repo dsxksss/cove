@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -29,6 +30,31 @@ def load_runner(path):
 
 
 class StemProtocolTests(unittest.TestCase):
+    def test_stem_tags_do_not_confuse_song_names_or_no_vocals(self):
+        for path in RUNNERS:
+            runner = load_runner(path)
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in ["Song (Vocals)_(Instrumental).wav", "Song (Instrumental)_(Vocals).wav", "Song_(no_vocals).wav", "Song (人声).wav", "instrumental.wav", "Song (Vocals).json"]:
+                    (root / name).write_bytes(b"fixture")
+                self.assertEqual({p.name for p in runner.stem_outputs(root, "vocals")}, {"Song (Instrumental)_(Vocals).wav", "Song (人声).wav"})
+                self.assertEqual({p.name for p in runner.stem_outputs(root, "instrumental")}, {"Song (Vocals)_(Instrumental).wav", "Song_(no_vocals).wav"})
+
+    def test_ncm_entrypoint_keeps_both_stems_and_selects_by_final_label(self):
+        upstream = load_runner(ROOT / "src-tauri/resources/ncm2acc/ncm2acc.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            class Separator:
+                output_dir = directory
+                def separate(self, _song):
+                    names = ["Song (Instrumental)_(Vocals).wav", "Song (Instrumental)_(Instrumental).wav"]
+                    for index, name in enumerate(names):
+                        (root / name).write_bytes(bytes([index]))
+                    return names
+            result = upstream.extract_instrumental(Separator(), Path("Song (Instrumental).wav"), "WAV")
+            self.assertEqual(result.read_bytes(), b"\x01")
+            self.assertTrue((root / "Song (Instrumental)_(Vocals).wav").exists())
+
     def test_json_round_trips_through_gbk_and_ascii_streams(self):
         for path in RUNNERS:
             for encoding in ("gbk", "ascii"):
@@ -37,12 +63,13 @@ class StemProtocolTests(unittest.TestCase):
                     raw = io.BytesIO()
                     stream = io.TextIOWrapper(raw, encoding=encoding)
                     with patch.object(runner.sys, "stdout", stream):
-                        runner.emit("separate", 0.16, message=MESSAGE, outputPath=OUTPUT_PATH)
+                        runner.emit("separate", 0.16, message=MESSAGE, outputPath=OUTPUT_PATH, vocalOutputPath=OUTPUT_PATH.replace("伴奏", "人声"))
                     wire = raw.getvalue()
                     self.assertTrue(wire.isascii())
                     event = json.loads(wire.decode("utf-8"))
                     self.assertEqual(event["message"], MESSAGE)
                     self.assertEqual(event["outputPath"], OUTPUT_PATH)
+                    self.assertEqual(event["vocalOutputPath"], OUTPUT_PATH.replace("伴奏", "人声"))
                     stream.detach()
 
     def test_stdio_configures_utf8(self):

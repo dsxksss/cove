@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createStudioProject, createVocalTrack } from "../studio/types";
-import { getClipDuration, getProjectDuration, hasAudibleClips, isTrackAudible } from "./studioSchedule";
+import { getClipDuration, getProjectDuration, hasAudibleClips, isTrackAudible, scheduledClip } from "./studioSchedule";
 
 function project() {
   const value = createStudioProject({ songId: "1", title: "Song", artist: "Artist", coverUrl: "", durationSec: 10, lyrics: [] });
@@ -12,6 +12,25 @@ function project() {
 }
 
 describe("studio scheduling", () => {
+  it("shifts clips in milliseconds and trims only the audible head before zero", () => {
+    const clip = { id: "c", assetId: "a", startSec: 0.1, offsetSec: 0.2, durationSec: 2 };
+    const earlier = scheduledClip(clip, { durationSec: 4 }, { offsetMs: -350 });
+    expect(earlier.startSec).toBe(0);
+    expect(earlier.offsetSec).toBeCloseTo(0.45);
+    expect(earlier.durationSec).toBeCloseTo(1.75);
+    const later = scheduledClip(clip, { durationSec: 4 }, { offsetMs: 200 });
+    expect(later.startSec).toBeCloseTo(0.3);
+    expect(later.offsetSec).toBe(0.2);
+    expect(clip.startSec).toBe(0.1);
+    expect(clip.durationSec).toBe(2);
+  });
+  it("includes delayed tails and excludes clips shifted wholly before zero", () => {
+    const value = project();
+    value.tracks[1].offsetMs = 500;
+    expect(getProjectDuration(value)).toBe(20.5);
+    value.tracks[1].offsetMs = -30000;
+    expect(hasAudibleClips(value)).toBe(false);
+  });
   it("extends the clock to the end of clips", () => {
     expect(getProjectDuration(project())).toBe(20);
   });

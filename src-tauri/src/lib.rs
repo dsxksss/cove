@@ -60,6 +60,7 @@ struct StemJob {
     stage: String,
     progress: f32,
     output_path: Option<String>,
+    vocal_output_path: Option<String>,
     error: Option<String>,
     message: Option<String>,
     elapsed_sec: Option<f32>,
@@ -5653,7 +5654,7 @@ async fn studio_prepare_instrumental(
     if input.len() > 512 * 1024 * 1024 { return Err("伴奏源文件超过 512 MiB 限制".into()); }
     fs::write(&input_path, input).map_err(|error| error.to_string())?;
 
-    let job = StemJob { id: id.clone(), state: "queued".into(), stage: "prepare".into(), progress: 0.0, output_path: None, error: None, message: Some("准备伴奏任务…".into()), elapsed_sec: None, indeterminate: false };
+    let job = StemJob { id: id.clone(), state: "queued".into(), stage: "prepare".into(), progress: 0.0, output_path: None, vocal_output_path: None, error: None, message: Some("准备伴奏任务…".into()), elapsed_sec: None, indeterminate: false };
     jobs.lock().map_err(|_| "伴奏任务状态锁定失败")?.insert(id.clone(), job);
     let runner = args.runner_path.map(PathBuf::from).unwrap_or_else(|| {
         let mut candidates = Vec::new();
@@ -5662,15 +5663,15 @@ async fn studio_prepare_instrumental(
         // Python environment into target/debug on every rebuild.
         #[cfg(debug_assertions)]
         candidates.extend([
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ncm2acc/ncm2acc-runner.exe"),
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ncm2acc/runner.py"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ncm2acc/ncm2acc-runner.exe"),
         ]);
         candidates.extend(std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(|dir| {
                 vec![
-                    dir.join("resources").join("ncm2acc").join("ncm2acc-runner.exe"),
                     dir.join("resources").join("ncm2acc").join("runner.py"),
+                    dir.join("resources").join("ncm2acc").join("ncm2acc-runner.exe"),
                     dir.join("resources").join("ncm2acc-runner.exe"),
                 ]
             }))
@@ -5740,11 +5741,12 @@ async fn studio_prepare_instrumental(
                     let stage = event.get("stage").and_then(Value::as_str).unwrap_or("separate").to_string();
                     let progress = event.get("progress").and_then(Value::as_f64).unwrap_or(0.35).clamp(0.0, 1.0) as f32;
                     let output = event.get("outputPath").and_then(Value::as_str).map(str::to_string);
+                    let vocals = event.get("vocalOutputPath").and_then(Value::as_str).map(str::to_string);
                     let error = event.get("error").and_then(Value::as_str).map(str::to_string);
                     let message = event.get("message").and_then(Value::as_str).map(str::to_string);
                     let elapsed_sec = event.get("elapsedSec").and_then(Value::as_f64).map(|value| value as f32);
                     let indeterminate = event.get("indeterminate").and_then(Value::as_bool).unwrap_or(false);
-                    update_stem_job(&event_jobs, &event_id, |job| { if job.state != "running" { return; } job.stage = stage.clone(); job.progress = job.progress.max(progress); if output.is_some() { job.output_path = output.clone(); } if error.is_some() { job.error = error.clone(); } if message.is_some() { job.message = message.clone(); } if elapsed_sec.is_some() { job.elapsed_sec = elapsed_sec; } job.indeterminate = indeterminate; });
+                    update_stem_job(&event_jobs, &event_id, |job| { if job.state != "running" { return; } job.stage = stage.clone(); job.progress = job.progress.max(progress); if output.is_some() { job.output_path = output.clone(); } if vocals.is_some() { job.vocal_output_path = vocals.clone(); } if error.is_some() { job.error = error.clone(); } if message.is_some() { job.message = message.clone(); } if elapsed_sec.is_some() { job.elapsed_sec = elapsed_sec; } job.indeterminate = indeterminate; });
                 }
             }
         }));
@@ -5792,10 +5794,15 @@ fn studio_cancel_job(job_id: String, jobs: State<'_, StemJobsState>) -> Result<(
 }
 
 #[tauri::command]
-fn studio_job_audio(job_id: String, jobs: State<'_, StemJobsState>) -> Result<Value, String> {
+fn studio_job_audio(job_id: String, stem: Option<String>, jobs: State<'_, StemJobsState>) -> Result<Value, String> {
     let job = jobs.lock().map_err(|_| "任务锁定失败")?.get(&job_id).cloned().ok_or("找不到伴奏任务")?;
     if job.state != "completed" { return Err("伴奏尚未完成".into()); }
-    let path = PathBuf::from(job.output_path.ok_or("伴奏输出缺失")?).canonicalize().map_err(|e| e.to_string())?;
+    let output = match stem.as_deref().unwrap_or("instrumental") {
+        "instrumental" => job.output_path.ok_or("伴奏输出缺失")?,
+        "vocals" => job.vocal_output_path.ok_or("当前运行包未输出人声，请更新人声分离补丁后重试")?,
+        _ => return Err("不支持的分离音轨".into()),
+    };
+    let path = PathBuf::from(output).canonicalize().map_err(|e| e.to_string())?;
     let allowed = app_data_dir().join("StudioJobs").join(&job.id).join("output").canonicalize().map_err(|e| e.to_string())?;
     if !path.starts_with(allowed) { return Err("伴奏输出不在任务目录中".into()); }
     Ok(json!({"name": path.file_name().unwrap().to_string_lossy(), "base64": studio_files::encode_base64(&fs::read(&path).map_err(|e| e.to_string())?)}))
@@ -6130,6 +6137,7 @@ pub fn run() {
             studio_files::studio_import_package,
             studio_files::studio_save_export,
             studio_files::studio_encode_mp3,
+            studio_files::studio_denoise_asset,
             studio_job_audio
         ])
         .run(tauri::generate_context!())

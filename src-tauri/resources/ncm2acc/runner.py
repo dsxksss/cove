@@ -144,6 +144,18 @@ def emit(stage: str, progress: float, **extra: object) -> None:
     print(json.dumps(payload, ensure_ascii=True), flush=True)
 
 
+def stem_outputs(directory: Path, stem: str) -> list[Path]:
+    wanted = {"instrumental": {"instrumental", "伴奏", "no_vocals", "accompaniment"}, "vocals": {"vocals", "人声"}}[stem]
+    candidates = []
+    for path in directory.iterdir():
+        if not path.is_file() or path.suffix.lower() not in {".wav", ".mp3", ".flac", ".m4a"}:
+            continue
+        labels = re.findall(r"\((instrumental|vocals|伴奏|人声|no_vocals|accompaniment)\)", path.stem, re.I)
+        if labels and labels[-1].lower() in wanted:
+            candidates.append(path)
+    return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)
+
+
 def main() -> int:
     configure_stdio()
     parser = argparse.ArgumentParser()
@@ -193,7 +205,6 @@ def main() -> int:
                 "--output_dir", str(output),
                 "--output_format", args.format,
                 "--model_file_dir", str(root / "models"),
-                "--single_stem", "Instrumental",
                 "--chunk_duration", str(max(10.0, args.chunk_duration)),
                 "--mdxc_segment_size", "256", "--mdxc_override_model_segment_size",
                 "--mdxc_batch_size", "1", "--mdxc_overlap", "2",
@@ -270,15 +281,19 @@ def main() -> int:
             return return_code
 
         emit("finalize", 0.92, message="正在写入伴奏文件…")
-        candidates = sorted(output.glob("*(伴奏).*"), key=lambda item: item.stat().st_mtime, reverse=True)
-        if not candidates:
-            candidates = sorted([item for item in output.iterdir() if any(token in item.stem.lower() for token in ("instrumental", "no_vocals", "accompaniment"))], key=lambda item: item.stat().st_mtime, reverse=True)
+        candidates = stem_outputs(output, "instrumental")
         if not candidates:
             emit("finalize", 1, error="分离完成但未找到伴奏输出文件", message="未找到伴奏输出文件")
             return 3
         destination = args.output / f"{args.title or candidates[0].stem} (伴奏){candidates[0].suffix}"
         shutil.copy2(candidates[0], destination)
-        emit("finalize", 1, outputPath=str(destination), message="伴奏已生成")
+        vocals = stem_outputs(output, "vocals")
+        extra = {}
+        if vocals:
+            vocal_destination = args.output / f"{args.title or vocals[0].stem} (人声){vocals[0].suffix}"
+            shutil.copy2(vocals[0], vocal_destination)
+            extra["vocalOutputPath"] = str(vocal_destination)
+        emit("finalize", 1, outputPath=str(destination), message="伴奏与人声已生成" if vocals else "伴奏已生成", **extra)
         return 0
 
 

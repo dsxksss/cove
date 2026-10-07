@@ -166,6 +166,7 @@ try {
   await page.screenshot({ path: fileURLToPath(new URL("studio-shortcuts.png", output)) });
 
   await page.getByRole("button", { name: "返回播放器", exact: true }).click();
+  await page.getByRole("button", { name: "不保存返回", exact: true }).click();
   await page.getByRole("button", { name: "打开翻唱工作室", exact: true }).waitFor();
   await blur();
   await page.keyboard.press("Space");

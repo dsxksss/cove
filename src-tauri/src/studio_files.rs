@@ -171,10 +171,11 @@ pub fn studio_read_asset(project_id: String, asset_id: String) -> Result<String,
 /// project so opening a fresh project for the same song does not trigger stem
 /// separation again.
 #[tauri::command]
-pub fn studio_cache_read(cache_id: String) -> Result<Option<Value>, String> {
+pub fn studio_cache_read(cache_id: String, stem: Option<String>) -> Result<Option<Value>, String> {
     let dir = instrumental_cache_root(&cache_id)?;
-    let meta_path = dir.join("meta.json");
-    let audio_path = dir.join("instrumental.audio");
+    let (meta_name, audio_name) = stem_cache_names(stem.as_deref())?;
+    let meta_path = dir.join(meta_name);
+    let audio_path = dir.join(audio_name);
     if !meta_path.is_file() || !audio_path.is_file() { return Ok(None); }
     let meta: Value = serde_json::from_slice(&fs::read(meta_path).map_err(|e| e.to_string())?)
         .map_err(|e| format!("伴奏缓存元数据无效：{e}"))?;
@@ -188,17 +189,70 @@ pub fn studio_cache_read(cache_id: String) -> Result<Option<Value>, String> {
 }
 
 #[tauri::command]
-pub fn studio_cache_write(cache_id: String, name: String, mime_type: String, input_base64: String) -> Result<(), String> {
+pub fn studio_cache_write(cache_id: String, name: String, mime_type: String, input_base64: String, stem: Option<String>) -> Result<(), String> {
     if input_base64.len() > 720 * 1024 * 1024 { return Err("伴奏缓存超过 512 MiB 限制".into()); }
     let bytes = super::decode_base64(&input_base64).ok_or("伴奏缓存数据无效")?;
     let dir = instrumental_cache_root(&cache_id)?;
+    let (meta_name, audio_name) = stem_cache_names(stem.as_deref())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    fs::write(dir.join("instrumental.audio"), bytes).map_err(|e| e.to_string())?;
-    fs::write(dir.join("meta.json"), serde_json::to_vec(&json!({
+    fs::write(dir.join(audio_name), bytes).map_err(|e| e.to_string())?;
+    fs::write(dir.join(meta_name), serde_json::to_vec(&json!({
         "name": safe_cache_name(&name),
         "mimeType": if mime_type.is_empty() { "audio/wav" } else { &mime_type },
         "version": 1,
-    })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // A replacement may come from an older runner that only outputs an
+    // instrumental. Never pair that new version with the previous vocals.
+    if audio_name == "instrumental.audio" {
+        for name in ["vocals.meta.json", "vocals.audio"] {
+            let path = dir.join(name);
+            if path.exists() { fs::remove_file(path).map_err(|e| e.to_string())?; }
+        }
+    }
+    Ok(())
+}
+
+fn stem_cache_names(stem: Option<&str>) -> Result<(&'static str, &'static str), String> {
+    match stem.unwrap_or("instrumental") {
+        "instrumental" => Ok(("meta.json", "instrumental.audio")),
+        "vocals" => Ok(("vocals.meta.json", "vocals.audio")),
+        _ => Err("不支持的分离音轨".into()),
+    }
+}
+
+#[tauri::command]
+pub async fn studio_denoise_asset(project_id: String, asset_id: String, strength: u8) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = root(&project_id)?;
+        let source = dir.join("assets").join(format!("{}.audio", component(&asset_id)?));
+        if !source.is_file() { return Err("录音文件尚未保存，请稍后再试".into()); }
+        let output = dir.join(format!("denoise-{}.wav", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()));
+        let reduction = match strength { 1 => 6, 2 => 12, 3 => 18, _ => return Err("无效的降噪强度".into()) };
+        let mut command = Command::new(studio_ffmpeg());
+        #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
+        let result = command.args(["-v", "error", "-y", "-i"]).arg(source)
+            .args(["-af", &format!("afftdn=nr={reduction}:nf=-40:tn=1"), "-c:a", "pcm_s24le"]).arg(&output).output();
+        let result = match result {
+            Ok(result) if result.status.success() => fs::read(&output).map(|bytes| encode_base64(&bytes)).map_err(|e| e.to_string()),
+            Ok(result) => Err(format!("降噪失败：{}", String::from_utf8_lossy(&result.stderr).chars().take(800).collect::<String>())),
+            Err(error) => Err(format!("无法启动降噪，需要运行包中的 FFmpeg：{error}")),
+        };
+        let _ = fs::remove_file(output);
+        result
+    }).await.map_err(|e| e.to_string())?
+}
+
+fn studio_ffmpeg() -> PathBuf {
+    #[cfg(debug_assertions)]
+    {
+        let development = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ncm2acc/ffmpeg.exe");
+        if development.is_file() { return development; }
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
+        let bundled = dir.join("resources/ncm2acc/ffmpeg.exe");
+        if bundled.is_file() { return bundled; }
+    }
+    PathBuf::from("ffmpeg.exe")
 }
 
 #[tauri::command]
@@ -476,8 +530,7 @@ pub fn studio_encode_mp3(project_id: String, input_base64: String) -> Result<Str
     let input = dir.join("mix.wav");
     let output = dir.join("mix.mp3");
     fs::write(&input, bytes).map_err(|e| e.to_string())?;
-    let bundled = std::env::current_exe().map_err(|e| e.to_string())?.parent().unwrap().join("resources/ncm2acc/ffmpeg.exe");
-    let mut command = Command::new(if bundled.exists() { bundled } else { PathBuf::from("ffmpeg.exe") });
+    let mut command = Command::new(studio_ffmpeg());
     #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
     let status = command.args(["-y", "-i"]).arg(&input).args(["-codec:a", "libmp3lame", "-b:a", "320k"]).arg(&output).output().map_err(|e| format!("需要 FFmpeg 才能导出 MP3：{e}"))?;
     if !status.status.success() { return Err(String::from_utf8_lossy(&status.stderr).chars().take(2000).collect()); }
@@ -487,6 +540,12 @@ pub fn studio_encode_mp3(project_id: String, input_base64: String) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stem_caches_preserve_old_paths_and_reject_other_names() {
+        assert_eq!(stem_cache_names(None).unwrap(), ("meta.json", "instrumental.audio"));
+        assert_eq!(stem_cache_names(Some("vocals")).unwrap(), ("vocals.meta.json", "vocals.audio"));
+        assert!(stem_cache_names(Some("../vocals")).is_err());
+    }
     #[test]
     fn exports_only_declared_assets_after_replacement() {
         let dir = std::env::temp_dir().join(format!("cove-zip-test-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));

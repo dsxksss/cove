@@ -45,6 +45,7 @@ export type NativeCommand =
   | "studio_import_package"
   | "studio_save_export"
   | "studio_encode_mp3"
+  | "studio_denoise_asset"
   | "studio_cache_read"
   | "studio_cache_write"
   | "studio_cache_remove";

@@ -17,7 +17,7 @@ type StudioState = {
   setRecordingTrackId: (id: string | null) => void;
   updateProjectTitle: (title: string) => void;
   addVocalTrack: () => void;
-  addReferenceTrack: () => string | null;
+  addReferenceTrack: (stem?: "original" | "vocals") => string | null;
   updateTrack: (id: string, patch: Partial<StudioTrack>) => void;
   renameTrack: (id: string, name: string) => void;
   updateMixer: (id: string, patch: Partial<StudioTrack["mixer"]>) => void;
@@ -54,12 +54,12 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const nextIndex = state.project.tracks.filter((track) => track.kind === "vocal").length + 1;
     return { project: touch({ ...state.project, tracks: [...state.project.tracks, createVocalTrack(nextIndex)] }) };
   }),
-  addReferenceTrack: () => {
+  addReferenceTrack: (stem = "original") => {
     const project = get().project;
     if (!project) return null;
-    const existing = project.tracks.find((track) => track.kind === "reference");
+    const existing = project.tracks.find((track) => track.kind === "reference" && (track.referenceStem ?? "original") === stem);
     if (existing) return existing.id;
-    const track = createReferenceTrack();
+    const track = createReferenceTrack(stem);
     set({ project: touch({ ...project, tracks: [...project.tracks, track] }) });
     return track.id;
   },
@@ -130,6 +130,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       tracks: state.project.tracks.map((track) => track.id !== trackId ? track : {
         ...track,
         assets: [asset],
+        denoiseOriginalAssets: undefined,
+        normalizationGain: undefined,
         clips: [{ id: `clip-${Date.now()}`, assetId: asset.id, startSec: Math.max(0, startSec), offsetSec: 0, durationSec: asset.durationSec }],
         takes: track.kind === "instrumental" ? [] : track.takes,
       }),

@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -114,7 +115,7 @@ def decrypt_ncm(ncm: Path, out_dir: Path, ncmdump: Path) -> Path | None:
 def extract_instrumental(separator, song: Path, fmt: str) -> Path | None:
     """用 audio-separator 提取伴奏，返回伴奏文件路径（已重命名为 '<歌名> (伴奏).<fmt>'）。"""
     out_dir = Path(separator.output_dir)
-    results = separator.separate(str(song))  # output_single_stem=Instrumental → 只产生一个文件
+    results = separator.separate(str(song))  # 同时保留伴奏与原曲人声
 
     # results 里既可能是文件名也可能是绝对路径，统一成绝对路径
     produced = []
@@ -122,9 +123,11 @@ def extract_instrumental(separator, song: Path, fmt: str) -> Path | None:
         p = Path(r)
         produced.append(p if p.is_absolute() else out_dir / p)
 
-    inst = next((p for p in produced if "instrumental" in p.name.lower()), None)
-    if inst is None:
-        inst = produced[0] if produced else None
+    def is_instrumental(path):
+        labels = re.findall(r"\((instrumental|vocals|伴奏|人声|no_vocals|accompaniment)\)", path.stem, re.I)
+        return bool(labels and labels[-1].lower() in {"instrumental", "伴奏", "no_vocals", "accompaniment"})
+
+    inst = next((p for p in produced if is_instrumental(p)), None)
     if inst is None or not inst.exists():
         log.error("人声分离失败：%s", song.name)
         return None
@@ -261,7 +264,7 @@ def make_separator(cfg: dict):
         output_dir=str(cfg["output"]),
         output_format=cfg["fmt"],
         output_bitrate=cfg["bitrate"],
-        output_single_stem="Instrumental",   # 只要伴奏
+        output_single_stem=None,   # 同时保留伴奏与原曲人声
         model_file_dir=str(cfg["model_dir"]),
         chunk_duration=float(cfg.get("chunk_duration", 60.0)),
         use_autocast=bool(cfg.get("use_autocast", False)) and torch.cuda.is_available(),

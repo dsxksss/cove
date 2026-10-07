@@ -50,6 +50,7 @@ export function createTrackGraph(context: BaseAudioContext, destination: AudioNo
     input,
     update(track: StudioTrack, hasSolo: boolean) {
       const e = normalizeEffects(track.effects);
+      input.gain.value = clamp(track.normalizationGain ?? 1, 0, 100);
       low.gain.value = e.eq.lowDb; mid.gain.value = e.eq.midDb; high.gain.value = e.eq.highDb;
       compressor.threshold.value = e.compressor.thresholdDb; compressor.ratio.value = e.compressor.ratio;
       compressor.attack.value = e.compressor.attackMs / 1000; compressor.release.value = e.compressor.releaseMs / 1000;
