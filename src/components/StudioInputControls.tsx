@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { ChevronDown, Mic2, Square } from "lucide-react";
+import { ChevronDown, Mic2, Plus, Square } from "lucide-react";
 import type { StudioInputLevel } from "../lib/studioRecorder";
 
 type Props = {
@@ -14,6 +14,10 @@ type Props = {
   onCountdownChange: () => void;
   recording: boolean;
   saving?: boolean;
+  targetName?: string;
+  hasVocalTracks: boolean;
+  blocked?: boolean;
+  onChooseTrack: () => void;
   onRecord: () => void;
 };
 
@@ -30,10 +34,16 @@ export function StudioInputControls(props: Props) {
     return () => { document.removeEventListener("pointerdown", dismiss); document.removeEventListener("keydown", escape); };
   }, [props.menuOpen, props.onMenuChange]);
 
-  const choose = (id: string) => { props.onDeviceChange(id); props.onMenuChange(false); };
+  const choose = (id: string) => { if (props.recording || props.saving) return; props.onDeviceChange(id); props.onMenuChange(false); };
   // Windows reports the default device both as an alias and in the device list.
   const devices = props.devices.filter((device) => device.deviceId && device.deviceId !== "default");
+  if (!props.targetName && !props.recording) return <section aria-label="录音控制" className="rounded-xl border border-dashed border-white/15 bg-white/[0.025] p-3">
+    <div className="mb-2 flex items-center gap-2 text-xs font-bold text-white/60"><Mic2 size={14} />录音</div>
+    <p className="mb-3 text-[11px] leading-5 text-white/40">{props.hasVocalTracks ? "选中人声轨后再录音，伴奏和参考轨用于试听。" : "先新建一条人声轨，再选择麦克风开始录音。"}</p>
+    <button type="button" disabled={props.blocked || props.saving} onClick={props.onChooseTrack} className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-lime-200/10 px-3 py-2 text-xs font-bold text-lime-100 hover:bg-lime-200/20 disabled:opacity-40"><Plus size={13} />{props.hasVocalTracks ? "选择人声轨" : "新建人声轨"}</button>
+  </section>;
   return <section className="min-w-0 space-y-2" aria-label="录音控制">
+    <div className="flex min-w-0 items-center gap-2 text-[10px] text-white/40"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${props.recording ? "animate-pulse bg-red-300" : "bg-sky-300"}`} /><span className="shrink-0">{props.recording ? "正在录制" : "录音到"}</span><span className="truncate font-bold text-white/70" title={props.targetName}>{props.targetName}</span></div>
     <div ref={menuRef} className="relative">
       <button type="button" aria-label="麦克风设备" aria-haspopup="menu" aria-expanded={props.menuOpen}
         disabled={props.recording} onClick={() => props.onMenuChange(!props.menuOpen)}
@@ -42,7 +52,7 @@ export function StudioInputControls(props: Props) {
         <Mic2 size={14} className="shrink-0 text-white/40" /><span className="min-w-0 flex-1 truncate">{props.deviceLabel}</span>
         <ChevronDown size={14} className={`shrink-0 transition-transform ${props.menuOpen ? "rotate-180" : ""}`} />
       </button>
-      {props.menuOpen && <div role="menu" aria-label="选择麦克风" className="absolute inset-x-0 bottom-full z-[100] mb-2 max-h-56 overflow-y-auto rounded-xl border border-white/12 bg-slate-900 p-1.5 shadow-2xl">
+      {props.menuOpen && !props.recording && <div role="menu" aria-label="选择麦克风" className="absolute inset-x-0 bottom-full z-[100] mb-2 max-h-56 overflow-y-auto rounded-xl border border-white/12 bg-slate-900 p-1.5 shadow-2xl">
         {[{ deviceId: "default", label: "默认麦克风" }, ...devices].map((device) => <button key={device.deviceId}
           type="button" role="menuitemradio" aria-checked={props.deviceId === device.deviceId}
           onClick={() => choose(device.deviceId)} title={device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}
@@ -56,12 +66,12 @@ export function StudioInputControls(props: Props) {
         <div className="flex justify-between gap-2 text-[9px] text-white/40"><span>输入</span><span className={props.level.clipping ? "text-red-200" : "text-lime-100/70"}>{props.level.clipping ? "过载" : props.level.rms > 0.01 ? "有声音" : "等待"}</span></div>
         <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/10"><div className={`h-full rounded-full transition-[width] ${props.level.clipping ? "bg-red-300" : "bg-lime-200"}`} style={{ width: `${Math.min(100, Math.max(0, props.level.peak * 100))}%` }} /></div>
       </div>
-      <button type="button" role="switch" aria-label="录音倒计时" aria-checked={props.countdown} onClick={props.onCountdownChange}
-        className={`flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-[10px] font-bold ${props.countdown ? "bg-lime-200/15 text-lime-100" : "bg-white/8 text-white/45"}`}>
+      <button type="button" role="switch" aria-label="录音倒计时" disabled={props.recording} aria-checked={props.countdown} onClick={props.onCountdownChange}
+        className={`flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-[10px] font-bold disabled:opacity-50 ${props.countdown ? "bg-lime-200/15 text-lime-100" : "bg-white/8 text-white/45"}`}>
         <span className={`relative h-3.5 w-6 rounded-full ${props.countdown ? "bg-lime-200/70" : "bg-white/20"}`}><span className={`absolute top-0.5 h-2.5 w-2.5 rounded-full bg-white transition-all ${props.countdown ? "left-3" : "left-0.5"}`} /></span>倒计时
       </button>
-      <button type="button" disabled={props.saving} onClick={props.onRecord} aria-label={props.saving ? "正在保存录音" : props.recording ? "停止录音" : "开始录音"}
-        className={`flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 text-xs font-bold ${props.recording ? "bg-red-400/20 text-red-100" : "bg-white/10 text-white/80 hover:bg-white/15"}`}>
+      <button type="button" disabled={props.saving || (!props.recording && props.blocked)} onClick={props.onRecord} aria-label={props.saving ? "正在保存录音" : props.recording ? "停止录音" : "开始录音"}
+        className={`flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 text-xs font-bold disabled:opacity-40 ${props.recording ? "bg-red-400/20 text-red-100" : "bg-red-400/10 text-red-100 hover:bg-red-400/20"}`}>
         {props.recording ? <Square size={13} fill="currentColor" /> : <Mic2 size={14} />}{props.saving ? "保存中" : props.recording ? "停止" : "录音"}
       </button>
     </div>

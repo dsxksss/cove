@@ -139,6 +139,20 @@ describe("studio editing state", () => {
     expect(useStudioStore.getState().recordingTrackId).toBe(null);
   });
 
+  it("returns the newly added vocal target and protects an active recording until saved", () => {
+    setup();
+    const store = useStudioStore.getState();
+    const target = store.addVocalTrack()!;
+    expect(useStudioStore.getState().project!.tracks.find(track => track.id === target)!.kind).toBe("vocal");
+    store.setRecordingTrackId(target);
+    const locked = useStudioStore.getState().project;
+    store.removeTrack(target);
+    expect(useStudioStore.getState().project).toBe(locked);
+    store.setRecordingTrackId(null);
+    store.removeTrack(target);
+    expect(useStudioStore.getState().project!.tracks.some(track => track.id === target)).toBe(false);
+  });
+
   it("applies mute and solo with deterministic priority", () => {
     const { vocalId } = setup();
     useStudioStore.getState().updateMixer(vocalId, { solo: true });

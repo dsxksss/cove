@@ -80,10 +80,14 @@ try {
   // encoder. Only native dialogs/IPC are substituted with this test directory.
   const exports = [];
   const saved = new Map(), assets = new Map();
-  let failSave = false, vocalCache = null;
-  await page.exposeFunction("testNative", (command, args) => {
+  let failSave = false, failAssetWrite = false, vocalCache = null;
+  let holdAssetWrite = false, releaseAssetWrite = null;
+  await page.exposeFunction("testNative", async (command, args) => {
     if (command === "studio_list_projects") return [];
     if (command === "test_fail_save") { failSave = args.enabled; return; }
+    if (command === "test_fail_asset_write") { failAssetWrite = args.enabled; return; }
+    if (command === "test_hold_asset_write") { holdAssetWrite = args.enabled; if (!holdAssetWrite) { releaseAssetWrite?.(); releaseAssetWrite = null; } return; }
+    if (command === "test_asset_write_pending") return Boolean(releaseAssetWrite);
     if (command === "test_vocal_cache") { vocalCache = args; return; }
     if (command === "studio_cache_read") return args.stem === "vocals" ? vocalCache : null;
     if (command === "studio_save_project") {
@@ -92,6 +96,8 @@ try {
       return;
     }
     if (command === "studio_write_asset") {
+      if (failAssetWrite) throw new Error("模拟录音资产写入失败");
+      if (holdAssetWrite) await new Promise(resolve => { releaseAssetWrite = resolve; });
       const path = new URL(`${args.assetId}.wav`, output);
       writeFileSync(path, Buffer.from(args.inputBase64, "base64"));
       assets.set(args.assetId, path);
@@ -150,7 +156,8 @@ try {
     const gain = micContext.createGain(); gain.gain.value = 0.2;
     const destination = micContext.createMediaStreamDestination();
     oscillator.connect(gain).connect(destination); oscillator.start();
-    Object.defineProperty(navigator.mediaDevices, "getUserMedia", { value: async () => { await micContext.resume(); window.currentMicStream = destination.stream.clone(); return window.currentMicStream; } });
+    window.micRequests = 0;
+    Object.defineProperty(navigator.mediaDevices, "getUserMedia", { value: async () => { window.micRequests++; await micContext.resume(); window.currentMicStream = destination.stream.clone(); return window.currentMicStream; } });
     Object.defineProperty(navigator.mediaDevices, "enumerateDevices", { value: async () => [] });
     const { createStudioProject } = await import("/src/studio/types.ts");
     const { encodePcmWav } = await import("/src/lib/studioWav.ts");
@@ -169,21 +176,37 @@ try {
     window.remount("initial");
   });
   const play = page.getByRole("button", { name: "播放工作室", exact: true });
+  await play.waitFor();
+  assert.equal(await page.getByRole("button", { name: "开始录音", exact: true }).count(), 0);
+  assert.equal(await page.evaluate(() => window.micRequests), 0);
   await play.click();
   await page.waitForFunction(() => window.engine.currentTime > 0.2);
   await page.getByRole("button", { name: "暂停工作室播放", exact: true }).click();
   // Deliberately separate the song playhead from the context's lifetime.
   await page.evaluate(() => { window.store.getState().setCurrentTime(7); window.engine.seek(7); });
   await page.getByRole("button", { name: "人声轨", exact: true }).click();
-  await page.getByText("人声 1", { exact: true }).first().click();
-  await page.getByRole("button", { name: "开始录音", exact: true }).click();
+  assert.equal(await page.getByRole("button", { name: "开始录音", exact: true }).count(), 1, "creating a vocal track selects it without an extra click");
+  assert.equal(await page.evaluate(() => window.micRequests), 0, "selecting a recording track must not request microphone permission");
+  await page.getByRole("button", { name: "麦克风设备", exact: true }).click();
+  await page.getByRole("button", { name: "开始录音", exact: true }).focus();
+  await page.keyboard.press("Space");
   await page.getByText("有声音", { exact: true }).waitFor();
+  assert.equal(await page.getByRole("menu", { name: "选择麦克风", exact: true }).count(), 0);
+  assert.equal(await page.getByRole("button", { name: "删除 人声 1", exact: true }).isDisabled(), true);
+  await page.getByText("伴奏", { exact: true }).first().click();
+  assert.equal(await page.getByLabel("录音控制", { exact: true }).getByText("人声 1", { exact: true }).count(), 1, "switching selection must keep the real recording target visible");
+  assert.equal(await page.getByRole("button", { name: "停止录音", exact: true }).count(), 1);
   assert.equal(await page.getByRole("button", { name: "返回播放器", exact: true }).isDisabled(), true);
   assert.equal(await page.getByRole("button", { name: "导出", exact: true }).isDisabled(), true);
   await page.waitForTimeout(300);
+  await page.evaluate(() => window.testNative("test_hold_asset_write", { enabled: true }));
   await page.getByRole("button", { name: "停止录音", exact: true }).evaluate((button) => { button.click(); button.click(); });
   assert.equal(await page.getByRole("button", { name: "正在保存录音", exact: true }).isDisabled(), true);
   assert.ok(await page.evaluate(() => window.store.getState().recordingTrackId), "duplicate stop must not unlock the session during save");
+  await page.waitForFunction(async () => await window.testNative("test_asset_write_pending"));
+  assert.equal(await page.getByRole("button", { name: "正在保存录音", exact: true }).isDisabled(), true, "recording remains locked while asset persistence is pending");
+  assert.equal(await page.getByRole("button", { name: "删除 人声 1", exact: true }).isDisabled(), true);
+  await page.evaluate(() => window.testNative("test_hold_asset_write", { enabled: false }));
   await page.waitForFunction(() => !window.store.getState().recordingTrackId && window.store.getState().project.tracks.some((track) => track.kind === "vocal" && track.clips.length));
   assert.ok(Math.abs(await page.evaluate(() => window.store.getState().project.tracks.find((track) => track.kind === "vocal").clips[0].startSec) - 7) < 128 / 48000, "recorded takes must use the song playhead, allowing only worklet frame alignment");
   assert.equal(await page.evaluate(() => window.store.getState().project.tracks.find((track) => track.kind === "vocal").takes.length), 1);
@@ -343,6 +366,20 @@ try {
   assert.equal(await page.evaluate(() => window.engine.isPlaying), false);
   assert.equal(await page.evaluate(() => window.store.getState().recordingTrackId), null);
   console.log("Recording latency PASS: shared origin after 100ms preparation delay, +100/-100 compensation at zero, nonzero placement, immutable capture setting, full source preservation and cancelling a pending start.");
+  await page.evaluate(() => window.testNative("test_fail_asset_write", { enabled: true }));
+  await page.getByRole("button", { name: "开始录音", exact: true }).click();
+  await page.getByText("正在录音，再次点击停止", { exact: true }).waitFor();
+  await page.waitForTimeout(150);
+  await page.getByRole("button", { name: "停止录音", exact: true }).click();
+  await page.getByText(/录音已保留在当前会话，但写入磁盘失败/).waitFor();
+  const recoveredAssetId = await page.evaluate(() => window.store.getState().project.tracks.find(t => t.kind === "vocal").assets.at(-1).id);
+  assert.equal(assets.has(recoveredAssetId), false);
+  await page.evaluate(() => window.testNative("test_fail_asset_write", { enabled: false }));
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await page.getByText("工程已保存到本地", { exact: true }).waitFor();
+  assert.equal(assets.has(recoveredAssetId), true, "saving retries a failed recording asset after disk recovery");
+  assert.ok([...saved.values()].at(-1).tracks.some(track => track.assets.some(asset => asset.id === recoveredAssetId)));
+  console.log("Recording guard PASS: track selection, no premature mic permission, active target deletion lock, device menu lock, stopping after switching tracks, delayed persistence and failed asset retry.");
   assert.deepEqual(runtimeErrors, []);
   console.log("Studio export UI PASS: real AudioWorklet take at song time, recording guards/reset, WAV, bundled FFmpeg MP3, player audio and metadata under production CSP (native dialogs mocked).");
 } finally { await browser.close(); }

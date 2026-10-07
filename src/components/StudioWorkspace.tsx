@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Square, Trash2, Upload, Volume2 } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Trash2, Upload, Volume2 } from "lucide-react";
 import { StudioInputControls } from "./StudioInputControls";
+import { useStudioTimelineViewport } from "./useStudioTimelineViewport";
 import { SignedMilliseconds, StudioTrackTools, trapStudioDialogTab } from "./StudioTrackTools";
 import type { LyricsLine } from "./playerTypes";
 import { invokeNative } from "../lib/native";
@@ -21,6 +22,11 @@ type Props = {
 function formatTime(value: number) {
   const safe = Math.max(0, Number.isFinite(value) ? value : 0);
   return `${Math.floor(safe / 60)}:${Math.floor(safe % 60).toString().padStart(2, "0")}`;
+}
+
+function formatPreciseTime(value: number) {
+  const ms = Math.round(Math.max(0, value) * 1000);
+  return `${formatTime(ms / 1000)}.${(ms % 1000).toString().padStart(3, "0")}`;
 }
 
 function activeLyric(lines: LyricsLine[], time: number) {
@@ -64,7 +70,7 @@ function instrumentalCacheId(project: Pick<StudioProject, "source" | "songId">):
   return `${project.source}-${project.songId}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 110);
 }
 
-function TrackRow({ track, selected, onSelect, onMixer, onDelete, onRename }: { track: StudioTrack; selected: boolean; onSelect: () => void; onMixer: (patch: Partial<StudioTrack["mixer"]>) => void; onDelete: () => void; onRename: (name: string) => void }) {
+function TrackRow({ track, selected, recording, onSelect, onMixer, onDelete, onRename }: { track: StudioTrack; selected: boolean; recording: boolean; onSelect: () => void; onMixer: (patch: Partial<StudioTrack["mixer"]>) => void; onDelete: () => void; onRename: (name: string) => void }) {
   const asset = track.assets.find((item) => item.id === track.clips[track.clips.length - 1]?.assetId) ?? lastAsset(track.assets);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(track.name);
@@ -76,7 +82,7 @@ function TrackRow({ track, selected, onSelect, onMixer, onDelete, onRename }: { 
         {editing ? <input autoFocus aria-label="音轨名称" value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => { if (event.key === "Enter") commit(); if (event.key === "Escape") { setDraft(track.name); setEditing(false); } }} onClick={(event) => event.stopPropagation()} className="no-drag min-w-0 flex-1 rounded bg-white/10 px-1.5 py-0.5 text-xs font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <span className="min-w-0 flex-1 truncate text-xs font-bold text-white/85">{track.name}</span>}
         <span className="text-[10px] text-white/35">{track.kind === "instrumental" ? "伴奏" : track.kind === "reference" ? "参考" : `${track.takes.length} takes`}</span>
         <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(track.name); setEditing(true); }} className="rounded p-1 text-white/25 hover:bg-white/10 hover:text-white/80" aria-label={`重命名 ${track.name}`} title="重命名音轨"><Pencil size={12} /></button>
-        {track.kind !== "instrumental" && <button type="button" onClick={(event) => { event.stopPropagation(); onDelete(); }} className="rounded p-1 text-white/30 hover:bg-red-400/15 hover:text-red-200" aria-label={`删除 ${track.name}`}><Trash2 size={13} /></button>}
+        {track.kind !== "instrumental" && <button type="button" disabled={recording} title={recording ? "录音保存完成后可删除" : "删除音轨"} onClick={(event) => { event.stopPropagation(); onDelete(); }} className="rounded p-1 text-white/30 hover:bg-red-400/15 hover:text-red-200 disabled:opacity-25" aria-label={`删除 ${track.name}`}><Trash2 size={13} /></button>}
       </div>
       <div className="h-8 overflow-hidden rounded-lg bg-black/20">
         {asset ? <div className="flex h-full items-center gap-1 px-2 opacity-80"><span className="h-3 w-1 rounded-full bg-white/60" /><span className="h-5 w-1 rounded-full bg-white/35" /><span className="h-4 w-1 rounded-full bg-white/55" /><span className="h-6 w-1 rounded-full bg-white/30" /><span className="h-3 w-1 rounded-full bg-white/50" /><span className="text-[10px] text-white/35">{asset.name}</span></div> : <div className="grid h-full place-items-center text-[10px] text-white/25">{track.kind === "instrumental" ? "导入伴奏或生成伴奏" : track.kind === "reference" ? "导入原曲作为参考" : "准备后录音"}</div>}
@@ -180,30 +186,38 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [countdownEnabled, setCountdownEnabled] = useState(loadRecordCountdown);
   const [countdownValue, setCountdownValue] = useState<number | null>(null);
   const autoPrepareRef = useRef<string | null>(null);
-  const timelineRef = useRef<HTMLDivElement | null>(null);
+  const [playbackStart, setPlaybackStart] = useState(0);
+  const [editingDuration, setEditingDuration] = useState<number | null>(null);
+  const timelineDuration = editingDuration ?? Math.max(projectDuration, 1);
+  const [localImportOpen, setLocalImportOpen] = useState(false);
+  const localImportRef = useRef<HTMLDivElement>(null);
+  const localOriginalRef = useRef<HTMLInputElement>(null);
+  const localVocalsRef = useRef<HTMLInputElement>(null);
   const scrubRef = useRef<{ resume: boolean; projectId: string } | null>(null);
   const [scrubPlaying, setScrubPlaying] = useState(false);
   const timelineDraggingRef = useRef(false);
   const [timelineDragging, setTimelineDragging] = useState(false);
-  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; startSec: number; offsetSec: number; durationSec: number; secondsPerPixel: number } | null>(null);
+  const { timelineRef, viewportRef: timelineViewportRef, zoom: timelineZoom, changeZoom } = useStudioTimelineViewport(currentProject.id, Boolean(recordingTrackId) || timelineDragging || editingDuration !== null);
+  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; clientX: number; originScroll: number; startSec: number; offsetSec: number; durationSec: number; secondsPerPixel: number } | null>(null);
   const [renamingProject, setRenamingProject] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState(project.title);
   const [micLevel, setMicLevel] = useState<StudioInputLevel>({ rms: 0, peak: 0, clipping: false });
   const inputGain = 1;
-  const assetWritesRef = useRef(new Map<string, Promise<unknown>>());
+  const assetWritesRef = useRef(new Map<string, { assetId: string; promise: Promise<unknown>; write: () => Promise<unknown>; failed: boolean }>());
   const mountedRef = useRef(false);
   const stemJobRef = useRef<string | null>(null);
   const isCurrentProject = (id: string) => mountedRef.current && useStudioStore.getState().project?.id === id;
 
   useEffect(() => {
     const dismiss = (event: PointerEvent) => {
+      if (!localImportRef.current?.contains(event.target as Node)) setLocalImportOpen(false);
       if (!headerMenuRef.current?.contains(event.target as Node)) {
         setExportMenuOpen(false);
         setProjectMenuOpen(false);
       }
     };
     const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") { setExportMenuOpen(false); setProjectMenuOpen(false); }
+      if (event.key === "Escape") { setExportMenuOpen(false); setProjectMenuOpen(false); setLocalImportOpen(false); }
     };
     document.addEventListener("pointerdown", dismiss);
     document.addEventListener("keydown", escape);
@@ -234,11 +248,17 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
-    const all = await navigator.mediaDevices.enumerateDevices();
-    setDevices(all.filter((device) => device.kind === "audioinput"));
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      if (mountedRef.current) setDevices(all.filter((device) => device.kind === "audioinput"));
+    } catch { /* Device enumeration may be restricted before permission. */ }
   }, []);
 
-  useEffect(() => { void refreshDevices(); }, [refreshDevices]);
+  useEffect(() => {
+    void refreshDevices();
+    navigator.mediaDevices?.addEventListener("devicechange", refreshDevices);
+    return () => navigator.mediaDevices?.removeEventListener("devicechange", refreshDevices);
+  }, [refreshDevices]);
   useEffect(() => {
     void invokeNative<Array<{ id: string; title: string; artist: string }>>("studio_list_projects").then((items) => {
       persistedProjectIdsRef.current = new Set(items.map((item) => item.id));
@@ -249,7 +269,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   useEffect(() => {
     setProjectTitleDraft(currentProject.title);
     setRenamingProject(false);
+    setPlaybackStart(0); setEditingDuration(null);
+    scrubRef.current = null; clipDragRef.current = null; timelineDraggingRef.current = false;
+    setScrubPlaying(false); setTimelineDragging(false); setLocalImportOpen(false);
   }, [currentProject.id]);
+  useEffect(() => { if (editingDuration === null) setPlaybackStart(value => Math.min(value, projectDuration)); }, [projectDuration, editingDuration]);
 
   const openSavedProject = async (id: string) => {
     if (savingProject || exporting || processingTrack || recordingTrackId) return;
@@ -337,12 +361,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   useEffect(() => { recorderRef.current?.update(inputGain, monitorInput); }, [inputGain, monitorInput]);
 
   useEffect(() => {
-    if (recordingTrackId) { setProjectMenuOpen(false); setExportMenuOpen(false); }
+    if (recordingTrackId) { setProjectMenuOpen(false); setExportMenuOpen(false); setMicMenuOpen(false); setLocalImportOpen(false); }
   }, [recordingTrackId]);
 
-  const beginScrub = useCallback(() => {
+  const beginScrub = useCallback((resumeAfter = false) => {
     if (scrubRef.current || useStudioStore.getState().recordingTrackId) return;
-    const resume = engineRef.current?.isPlaying ?? false;
+    const resume = resumeAfter && (engineRef.current?.isPlaying ?? false);
     scrubRef.current = { resume, projectId: useStudioStore.getState().project?.id ?? "" };
     setScrubPlaying(resume);
     engineRef.current?.pause();
@@ -352,6 +376,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const scrub = scrubRef.current;
     scrubRef.current = null;
     clipDragRef.current = null;
+    setEditingDuration(null);
     setScrubPlaying(false);
     timelineDraggingRef.current = false;
     setTimelineDragging(false);
@@ -377,17 +402,19 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const seekTo = useCallback((value: number) => {
     if (useStudioStore.getState().recordingTrackId) return;
     const next = Math.min(projectDuration, Math.max(0, value));
+    engineRef.current?.pause();
     engineRef.current?.seek(next);
     setCurrentTime(next);
+    setPlaybackStart(next);
   }, [projectDuration, setCurrentTime]);
 
   const seekTimelineFromPointer = useCallback((clientX: number) => {
     const bounds = timelineRef.current?.getBoundingClientRect();
     if (!bounds) return;
     const ratio = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
-    const value = ratio * Math.max(projectDuration, 1);
+    const value = ratio * timelineDuration;
     seekTo(value);
-  }, [projectDuration, seekTo]);
+  }, [timelineDuration, seekTo]);
 
   useEffect(() => {
     if (!timelineDragging) return;
@@ -406,17 +433,18 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   const beginClipDrag = useCallback((trackId: string, clip: StudioClip, mode: "move" | "left" | "right", clientX: number) => {
     if (useStudioStore.getState().recordingTrackId) return;
-    beginScrub();
-    clipDragRef.current = { trackId, clip, mode, originX: clientX, startSec: clip.startSec, offsetSec: clip.offsetSec, durationSec: clip.durationSec, secondsPerPixel: Math.max(projectDuration, 1) / Math.max(1, timelineRef.current?.clientWidth ?? 1) };
+    beginScrub(true);
+    setEditingDuration(Math.max(projectDuration, 1));
+    clipDragRef.current = { trackId, clip, mode, originX: clientX, clientX, originScroll: timelineViewportRef.current?.scrollLeft ?? 0, startSec: clip.startSec, offsetSec: clip.offsetSec, durationSec: clip.durationSec, secondsPerPixel: Math.max(projectDuration, 1) / Math.max(1, timelineRef.current?.clientWidth ?? 1) };
     setSelectedTrackId(trackId);
   }, [beginScrub, projectDuration]);
 
   useEffect(() => {
-    const move = (event: PointerEvent) => {
+    const applyDrag = () => {
       const drag = clipDragRef.current;
       const bounds = timelineRef.current?.getBoundingClientRect();
       if (!drag || !bounds || bounds.width <= 0) return;
-      const delta = (event.clientX - drag.originX) * drag.secondsPerPixel;
+      const delta = (drag.clientX - drag.originX + (timelineViewportRef.current?.scrollLeft ?? 0) - drag.originScroll) * drag.secondsPerPixel;
       if (drag.mode === "move") {
         updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + delta });
       } else if (drag.mode === "left") {
@@ -426,13 +454,22 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         updateClip(drag.trackId, drag.clip.id, { durationSec: drag.durationSec + delta });
       }
     };
+    const move = (event: PointerEvent) => { if (clipDragRef.current) clipDragRef.current.clientX = event.clientX; applyDrag(); };
     const end = () => { clipDragRef.current = null; };
+    const viewport = timelineViewportRef.current;
+    viewport?.addEventListener("scroll", applyDrag);
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
-    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); };
+    return () => { viewport?.removeEventListener("scroll", applyDrag); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); };
   }, [projectDuration, updateClip]);
 
   const selectedTrack = currentProject.tracks.find((track) => track.id === selectedTrackId) ?? currentProject.tracks[0];
+  const recordingTarget = recordingTrackId ? currentProject.tracks.find(track => track.id === recordingTrackId) : selectedTrack?.kind === "vocal" ? selectedTrack : undefined;
+  const createAndSelectVocal = () => {
+    if (recordingTrackId || savingRecording || processingTrack || exporting) return;
+    const id = addVocalTrack();
+    if (id) setSelectedTrackId(id);
+  };
   const lyricIndex = useMemo(() => activeLyric(currentProject.lyrics, currentTime), [currentProject.lyrics, currentTime]);
   const lyricRows = useMemo(() => {
     if (currentProject.lyrics.length === 0) return [];
@@ -446,13 +483,20 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   const togglePlayback = useCallback(async () => {
     if (scrubRef.current || recordingTrackId) return;
-    if (engineRef.current?.isPlaying) { engineRef.current.pause(); return; }
+    if (engineRef.current?.isPlaying) { engineRef.current.pause(); setCurrentTime(engineRef.current.currentTime); return; }
     try {
-      const start = currentTime >= projectDuration ? 0 : currentTime;
+      const start = currentTime >= projectDuration ? (playbackStart < projectDuration ? playbackStart : 0) : currentTime;
       setCurrentTime(start);
       await engineRef.current?.play(start);
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "音频播放失败"); }
-  }, [currentTime, projectDuration, recordingTrackId, setCurrentTime]);
+  }, [currentTime, projectDuration, playbackStart, recordingTrackId, setCurrentTime]);
+
+  const restartPlayback = async () => {
+    if (scrubRef.current || useStudioStore.getState().recordingTrackId) return;
+    const start = playbackStart < projectDuration ? playbackStart : 0;
+    try { setCurrentTime(start); await engineRef.current?.play(start); }
+    catch (error) { setNcmStatus(error instanceof Error ? error.message : "音频播放失败"); }
+  };
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -470,7 +514,17 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     return () => window.removeEventListener("keydown", onKey);
   }, [togglePlayback, exitPromptOpen, trackToolsOpen]);
 
-  const importAudio = async (file: File, trackId = "instrumental", startSec = 0) => {
+  const queueAssetWrite = (projectId: string, assetId: string, write: () => Promise<unknown>) => {
+    const key = `${projectId}:${assetId}`;
+    const job = { assetId, promise: write(), write, failed: false };
+    assetWritesRef.current.set(key, job);
+    void job.promise.then(() => {
+      if (assetWritesRef.current.get(key) === job) assetWritesRef.current.delete(key);
+    }, () => { job.failed = true; });
+    return job.promise;
+  };
+
+  const importAudio = async (file: File, trackId = "instrumental", startSec = 0, waitForWrite = false) => {
     const projectId = currentProject.id;
     const probe = document.createElement("audio");
     const probeUrl = URL.createObjectURL(file);
@@ -486,16 +540,18 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     if (!isCurrentProject(projectId)) return;
     const asset = assetFromFile(file, durationSec);
     const targetTrack = useStudioStore.getState().project?.tracks.find((track) => track.id === trackId);
+    if (!targetTrack) { URL.revokeObjectURL(asset.url); throw new Error("目标音轨已不存在，请重新选择音轨"); }
     engineRef.current?.pause();
     setPlaying(false);
     if (trackId === "instrumental" || targetTrack?.kind === "reference" || trackId.startsWith("reference-")) replaceAssetOnTrack(trackId, asset, startSec);
     else addAssetToTrack(trackId, asset, undefined, startSec);
-    const assetWrite = readFileAsBase64(file).then((inputBase64) => invokeNative("studio_write_asset", { projectId: currentProject.id, assetId: asset.id, inputBase64 }));
-    const assetKey = `${currentProject.id}:${asset.id}`;
-    assetWritesRef.current.set(assetKey, assetWrite);
-    void assetWrite.then(() => { if (assetWritesRef.current.get(assetKey) === assetWrite) assetWritesRef.current.delete(assetKey); }).catch(() => undefined);
+    const assetWrite = queueAssetWrite(projectId, asset.id, () => readFileAsBase64(file).then((inputBase64) => invokeNative("studio_write_asset", { projectId, assetId: asset.id, inputBase64 })));
     if (trackId === "instrumental" && durationSec > 0 && currentProject.durationSec === 0) setProject({ ...useStudioStore.getState().project!, durationSec });
     setSelectedTrackId(trackId);
+    if (waitForWrite) {
+      try { await assetWrite; }
+      catch (error) { throw new Error(`录音已保留在当前会话，但写入磁盘失败：${error instanceof Error ? error.message : String(error)}`); }
+    }
   };
 
   const importOriginalFile = async (file: File) => {
@@ -531,9 +587,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     }
   };
 
-  const startRecording = async () => {
-    if (recordSavingRef.current) return;
+  const startRecording = async (trackId: string) => {
+    const state = useStudioStore.getState();
+    if (recordSavingRef.current || recorderRef.current || state.recordingTrackId || savingProject || exporting || processingTrack) return;
+    if (!state.project?.tracks.some(track => track.id === trackId && track.kind === "vocal")) return;
     if (!navigator.mediaDevices?.getUserMedia || !engineRef.current) { setNcmStatus("当前 WebView 不支持麦克风录音"); setRecordingTrackId(null); return; }
+    setRecordingTrackId(trackId);
     const recorder = new StudioRecorder(engineRef.current.context);
     const projectId = currentProject.id;
     recordingSessionRef.current += 1;
@@ -541,6 +600,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     try {
       countdownAbortRef.current = false;
       await recorder.prepare(inputDeviceId, inputGain, monitorInput);
+      void refreshDevices();
       if (!isCurrentProject(projectId) || recorderRef.current !== recorder) { recorder.dispose(); return; }
       recorder.onDeviceLost(() => {
         if (recorderRef.current !== recorder) return;
@@ -623,7 +683,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     void recorder.stop().then(async (blob) => {
       if (!isCurrentSession()) return;
       const file = new File([blob], `${currentProject.title}-${Date.now()}.wav`, { type: "audio/wav" });
-      await importAudio(file, trackId, startSec);
+      await importAudio(file, trackId, startSec, true);
       if (isCurrentSession()) setNcmStatus("录音已添加到音轨");
     }).catch((error) => {
       if (isCurrentSession()) setNcmStatus(error instanceof Error ? error.message : "保存录音失败");
@@ -786,9 +846,15 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "取消任务失败"); }
   };
 
-  const waitForAssetWrites = async (projectId: string) => {
-    const writes = [...assetWritesRef.current.entries()].filter(([key]) => key.startsWith(`${projectId}:`)).map(([, promise]) => promise);
-    if (writes.length) await Promise.all(writes);
+  const waitForAssetWrites = async (snapshot: StudioProject) => {
+    const referenced = new Set(snapshot.tracks.flatMap(track => track.assets.map(asset => asset.id)));
+    const writes: Promise<unknown>[] = [];
+    for (const [key, job] of assetWritesRef.current) {
+      if (!key.startsWith(`${snapshot.id}:`)) continue;
+      if (!referenced.has(job.assetId)) { assetWritesRef.current.delete(key); continue; }
+      writes.push(job.failed ? queueAssetWrite(snapshot.id, job.assetId, job.write) : job.promise);
+    }
+    await Promise.all(writes);
   };
   const normalizeSelectedTrack = async () => {
     if (!selectedTrack || processingTrack) return;
@@ -808,7 +874,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setProcessingTrack(true); engineRef.current?.pause();
     setNcmStatus("正在降噪，原始音频会保留…");
     try {
-      await waitForAssetWrites(snapshot.id);
+      await waitForAssetWrites(snapshot);
       const replacements = new Map<string, StudioAsset>();
       for (const assetId of new Set(originals.map((clip) => clip.assetId))) {
         const source = track.assets.find((asset) => asset.id === assetId);
@@ -833,7 +899,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setExitError(null);
     const snapshot = structuredClone(useStudioStore.getState().project ?? currentProject);
     try {
-      await waitForAssetWrites(snapshot.id);
+      await waitForAssetWrites(snapshot);
       await invokeNative("studio_save_project", { project: snapshot });
       persistedProjectIdsRef.current.add(snapshot.id);
       if (isCurrentProject(snapshot.id)) savedSnapshotRef.current = snapshot;
@@ -855,13 +921,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setExportMenuOpen(false);
     const snapshot = currentProject;
     try {
-      await waitForAssetWrites(snapshot.id);
+      await waitForAssetWrites(snapshot);
       let encoded: string | undefined;
       if (extension === "cove-studio") {
         setNcmStatus("正在打包工程…");
         persistedProjectIdsRef.current.add(snapshot.id);
         setSavedProjects((items) => [{ id: snapshot.id, title: snapshot.title, artist: snapshot.artist }, ...items.filter((item) => item.id !== snapshot.id)]);
-        await waitForAssetWrites(snapshot.id);
+        await waitForAssetWrites(snapshot);
         await invokeNative("studio_save_project", { project: snapshot });
         if (isCurrentProject(snapshot.id)) savedSnapshotRef.current = structuredClone(snapshot);
         const path = await invokeNative<string | null>("studio_export_package_to_file", { projectId: snapshot.id, fileName: `${snapshot.title}.cove-studio` });
@@ -923,7 +989,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   };
 
   const timelineProgress = Math.min(100, Math.max(0, (currentTime / Math.max(projectDuration, 1)) * 100));
-  const playheadLeft = `${timelineProgress}%`;
+  const playheadLeft = `${Math.min(100, Math.max(0, currentTime / timelineDuration * 100))}%`;
   const hasRenderableAudio = hasAudibleClips(currentProject);
 
   return <div className="relative flex h-full w-full flex-col overflow-hidden bg-slate-950/90 text-white">
@@ -958,9 +1024,21 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     </header>
     <div className="flex min-h-0 flex-1">
       <aside className="flex w-72 shrink-0 flex-col gap-3 overflow-y-auto border-r border-white/10 p-4">
-        <div className="flex items-center justify-between gap-2"><span className="text-[11px] font-black tracking-[0.16em] text-white/35">轨道</span><div className="flex items-center gap-1"><button type="button" onClick={addVocalTrack} className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-[11px] font-bold text-white/70 hover:bg-white/15"><Plus size={13} />人声轨</button><button type="button" onClick={() => void importOriginalCurrentSong()} className="rounded-lg bg-amber-300/15 px-2 py-1 text-[11px] font-bold text-amber-100/80 hover:bg-amber-300/25">原曲</button><label className="cursor-pointer rounded-lg bg-white/8 px-2 py-1 text-[11px] font-bold text-white/55 hover:bg-white/15" title="选择本地原曲文件">本地<input type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importOriginalFile(file); event.currentTarget.value = ""; }} /></label></div></div>
-        <div className="flex items-center gap-2"><button disabled={loadingVocals || Boolean(jobId) || Boolean(recordingTrackId)} onClick={() => void importVocalReference()} className="flex-1 rounded-lg bg-amber-300/10 px-2 py-1.5 text-[11px] font-bold text-amber-100 disabled:opacity-40">{loadingVocals ? "正在提取人声…" : "原曲人声参考"}</button><label className="cursor-pointer rounded-lg bg-white/8 px-2 py-1.5 text-[11px] text-white/55">本地提取<input disabled={loadingVocals || Boolean(jobId) || Boolean(recordingTrackId)} type="file" accept="audio/*,.ncm,.mp3,.flac,.wav" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importVocalReference(file); event.currentTarget.value = ""; }} /></label></div>
-        <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} />)}</div>
+        <div className="flex items-center justify-between gap-2"><span className="text-[11px] font-black tracking-[0.16em] text-white/35">轨道</span><button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} onClick={createAndSelectVocal} className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-[11px] font-bold text-white/70 hover:bg-white/15 disabled:opacity-40"><Plus size={13} />人声轨</button></div>
+        <div className="grid grid-cols-3 gap-1.5" aria-label="参考音轨导入">
+          <button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} title="导入整首原曲作为参考轨" onClick={() => void importOriginalCurrentSong()} className="rounded-lg bg-white/8 px-2 py-2 text-[11px] font-bold text-white/65 hover:bg-white/15 disabled:opacity-40">原曲</button>
+          <button type="button" aria-label="原曲人声参考" title="导入分离出的原唱人声作为参考轨" disabled={loadingVocals || Boolean(jobId) || Boolean(recordingTrackId) || processingTrack || exporting} onClick={() => void importVocalReference()} className="rounded-lg bg-white/8 px-1 py-2 text-[11px] font-bold text-white/65 hover:bg-white/15 disabled:opacity-40">{loadingVocals ? "提取中…" : "原曲人声"}</button>
+          <div ref={localImportRef} className="relative min-w-0">
+            <button type="button" aria-haspopup="menu" aria-expanded={localImportOpen} disabled={Boolean(recordingTrackId) || processingTrack || exporting} onClick={() => setLocalImportOpen(open => !open)} className="flex w-full items-center justify-center gap-1 rounded-lg bg-white/8 px-2 py-2 text-[11px] font-bold text-white/65 hover:bg-white/15 disabled:opacity-40">本地<ChevronDown size={12} /></button>
+            {localImportOpen && <div role="menu" aria-label="本地音频导入" className="absolute right-0 top-full z-50 mt-2 w-56 rounded-xl border border-white/12 bg-slate-900 p-1.5 shadow-xl">
+              <button type="button" role="menuitem" onClick={() => { setLocalImportOpen(false); localOriginalRef.current?.click(); }} className="w-full rounded-lg px-3 py-2.5 text-left text-xs text-white/75 hover:bg-white/10">导入本地原曲</button>
+              <button type="button" role="menuitem" disabled={loadingVocals || Boolean(jobId)} onClick={() => { setLocalImportOpen(false); localVocalsRef.current?.click(); }} className="w-full rounded-lg px-3 py-2.5 text-left text-xs text-white/75 hover:bg-white/10 disabled:opacity-40">从本地歌曲提取人声</button>
+            </div>}
+            <input ref={localOriginalRef} aria-label="选择本地原曲" type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importOriginalFile(file); event.currentTarget.value = ""; }} />
+            <input ref={localVocalsRef} aria-label="选择本地歌曲提取人声" type="file" accept="audio/*,.ncm,.mp3,.flac,.wav" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importVocalReference(file); event.currentTarget.value = ""; }} />
+          </div>
+        </div>
+        <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} recording={track.id === recordingTrackId} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} />)}</div>
         <div className="mt-auto space-y-2 rounded-2xl border border-white/8 bg-white/[0.035] p-3">
           <p className="text-[10px] font-black tracking-[0.15em] text-white/35">伴奏输入</p>
           <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/70 hover:bg-white/15"><Upload size={14} />导入音频<input type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importAudio(file); event.currentTarget.value = ""; }} /></label>
@@ -970,22 +1048,29 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         </div>
       </aside>
       <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">
-        <div className="flex min-h-[328px] flex-1 flex-col p-5">
-          <div className="relative min-h-60 flex-1 rounded-3xl border border-white/10 bg-black/20">
+        <div className="flex min-h-[288px] flex-1 flex-col px-5 pt-4 pb-3">
+          <div className="relative flex min-h-52 flex-1 flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/20">
+            <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-white/5 px-4 text-[10px] text-white/40">
+              <span className="min-w-0 truncate" title="拖动定位后暂停，播放和重新播放从定位点开始">起点 <span className="font-mono text-lime-100/70" aria-label="播放起点">{formatPreciseTime(playbackStart)}</span></span>
+              <div className="flex shrink-0 items-center gap-1"><span className="mr-1 hidden sm:inline">Ctrl + 滚轮缩放</span><button type="button" aria-label="缩小时间轴" disabled={Boolean(recordingTrackId) || timelineZoom <= 1} onClick={() => changeZoom(timelineZoom / 1.5)} className="rounded p-1 hover:bg-white/10 disabled:opacity-30"><Minus size={12} /></button><button type="button" aria-label="重置时间轴缩放" title="显示完整歌曲" disabled={Boolean(recordingTrackId)} onClick={() => changeZoom(1)} className="w-10 rounded py-1 font-mono hover:bg-white/10">{Math.round(timelineZoom * 100)}%</button><button type="button" aria-label="放大时间轴" disabled={Boolean(recordingTrackId) || timelineZoom >= 64} onClick={() => changeZoom(timelineZoom * 1.5)} className="rounded p-1 hover:bg-white/10 disabled:opacity-30"><Plus size={12} /></button></div>
+            </div>
+            <div ref={timelineViewportRef} aria-label="时间轴视图" className="relative min-h-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:thin]">
+            <div className="relative h-full" style={{ width: `${timelineZoom * 100}%` }}>
             <div ref={timelineRef} role="slider" tabIndex={0} aria-label="时间线播放头" aria-disabled={Boolean(recordingTrackId)}
               aria-valuemin={0} aria-valuemax={Math.max(projectDuration, 1)} aria-valuenow={Math.round(currentTime * 100) / 100}
               onPointerDown={(event) => {
                 if (recordingTrackId || event.button !== 0 || (event.target as HTMLElement).closest("button, [role=button]")) return;
+                event.preventDefault(); event.currentTarget.focus();
                 beginScrub(); timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX);
               }}
               onKeyDown={(event) => {
                 if (event.target !== event.currentTarget || recordingTrackId) return;
-                const step = event.shiftKey ? 10 : 1;
+                const step = event.ctrlKey ? 0.01 : event.shiftKey ? 10 : 1;
                 if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); seekTo(currentTime + (event.key === "ArrowLeft" ? -step : step)); }
+                if (event.key === "Home" || event.key === "End") { event.preventDefault(); seekTo(event.key === "Home" ? 0 : projectDuration); }
               }}
               className={`absolute inset-x-4 inset-y-3 touch-none select-none ${timelineDragging ? "cursor-grabbing" : "cursor-crosshair"}`}>
-              <div className="pointer-events-none absolute inset-x-0 bottom-0 top-12 flex justify-between" aria-hidden="true">{[0, 1, 2, 3, 4].map((tick) => <span key={tick} className="w-px bg-white/5" />)}</div>
-              <div className="pointer-events-none absolute inset-x-0 top-5 flex justify-between text-[10px] font-mono text-white/30"><span>0:00</span><span>{formatTime(projectDuration / 2)}</span><span>{formatTime(projectDuration)}</span></div>
+              {Array.from({ length: Math.ceil(timelineZoom * 4) + 1 }, (_, tick) => { const fraction = tick / Math.ceil(timelineZoom * 4); return <div key={tick} className="pointer-events-none absolute bottom-0 top-5" style={{ left: `${fraction * 100}%` }} aria-hidden="true"><span className={`absolute whitespace-nowrap font-mono text-[10px] text-white/30 ${fraction === 1 ? "-translate-x-full" : fraction === 0 ? "" : "-translate-x-1/2"}`}>{timelineZoom > 1 ? formatPreciseTime(fraction * timelineDuration) : formatTime(fraction * timelineDuration)}</span><span className="absolute bottom-0 top-6 w-px bg-white/5" /></div>; })}
               <div className="absolute inset-x-0 bottom-0 top-12 space-y-3 overflow-y-auto py-1 [scrollbar-width:thin]" aria-label="音轨片段">
                 {currentProject.tracks.map((track) => <div key={track.id} className="space-y-1" onClick={() => setSelectedTrackId(track.id)}>
                   <p className="truncate text-[10px] font-bold text-white/40">{track.name}</p>
@@ -994,16 +1079,16 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                     {track.clips.map((clip) => {
                       const asset = track.assets.find((item) => item.id === clip.assetId);
                       const placed = scheduledClip(clip, asset ?? { durationSec: clip.offsetSec + clip.durationSec }, track);
-                      const left = (placed.startSec / Math.max(projectDuration, 1)) * 100;
-                      const width = (placed.durationSec / Math.max(projectDuration, 1)) * 100;
+                      const left = (placed.startSec / timelineDuration) * 100;
+                      const width = (placed.durationSec / timelineDuration) * 100;
                       return <div key={clip.id} role="button" tabIndex={0} aria-label={`音频片段 ${track.name}`}
-                        title={`${asset?.name ?? "音频片段"} · ${formatTime(clip.startSec)} · ${formatTime(clip.durationSec)}`}
+                        title={`${asset?.name ?? "音频片段"} · 起点 ${formatPreciseTime(placed.startSec)} · 长度 ${formatPreciseTime(placed.durationSec)} · Ctrl + 方向键微调 10 ms`}
                         onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }}
                         onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); event.currentTarget.focus(); beginClipDrag(track.id, clip, "move", event.clientX); }}
-                        onKeyDown={(event) => { if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); if (!recordingTrackId) removeClip(track.id, clip.id); } }}
+                        onKeyDown={(event) => { if (event.target !== event.currentTarget || recordingTrackId) return; if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); removeClip(track.id, clip.id); } if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const step = event.ctrlKey ? 0.01 : event.shiftKey ? 1 : 0.1; updateClip(track.id, clip.id, { startSec: clip.startSec + (event.key === "ArrowLeft" ? -step : step) }); } }}
                         className={`group absolute inset-y-1 z-[2] min-w-1 rounded-lg border ${track.id === selectedTrackId ? "border-lime-200/40 bg-slate-800" : "border-white/15 bg-slate-900"} cursor-grab active:cursor-grabbing`}
                         style={{ left: `${left}%`, width: `${width}%` }}>
-                        <span className="pointer-events-none absolute inset-0 flex min-w-0 items-center gap-2 px-3 text-[10px] text-white/65"><span className="truncate">{asset?.name ?? track.name}</span><span className="shrink-0 font-mono text-white/35">{formatTime(clip.durationSec)}</span></span>
+                        <span className="pointer-events-none absolute inset-0 flex min-w-0 items-center gap-2 overflow-hidden px-3 text-[10px] text-white/65"><span className="truncate">{asset?.name ?? track.name}</span><span className="shrink-0 font-mono text-white/35">{timelineZoom > 1 ? formatPreciseTime(clip.durationSec) : formatTime(clip.durationSec)}</span></span>
                         <button type="button" aria-label="调整片段起点" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "left", event.clientX); }} className="absolute inset-y-0 left-0 z-10 w-2 cursor-ew-resize rounded-l-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
                         <button type="button" aria-label="调整片段结尾" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "right", event.clientX); }} className="absolute inset-y-0 right-0 z-10 w-2 cursor-ew-resize rounded-r-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
                         <button type="button" aria-label="删除片段" disabled={Boolean(recordingTrackId)} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); removeClip(track.id, clip.id); }} className="absolute right-2 top-1 z-20 grid h-5 w-5 place-items-center rounded bg-slate-950 text-red-200 opacity-0 transition group-hover:opacity-100 focus:opacity-100">×</button>
@@ -1012,23 +1097,26 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                   </div>
                 </div>)}
               </div>
+              <div className="pointer-events-none absolute bottom-0 top-3 w-px border-l border-dashed border-white/25" title="播放起点" style={{ left: `${Math.min(100, playbackStart / timelineDuration * 100)}%` }} />
               <div className="pointer-events-none absolute bottom-0 top-2 z-10 w-px -translate-x-1/2 bg-lime-200/75" style={{ left: playheadLeft }} />
               <button type="button" aria-label="拖拽时间线播放头" disabled={Boolean(recordingTrackId)}
-                onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); beginScrub(); timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }}
+                onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); timelineRef.current?.focus(); beginScrub(); timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }}
                 className={`absolute -top-1 z-20 grid h-6 w-6 -translate-x-1/2 touch-none place-items-center ${timelineDragging ? "cursor-grabbing" : "cursor-grab"}`} style={{ left: playheadLeft }}><span className="h-3 w-3 rounded-full bg-lime-200" /></button>
             </div>
+            </div>
+            </div>
           </div>
-          <div className="mt-4 flex shrink-0 flex-wrap items-center gap-3" aria-label="播放控制">
+          <div className="mt-3 flex shrink-0 flex-wrap items-center gap-3" aria-label="播放控制">
             <button type="button" aria-label={isPlaying || scrubPlaying ? "暂停工作室播放" : "播放工作室"} disabled={Boolean(recordingTrackId)} onClick={() => void togglePlayback()} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-white text-slate-950 disabled:opacity-50">{isPlaying || scrubPlaying ? <Pause size={18} /> : <Play size={18} fill="currentColor" />}</button>
-            <button type="button" disabled={Boolean(recordingTrackId)} onClick={() => seekTo(0)} className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 text-white/70 hover:bg-white/15 disabled:opacity-50" aria-label="回到开头"><Square size={13} /></button>
+            <button type="button" disabled={Boolean(recordingTrackId)} onClick={() => void restartPlayback()} title={`从 ${formatPreciseTime(playbackStart)} 重新播放`} className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 text-white/70 hover:bg-white/15 disabled:opacity-50" aria-label="重新播放"><RotateCcw size={15} /></button>
             <span className="whitespace-nowrap font-mono text-xs text-white/55">{formatTime(currentTime)} / {formatTime(projectDuration)}</span>
             <input aria-label="工作室进度" disabled={Boolean(recordingTrackId)} type="range" min="0" max={Math.max(projectDuration, 1)} step="0.01" value={Math.min(currentTime, projectDuration || 1)}
-              onPointerDown={beginScrub} onKeyDown={(event) => { if (["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key)) beginScrub(); }} onKeyUp={finishScrub} onBlur={finishScrub}
+              onPointerDown={() => beginScrub()} onKeyDown={(event) => { if (["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key)) beginScrub(); }} onKeyUp={finishScrub} onBlur={finishScrub}
               onChange={(event) => seekTo(Number(event.target.value))} style={{ "--studio-progress": `${timelineProgress}%` } as React.CSSProperties} className="studio-progress-slider min-w-24 flex-1" />
             <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-white/45"><Headphones size={14} />耳机监听<input type="checkbox" checked={monitorInput} onChange={(event) => setMonitorInput(event.target.checked)} className="accent-lime-200" /></label>
           </div>
         </div>
-        <div className="grid shrink-0 grid-cols-1 gap-4 border-t border-white/10 px-5 py-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <div className="grid shrink-0 grid-cols-1 gap-4 border-t border-white/10 px-5 py-3 lg:grid-cols-[minmax(0,1fr)_320px]">
           <section className="flex min-h-[190px] min-w-0 flex-1 flex-col rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3" aria-label="同步歌词">
             <div className="mb-2 flex items-center justify-between gap-2 text-[10px] font-black tracking-[0.15em] text-white/35">
               <span>同步歌词</span>
@@ -1048,10 +1136,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
           <div className="min-w-0 space-y-3">
             {selectedTrack && <EffectPanel key={`${currentProject.id}:${selectedTrack.id}`} track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} onReset={() => resetEffects(selectedTrack.id)} clipboardSource={effectsClipboard?.sourceName} onCopy={() => copyEffects(selectedTrack.id)} onPaste={() => pasteEffects(selectedTrack.id)} />}
             <StudioInputControls devices={devices} deviceId={inputDeviceId} deviceLabel={micLabel} menuOpen={micMenuOpen}
-              onMenuChange={(open) => { setMicMenuOpen(open); if (open) setProjectMenuOpen(false); }} onDeviceChange={setInputDeviceId}
+              targetName={recordingTarget?.name} hasVocalTracks={currentProject.tracks.some(track => track.kind === "vocal")} blocked={processingTrack || exporting || savingProject}
+              onChooseTrack={() => { const vocal = currentProject.tracks.find(track => track.kind === "vocal"); if (vocal) setSelectedTrackId(vocal.id); else createAndSelectVocal(); }}
+              onMenuChange={(open) => { setMicMenuOpen(open); if (open) { setProjectMenuOpen(false); void refreshDevices(); } }} onDeviceChange={setInputDeviceId}
                 level={micLevel} countdown={countdownEnabled} recording={Boolean(recordingTrackId)} saving={savingRecording}
               onCountdownChange={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* optional preference */ } }}
-              onRecord={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") { setRecordingTrackId(selectedTrack.id); void startRecording(); } else setNcmStatus("请先添加并选择人声轨"); }} />
+              onRecord={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") void startRecording(selectedTrack.id); }} />
             <div className="flex items-center justify-between gap-2"><button disabled={!selectedTrack || Boolean(recordingTrackId)} onClick={() => setTrackToolsOpen(true)} className="shrink-0 rounded-lg bg-white/10 px-2.5 py-1.5 text-[11px] font-bold text-lime-100 disabled:opacity-40">音轨调整</button><div title="仅影响之后的新录音：正数提前，负数延后。已有录音请使用音轨偏移。"><SignedMilliseconds label="输入延迟" disabled={Boolean(recordingTrackId)} value={currentProject.inputLatencyMs} onChange={updateLatency} limit={5000} /></div></div>
           </div>
         </div>

@@ -17,7 +17,7 @@ type StudioState = {
   setMonitorInput: (enabled: boolean) => void;
   setRecordingTrackId: (id: string | null) => void;
   updateProjectTitle: (title: string) => void;
-  addVocalTrack: () => void;
+  addVocalTrack: () => string | null;
   addReferenceTrack: (stem?: "original" | "vocals") => string | null;
   updateTrack: (id: string, patch: Partial<StudioTrack>) => void;
   renameTrack: (id: string, name: string) => void;
@@ -53,11 +53,13 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   setMonitorInput: (monitorInput) => set({ monitorInput }),
   setRecordingTrackId: (recordingTrackId) => set({ recordingTrackId }),
   updateProjectTitle: (title) => set((state) => state.project ? { project: touch({ ...state.project, title: title.trim() || state.project.title }) } : state),
-  addVocalTrack: () => set((state) => {
-    if (!state.project) return state;
-    const nextIndex = state.project.tracks.filter((track) => track.kind === "vocal").length + 1;
-    return { project: touch({ ...state.project, tracks: [...state.project.tracks, createVocalTrack(nextIndex)] }) };
-  }),
+  addVocalTrack: () => {
+    const project = get().project;
+    if (!project) return null;
+    const track = createVocalTrack(project.tracks.filter((track) => track.kind === "vocal").length + 1);
+    set({ project: touch({ ...project, tracks: [...project.tracks, track] }) });
+    return track.id;
+  },
   addReferenceTrack: (stem = "original") => {
     const project = get().project;
     if (!project) return null;
@@ -154,7 +156,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     }) };
   }),
   removeTrack: (id) => set((state) => {
-    if (!state.project || id === "instrumental") return state;
+    if (!state.project || id === "instrumental" || id === state.recordingTrackId) return state;
     return { project: touch({ ...state.project, tracks: state.project.tracks.filter((track) => track.id !== id) }) };
   }),
   updateLatency: (inputLatencyMs) => set((state) => state.project ? { project: touch({ ...state.project, inputLatencyMs }) } : state),
