@@ -1,9 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { getAudio } from "../lib/audio";
 import {
   applyMediaSession,
   setMediaPlaybackState,
   setMediaPositionState,
+  type MediaSessionHandlers,
 } from "../lib/mediaSession";
 import { usePlayerStore } from "../store/playerStore";
 import { observeWindowInteraction } from "../lib/windowInteraction";
@@ -13,7 +14,10 @@ import { observeWindowInteraction } from "../lib/windowInteraction";
  * plus OS Media Session controls and a smoother rAF time clock for lyrics.
  * Mount once near the app root.
  */
-export function useAudioEngine() {
+export function useAudioEngine(playerMode = true) {
+  // Keep installed OS callbacks current without reattaching the audio engine.
+  const playerModeRef = useRef(playerMode);
+  playerModeRef.current = playerMode;
   useEffect(() => {
     const audio = getAudio();
     const store = usePlayerStore.getState;
@@ -168,32 +172,39 @@ export function useAudioEngine() {
 
     // ---- Media Session: headset / keyboard / lock-screen controls ----
     const seekBy = (delta: number) => {
+      if (!playerModeRef.current) return;
       const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
       const next = Math.max(0, Math.min((audio.currentTime || 0) + delta, dur || audio.currentTime + delta));
       store().seek(next);
     };
 
-    applyMediaSession(null, {
+    const mediaHandlers: MediaSessionHandlers = {
       play: () => {
+        if (!playerModeRef.current) return;
         void audio.play().catch(() => {});
       },
       pause: () => {
+        if (!playerModeRef.current) return;
         audio.pause();
       },
-      previoustrack: () => store().prev(),
+      previoustrack: () => { if (playerModeRef.current) store().prev(); },
       nexttrack: () => {
+        if (!playerModeRef.current) return;
         void store().next();
       },
       seekbackward: (d) => seekBy(-(d.seekOffset ?? 10)),
       seekforward: (d) => seekBy(d.seekOffset ?? 10),
       seekto: (d) => {
+        if (!playerModeRef.current) return;
         if (typeof d.seekTime === "number") store().seek(d.seekTime);
       },
       stop: () => {
+        if (!playerModeRef.current) return;
         audio.pause();
         store().seek(0);
       },
-    });
+    };
+    applyMediaSession(null, mediaHandlers);
 
     // Keep metadata in sync with the store.
     const unsub = usePlayerStore.subscribe((state, prev) => {
@@ -209,25 +220,7 @@ export function useAudioEngine() {
             album: song.album,
             artworkUrl: state.currentCover ?? song.pic,
           },
-          {
-            play: () => {
-              void audio.play().catch(() => {});
-            },
-            pause: () => audio.pause(),
-            previoustrack: () => store().prev(),
-            nexttrack: () => {
-              void store().next();
-            },
-            seekbackward: (d) => seekBy(-(d.seekOffset ?? 10)),
-            seekforward: (d) => seekBy(d.seekOffset ?? 10),
-            seekto: (d) => {
-              if (typeof d.seekTime === "number") store().seek(d.seekTime);
-            },
-            stop: () => {
-              audio.pause();
-              store().seek(0);
-            },
-          }
+          mediaHandlers
         );
       }
       if (state.isPlaying !== prev.isPlaying) {
@@ -245,25 +238,7 @@ export function useAudioEngine() {
           album: initial.album,
           artworkUrl: store().currentCover ?? initial.pic,
         },
-        {
-          play: () => {
-            void audio.play().catch(() => {});
-          },
-          pause: () => audio.pause(),
-          previoustrack: () => store().prev(),
-          nexttrack: () => {
-            void store().next();
-          },
-          seekbackward: (d) => seekBy(-(d.seekOffset ?? 10)),
-          seekforward: (d) => seekBy(d.seekOffset ?? 10),
-          seekto: (d) => {
-            if (typeof d.seekTime === "number") store().seek(d.seekTime);
-          },
-          stop: () => {
-            audio.pause();
-            store().seek(0);
-          },
-        }
+        mediaHandlers
       );
       setMediaPlaybackState(store().isPlaying ? "playing" : "paused");
     }

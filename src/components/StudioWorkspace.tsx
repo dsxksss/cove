@@ -69,7 +69,7 @@ function TrackRow({ track, selected, onSelect, onMixer, onDelete, onRename }: { 
   const [draft, setDraft] = useState(track.name);
   const commit = () => { const next = draft.trim(); if (next) onRename(next); else setDraft(track.name); setEditing(false); };
   return (
-    <div role="button" tabIndex={0} onClick={onSelect} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(); } }} className={`group flex min-h-24 w-full flex-col gap-2 rounded-2xl border p-3 text-left transition ${selected ? "border-white/30 bg-white/10" : "border-white/8 bg-white/[0.035] hover:bg-white/[0.07]"}`}>
+    <div role="button" tabIndex={0} onClick={onSelect} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === "Enter") { event.preventDefault(); onSelect(); } }} className={`group flex min-h-24 w-full flex-col gap-2 rounded-2xl border p-3 text-left transition ${selected ? "border-white/30 bg-white/10" : "border-white/8 bg-white/[0.035] hover:bg-white/[0.07]"}`}>
       <div className="flex items-center gap-2">
         <span className="h-3 w-3 rounded-full" style={{ background: track.color }} />
         {editing ? <input autoFocus aria-label="音轨名称" value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => { if (event.key === "Enter") commit(); if (event.key === "Escape") { setDraft(track.name); setEditing(false); } }} onClick={(event) => event.stopPropagation()} className="no-drag min-w-0 flex-1 rounded bg-white/10 px-1.5 py-0.5 text-xs font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <span className="min-w-0 flex-1 truncate text-xs font-bold text-white/85">{track.name}</span>}
@@ -400,7 +400,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     }));
   }, [currentProject.lyrics, lyricIndex]);
 
-  const togglePlayback = async () => {
+  const togglePlayback = useCallback(async () => {
     if (scrubRef.current || recordingTrackId) return;
     if (engineRef.current?.isPlaying) { engineRef.current.pause(); return; }
     try {
@@ -408,7 +408,22 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       setCurrentTime(start);
       await engineRef.current?.play(start);
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "音频播放失败"); }
-  };
+  }, [currentTime, projectDuration, recordingTrackId, setCurrentTime]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== " " && event.code !== "Space") return;
+      if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target instanceof Element ? event.target : null;
+      // Preserve typing and native controls. A focused play button already
+      // activates on Space keyup; handling it here as well would toggle twice.
+      if (target?.closest('input:not([type="range"]), textarea, select, button, summary, [contenteditable]:not([contenteditable="false"])')) return;
+      event.preventDefault();
+      if (!event.repeat) void togglePlayback();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [togglePlayback]);
 
   const importAudio = async (file: File, trackId = "instrumental", startSec = 0) => {
     const projectId = currentProject.id;

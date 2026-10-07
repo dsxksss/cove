@@ -232,7 +232,8 @@ function saveShowTranslation(value: boolean) {
 }
 
 export default function App() {
-  useAudioEngine();
+  const [studioOpen, setStudioOpen] = useState(false);
+  useAudioEngine(!studioOpen);
   const desktopBlur = useDesktopBlur();
 
   // ---- data layer (Zustand) ----
@@ -316,7 +317,6 @@ export default function App() {
   const appPlaylistsRef = useRef(appPlaylists);
   const [activeAppPlaylistId, setActiveAppPlaylistId] = useState<string | null>(null);
   const [songActionTarget, setSongActionTarget] = useState<Song | null>(null);
-  const [studioOpen, setStudioOpen] = useState(false);
   const [studioProject, setStudioProject] = useState<StudioProject | null>(null);
   const studioPlayerUrlRef = useRef<string | null>(null);
 
@@ -542,7 +542,11 @@ export default function App() {
 
   // keyboard: space play/pause, arrows seek/skip, / search, q queue, p playlists
   useEffect(() => {
+    // Only the visible mode owns keyboard shortcuts. The studio has its own
+    // transport and must not restart or seek the background catalog player.
+    if (studioOpen) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) {
         return;
@@ -551,6 +555,7 @@ export default function App() {
 
       if (e.key === " ") {
         e.preventDefault();
+        if (e.repeat) return;
         toggle();
       } else if (e.key === "ArrowRight" && mod) {
         e.preventDefault();
@@ -599,7 +604,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [toggle, next, prev, seek, volume, setVolume, multiAuth?.anyLoggedIn]);
+  }, [studioOpen, toggle, next, prev, seek, volume, setVolume, multiAuth?.anyLoggedIn]);
 
   const handleReloadFavorites = async () => {
     await loadFavPlaylist();
