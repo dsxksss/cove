@@ -180,4 +180,56 @@ describe("studio editing state", () => {
     vocal = useStudioStore.getState().project!.tracks.find((track) => track.id === vocalId)!;
     expect(vocal.effects.eq.midDb).toBe(0);
   });
+
+  it("splits at song time including signed track offset, without losing source samples", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    store.updateClip(vocalId, "clip-1", { startSec: 2, offsetSec: 0.5, durationSec: 3 });
+    store.updateTrack(vocalId, { offsetMs: -100 });
+    const before = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    store.splitClip(vocalId, "clip-1", 3);
+    const track = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    expect(track.clips.length).toBe(2);
+    expect(track.clips[0].durationSec).toBeCloseTo(1.1);
+    expect(track.clips[1].startSec).toBeCloseTo(3.1);
+    expect(track.clips[1].offsetSec).toBeCloseTo(1.6);
+    expect(track.clips[1].durationSec).toBeCloseTo(1.9);
+    expect(track.assets).toBe(before.assets);
+    expect(track.takes).toBe(before.takes);
+    expect(track.clips[0].id === track.clips[1].id).toBe(false);
+  });
+
+  it("duplicates trimmed clips consecutively and rejects invalid or recording edits", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    store.updateClip(vocalId, "clip-1", { startSec: 2, offsetSec: 1, durationSec: 2 });
+    store.duplicateClip(vocalId, "clip-1");
+    const track = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    expect(track.clips[1].startSec).toBe(4);
+    expect(track.clips[1].offsetSec).toBe(1);
+    expect(track.clips[1].assetId).toBe(track.clips[0].assetId);
+    const snapshot = useStudioStore.getState().project;
+    store.splitClip(vocalId, "clip-1", 2);
+    store.splitClip(vocalId, "clip-1", NaN);
+    store.duplicateClip(vocalId, "missing");
+    expect(useStudioStore.getState().project).toBe(snapshot);
+    store.setRecordingTrackId(vocalId);
+    store.splitClip(vocalId, "clip-1", 3);
+    store.duplicateClip(vocalId, "clip-1");
+    store.removeClip(vocalId, "clip-1");
+    store.updateClip(vocalId, "clip-1", { startSec: 4 });
+    expect(useStudioStore.getState().project).toBe(snapshot);
+  });
+
+  it("persists channel mode and keeps legacy projects in stereo by default", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    expect(store.project!.tracks[0].mixer.channelMode).toBeUndefined();
+    store.updateMixer(vocalId, { channelMode: "mono", gain: 1.8, pan: -0.4 });
+    store.setProject(JSON.parse(JSON.stringify(useStudioStore.getState().project)));
+    const track = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    expect(track.mixer.channelMode).toBe("mono");
+    expect(track.mixer.gain).toBe(1.8);
+    expect(track.mixer.pan).toBe(-0.4);
+  });
 });

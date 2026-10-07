@@ -28,6 +28,8 @@ type StudioState = {
   resetEffects: (id: string) => void;
   updateClip: (trackId: string, clipId: string, patch: Partial<StudioClip>) => void;
   removeClip: (trackId: string, clipId: string) => void;
+  duplicateClip: (trackId: string, clipId: string) => void;
+  splitClip: (trackId: string, clipId: string, timeSec: number) => void;
   addAssetToTrack: (trackId: string, asset: StudioAsset, take?: StudioTake, startSec?: number) => void;
   replaceAssetOnTrack: (trackId: string, asset: StudioAsset, startSec?: number) => void;
   removeTrack: (id: string) => void;
@@ -107,7 +109,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     return { project: touch({ ...project, tracks: project.tracks.map((track) => track.id === id ? { ...track, effects: structuredClone(effectsClipboard.effects) } : track) }) };
   }),
   updateClip: (trackId, clipId, patch) => set((state) => {
-    if (!state.project) return state;
+    if (!state.project || state.recordingTrackId) return state;
     return { project: touch({
       ...state.project,
       tracks: state.project.tracks.map((track) => {
@@ -126,8 +128,26 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     }) };
   }),
   removeClip: (trackId, clipId) => set((state) => {
-    if (!state.project) return state;
+    if (!state.project || state.recordingTrackId) return state;
     return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === trackId ? { ...track, clips: track.clips.filter((clip) => clip.id !== clipId) } : track) }) };
+  }),
+  duplicateClip: (trackId, clipId) => set((state) => {
+    const project = state.project;
+    const track = project?.tracks.find(track => track.id === trackId);
+    const clip = track?.clips.find(clip => clip.id === clipId);
+    if (!project || !track || !clip || state.recordingTrackId) return state;
+    const duplicate = { ...clip, id: `clip-${crypto.randomUUID()}`, startSec: clip.startSec + clip.durationSec };
+    return { project: touch({ ...project, tracks: project.tracks.map(item => item.id === trackId ? { ...item, clips: [...item.clips, duplicate] } : item) }) };
+  }),
+  splitClip: (trackId, clipId, timeSec) => set((state) => {
+    const project = state.project;
+    const track = project?.tracks.find(track => track.id === trackId);
+    const clip = track?.clips.find(clip => clip.id === clipId);
+    if (!project || !track || !clip || state.recordingTrackId || !Number.isFinite(timeSec)) return state;
+    const delta = timeSec - clip.startSec - (track.offsetMs ?? 0) / 1000;
+    if (delta < 0.05 || delta > clip.durationSec - 0.05) return state;
+    const right = { ...clip, id: `clip-${crypto.randomUUID()}`, startSec: clip.startSec + delta, offsetSec: clip.offsetSec + delta, durationSec: clip.durationSec - delta };
+    return { project: touch({ ...project, tracks: project.tracks.map(item => item.id === trackId ? { ...item, clips: item.clips.flatMap(part => part.id === clipId ? [{ ...part, durationSec: delta }, right] : [part]) } : item) }) };
   }),
   addAssetToTrack: (trackId, asset, take, startSec = 0) => set((state) => {
     if (!state.project) return state;

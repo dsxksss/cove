@@ -58,6 +58,11 @@ export function createTrackGraph(context: BaseAudioContext, destination: AudioNo
       if (decay !== e.reverb.decaySec) { reverb.buffer = impulse(context, e.reverb.decaySec); decay = e.reverb.decaySec; }
       echo.gain.value = e.delay.mix; delay.delayTime.value = e.delay.timeMs / 1000; feedback.gain.value = e.delay.feedback;
       gain.gain.value = track.mixer.mute || (hasSolo && !track.mixer.solo) ? 0 : clamp(track.mixer.gain, 0, 2);
+      // Fold the complete effect output before panning. Preserve the previous
+      // channel negotiation for legacy projects and native mono recordings.
+      gain.channelCount = track.mixer.channelMode === "mono" ? 1 : 2;
+      gain.channelCountMode = track.mixer.channelMode === "mono" ? "explicit" : "max";
+      gain.channelInterpretation = "speakers";
       pan.pan.value = clamp(track.mixer.pan, -1, 1);
     },
     dispose() { nodes.forEach(node => node.disconnect()); },

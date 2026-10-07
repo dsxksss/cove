@@ -47,7 +47,7 @@ export type StudioTrack = {
   clips: StudioClip[];
   takes: StudioTake[];
   assets: StudioAsset[];
-  mixer: { gain: number; pan: number; mute: boolean; solo: boolean; armed: boolean };
+  mixer: { gain: number; pan: number; mute: boolean; solo: boolean; armed: boolean; channelMode?: "stereo" | "mono" };
   effects: StudioEffects;
 };
 

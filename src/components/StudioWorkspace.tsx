@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Trash2, Upload, Volume2 } from "lucide-react";
 import { StudioInputControls } from "./StudioInputControls";
 import { useStudioTimelineViewport } from "./useStudioTimelineViewport";
 import { SignedMilliseconds, StudioTrackTools, trapStudioDialogTab } from "./StudioTrackTools";
+import { StudioContextMenu, type StudioMenuItem } from "./StudioContextMenu";
 import type { LyricsLine } from "./playerTypes";
 import { invokeNative } from "../lib/native";
 import { StudioAudioEngine } from "../lib/studioAudio";
@@ -70,13 +71,13 @@ function instrumentalCacheId(project: Pick<StudioProject, "source" | "songId">):
   return `${project.source}-${project.songId}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 110);
 }
 
-function TrackRow({ track, selected, recording, onSelect, onMixer, onDelete, onRename }: { track: StudioTrack; selected: boolean; recording: boolean; onSelect: () => void; onMixer: (patch: Partial<StudioTrack["mixer"]>) => void; onDelete: () => void; onRename: (name: string) => void }) {
+function TrackRow({ track, selected, recording, onSelect, onMixer, onDelete, onRename, onContextMenu, onOpenDetails }: { track: StudioTrack; selected: boolean; recording: boolean; onSelect: () => void; onMixer: (patch: Partial<StudioTrack["mixer"]>) => void; onDelete: () => void; onRename: (name: string) => void; onContextMenu: (event: MouseEvent<HTMLElement> | ReactKeyboardEvent<HTMLElement>) => void; onOpenDetails: (element: HTMLElement) => void }) {
   const asset = track.assets.find((item) => item.id === track.clips[track.clips.length - 1]?.assetId) ?? lastAsset(track.assets);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(track.name);
   const commit = () => { const next = draft.trim(); if (next) onRename(next); else setDraft(track.name); setEditing(false); };
   return (
-    <div role="button" tabIndex={0} onClick={onSelect} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === "Enter") { event.preventDefault(); onSelect(); } }} className={`group flex min-h-24 w-full flex-col gap-2 rounded-2xl border p-3 text-left transition ${selected ? "border-white/30 bg-white/10" : "border-white/8 bg-white/[0.035] hover:bg-white/[0.07]"}`}>
+    <div role="button" aria-label={`音轨 ${track.name}`} title="右键打开菜单，双击打开详细设置" tabIndex={0} onClick={onSelect} onContextMenu={onContextMenu} onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,select,textarea,[contenteditable]")) onOpenDetails(event.currentTarget); }} onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) onContextMenu(event); else if (event.key === "Enter") { event.preventDefault(); onSelect(); onOpenDetails(event.currentTarget); } }} className={`group flex min-h-24 w-full flex-col gap-2 rounded-2xl border p-3 text-left transition ${selected ? "border-white/30 bg-white/10" : "border-white/8 bg-white/[0.035] hover:bg-white/[0.07]"}`}>
       <div className="flex items-center gap-2">
         <span className="h-3 w-3 rounded-full" style={{ background: track.color }} />
         {editing ? <input autoFocus aria-label="音轨名称" value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => { if (event.key === "Enter") commit(); if (event.key === "Escape") { setDraft(track.name); setEditing(false); } }} onClick={(event) => event.stopPropagation()} className="no-drag min-w-0 flex-1 rounded bg-white/10 px-1.5 py-0.5 text-xs font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <span className="min-w-0 flex-1 truncate text-xs font-bold text-white/85">{track.name}</span>}
@@ -91,7 +92,7 @@ function TrackRow({ track, selected, recording, onSelect, onMixer, onDelete, onR
         <button type="button" onClick={() => onMixer({ mute: !track.mixer.mute })} className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${track.mixer.mute ? "bg-red-400/25 text-red-100" : "text-white/45 hover:bg-white/10"}`}>M</button>
         <button type="button" onClick={() => onMixer({ solo: !track.mixer.solo })} className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${track.mixer.solo ? "bg-amber-300/25 text-amber-100" : "text-white/45 hover:bg-white/10"}`}>S</button>
         <Volume2 size={12} className="ml-auto text-white/35" />
-        <input aria-label={`${track.name} 音量`} type="range" min="0" max="1.4" step="0.01" value={track.mixer.gain} onChange={(event) => onMixer({ gain: Number(event.target.value) })} className="w-24 accent-white" />
+        <input aria-label={`${track.name} 音量`} type="range" min="0" max="2" step="0.01" value={track.mixer.gain} onChange={(event) => onMixer({ gain: Number(event.target.value) })} className="w-24 accent-white" />
       </div>
     </div>
   );
@@ -127,7 +128,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [exitPromptOpen, setExitPromptOpen] = useState(false);
   const [savingProject, setSavingProject] = useState(false);
   const [exitError, setExitError] = useState<string | null>(null);
-  const [trackToolsOpen, setTrackToolsOpen] = useState(false);
+  const [trackTools, setTrackTools] = useState<{ trackId: string; rename?: boolean; tab?: "channel" | "effects" | "audio" } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ projectId: string; trackId: string; clipId?: string; x: number; y: number } | null>(null);
+  const contextOriginRef = useRef<HTMLElement | null>(null);
+  const toolsOriginRef = useRef<HTMLElement | null>(null);
   const [processingTrack, setProcessingTrack] = useState(false);
   const [loadingVocals, setLoadingVocals] = useState(false);
   const storedProject = useStudioStore((state) => state.project);
@@ -157,6 +161,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const pasteEffects = useStudioStore((state) => state.pasteEffects);
   const updateClip = useStudioStore((state) => state.updateClip);
   const removeClip = useStudioStore((state) => state.removeClip);
+  const duplicateClip = useStudioStore((state) => state.duplicateClip);
+  const splitClip = useStudioStore((state) => state.splitClip);
   const addAssetToTrack = useStudioStore((state) => state.addAssetToTrack);
   const replaceAssetOnTrack = useStudioStore((state) => state.replaceAssetOnTrack);
   const removeTrack = useStudioStore((state) => state.removeTrack);
@@ -198,7 +204,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const timelineDraggingRef = useRef(false);
   const [timelineDragging, setTimelineDragging] = useState(false);
   const { timelineRef, viewportRef: timelineViewportRef, zoom: timelineZoom, changeZoom } = useStudioTimelineViewport(currentProject.id, Boolean(recordingTrackId) || timelineDragging || editingDuration !== null);
-  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; clientX: number; originScroll: number; startSec: number; offsetSec: number; durationSec: number; secondsPerPixel: number } | null>(null);
+  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; clientX: number; originScroll: number; startSec: number; offsetSec: number; durationSec: number; secondsPerPixel: number; started: boolean } | null>(null);
   const [renamingProject, setRenamingProject] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState(project.title);
   const [micLevel, setMicLevel] = useState<StudioInputLevel>({ rms: 0, peak: 0, clipping: false });
@@ -207,6 +213,34 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const mountedRef = useRef(false);
   const stemJobRef = useRef<string | null>(null);
   const isCurrentProject = (id: string) => mountedRef.current && useStudioStore.getState().project?.id === id;
+  const editLocked = Boolean(recordingTrackId) || processingTrack || exporting || savingProject;
+  const editLockedRef = useRef(editLocked); editLockedRef.current = editLocked;
+  const toolsTrack = currentProject.tracks.find(track => track.id === trackTools?.trackId);
+  const closeContextMenu = (restoreFocus = true) => {
+    setContextMenu(null);
+    if (restoreFocus && contextOriginRef.current?.isConnected) contextOriginRef.current.focus({ preventScroll: true });
+  };
+  const openTrackTools = (trackId: string, origin?: HTMLElement, options?: { rename?: boolean; tab?: "channel" | "effects" | "audio" }) => {
+    if (editLockedRef.current || !useStudioStore.getState().project?.tracks.some(track => track.id === trackId)) return;
+    toolsOriginRef.current = origin ?? contextOriginRef.current;
+    setSelectedTrackId(trackId);
+    setTrackTools({ trackId, ...options });
+  };
+  const closeTrackTools = () => {
+    setTrackTools(null);
+    if (toolsOriginRef.current?.isConnected) toolsOriginRef.current.focus({ preventScroll: true });
+  };
+  const openContextMenu = (event: MouseEvent<HTMLElement> | ReactKeyboardEvent<HTMLElement>, trackId: string, clipId?: string) => {
+    event.preventDefault(); event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    contextOriginRef.current = event.currentTarget;
+    setSelectedTrackId(trackId);
+    setContextMenu({ projectId: currentProject.id, trackId, clipId, x: "clientX" in event ? event.clientX : bounds.left + 24, y: "clientY" in event ? event.clientY : bounds.top + 24 });
+  };
+  useEffect(() => {
+    if (contextMenu && (contextMenu.projectId !== currentProject.id || !currentProject.tracks.some(track => track.id === contextMenu.trackId && (!contextMenu.clipId || track.clips.some(clip => clip.id === contextMenu.clipId))))) setContextMenu(null);
+    if (trackTools && !toolsTrack) setTrackTools(null);
+  }, [contextMenu, currentProject, trackTools, toolsTrack]);
 
   useEffect(() => {
     const dismiss = (event: PointerEvent) => {
@@ -400,7 +434,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, [finishScrub]);
 
   const seekTo = useCallback((value: number) => {
-    if (useStudioStore.getState().recordingTrackId) return;
+    if (useStudioStore.getState().recordingTrackId || editLockedRef.current) return;
     const next = Math.min(projectDuration, Math.max(0, value));
     engineRef.current?.pause();
     engineRef.current?.seek(next);
@@ -432,12 +466,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, [seekTimelineFromPointer, timelineDragging]);
 
   const beginClipDrag = useCallback((trackId: string, clip: StudioClip, mode: "move" | "left" | "right", clientX: number) => {
-    if (useStudioStore.getState().recordingTrackId) return;
-    beginScrub(true);
+    if (useStudioStore.getState().recordingTrackId || editLockedRef.current) return;
     setEditingDuration(Math.max(projectDuration, 1));
-    clipDragRef.current = { trackId, clip, mode, originX: clientX, clientX, originScroll: timelineViewportRef.current?.scrollLeft ?? 0, startSec: clip.startSec, offsetSec: clip.offsetSec, durationSec: clip.durationSec, secondsPerPixel: Math.max(projectDuration, 1) / Math.max(1, timelineRef.current?.clientWidth ?? 1) };
+    clipDragRef.current = { trackId, clip, mode, started: false, originX: clientX, clientX, originScroll: timelineViewportRef.current?.scrollLeft ?? 0, startSec: clip.startSec, offsetSec: clip.offsetSec, durationSec: clip.durationSec, secondsPerPixel: Math.max(projectDuration, 1) / Math.max(1, timelineRef.current?.clientWidth ?? 1) };
     setSelectedTrackId(trackId);
-  }, [beginScrub, projectDuration]);
+  }, [projectDuration]);
 
   useEffect(() => {
     const applyDrag = () => {
@@ -445,6 +478,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       const bounds = timelineRef.current?.getBoundingClientRect();
       if (!drag || !bounds || bounds.width <= 0) return;
       const delta = (drag.clientX - drag.originX + (timelineViewportRef.current?.scrollLeft ?? 0) - drag.originScroll) * drag.secondsPerPixel;
+      // A click/double-click only selects or opens settings. Suspend audio
+      // once an actual drag starts, so opening a channel never restarts it.
+      if (!drag.started) {
+        if (Math.abs(delta / drag.secondsPerPixel) < 3) return;
+        drag.started = true;
+        beginScrub(true);
+      }
       if (drag.mode === "move") {
         updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + delta });
       } else if (drag.mode === "left") {
@@ -461,7 +501,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
     return () => { viewport?.removeEventListener("scroll", applyDrag); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); };
-  }, [projectDuration, updateClip]);
+  }, [projectDuration, updateClip, beginScrub]);
 
   const selectedTrack = currentProject.tracks.find((track) => track.id === selectedTrackId) ?? currentProject.tracks[0];
   const recordingTarget = recordingTrackId ? currentProject.tracks.find(track => track.id === recordingTrackId) : selectedTrack?.kind === "vocal" ? selectedTrack : undefined;
@@ -470,6 +510,38 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const id = addVocalTrack();
     if (id) setSelectedTrackId(id);
   };
+  const menuTrack = contextMenu?.projectId === currentProject.id ? currentProject.tracks.find(track => track.id === contextMenu.trackId) : undefined;
+  const menuClip = menuTrack?.clips.find(clip => clip.id === contextMenu?.clipId);
+  const menuAction = (action: (track: StudioTrack, clip?: StudioClip) => void, readOnly = false) => () => {
+    const state = useStudioStore.getState();
+    if (!contextMenu || state.project?.id !== contextMenu.projectId || (!readOnly && (editLockedRef.current || state.recordingTrackId))) return;
+    const track = state.project.tracks.find(item => item.id === contextMenu.trackId);
+    const clip = track?.clips.find(item => item.id === contextMenu.clipId);
+    if (!track || (contextMenu.clipId && !clip)) return;
+    action(track, clip);
+  };
+  const menuItems: StudioMenuItem[] = menuTrack ? [
+    { id: "settings", label: "音轨详细设置", hint: "双击", disabled: editLocked, action: menuAction(track => openTrackTools(track.id)) },
+    { id: "rename", label: "重命名音轨", disabled: editLocked, action: menuAction(track => openTrackTools(track.id, undefined, { rename: true })) },
+    { id: "mute", label: "静音音轨", separator: true, checked: menuTrack.mixer.mute, disabled: editLocked, action: menuAction(track => updateMixer(track.id, { mute: !track.mixer.mute })) },
+    { id: "solo", label: "独奏音轨", checked: menuTrack.mixer.solo, disabled: editLocked, action: menuAction(track => updateMixer(track.id, { solo: !track.mixer.solo })) },
+    { id: "copy-effects", label: "复制效果器", separator: true, action: menuAction(track => copyEffects(track.id), true) },
+    { id: "paste-effects", label: "粘贴效果器", disabled: editLocked || !effectsClipboard, action: menuAction(track => pasteEffects(track.id)) },
+    { id: "reset-effects", label: "恢复默认效果", disabled: editLocked, action: menuAction(track => resetEffects(track.id)) },
+    { id: "audio", label: "归一化 / 降噪…", disabled: editLocked || !menuTrack.clips.length, action: menuAction(track => openTrackTools(track.id, undefined, { tab: "audio" })) },
+  ] : [];
+  if (menuClip && contextMenu) {
+    const splitDelta = currentTime - menuClip.startSec - (menuTrack?.offsetMs ?? 0) / 1000;
+    menuItems.push(
+      { id: "locate", label: "定位到片段起点", separator: true, disabled: editLocked, action: menuAction((track, clip) => { if (clip) seekTo(scheduledClip(clip, track.assets.find(asset => asset.id === clip.assetId) ?? { durationSec: clip.offsetSec + clip.durationSec }, track).startSec); }) },
+      { id: "duplicate", label: "复制片段到末尾", disabled: editLocked, action: menuAction((track, clip) => { if (clip) duplicateClip(track.id, clip.id); }) },
+      { id: "split", label: "在播放头处分割", disabled: editLocked || splitDelta < 0.05 || splitDelta > menuClip.durationSec - 0.05, action: menuAction((track, clip) => { if (clip) splitClip(track.id, clip.id, useStudioStore.getState().currentTime); }) },
+      { id: "restore-clip", label: "恢复完整片段", disabled: editLocked, action: menuAction((track, clip) => { const asset = track.assets.find(item => item.id === clip?.assetId); if (clip && asset) updateClip(track.id, clip.id, { offsetSec: 0, durationSec: asset.durationSec }); }) },
+      { id: "delete-clip", label: "删除片段", hint: "Delete", separator: true, danger: true, disabled: editLocked, action: menuAction((track, clip) => { if (clip) { removeClip(track.id, clip.id); timelineRef.current?.focus({ preventScroll: true }); } }) },
+    );
+  } else if (menuTrack?.kind !== "instrumental") {
+    menuItems.push({ id: "delete-track", label: "删除音轨", separator: true, danger: true, disabled: editLocked, action: menuAction(track => { removeTrack(track.id); timelineRef.current?.focus({ preventScroll: true }); }) });
+  }
   const lyricIndex = useMemo(() => activeLyric(currentProject.lyrics, currentTime), [currentProject.lyrics, currentTime]);
   const lyricRows = useMemo(() => {
     if (currentProject.lyrics.length === 0) return [];
@@ -499,8 +571,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   };
 
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (exitPromptOpen || trackToolsOpen) return;
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (exitPromptOpen || trackTools || contextMenu) return;
       if (event.key !== " " && event.code !== "Space") return;
       if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
       const target = event.target instanceof Element ? event.target : null;
@@ -512,7 +584,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlayback, exitPromptOpen, trackToolsOpen]);
+  }, [togglePlayback, exitPromptOpen, trackTools, contextMenu]);
 
   const queueAssetWrite = (projectId: string, assetId: string, write: () => Promise<unknown>) => {
     const key = `${projectId}:${assetId}`;
@@ -856,10 +928,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     }
     await Promise.all(writes);
   };
-  const normalizeSelectedTrack = async () => {
-    if (!selectedTrack || processingTrack) return;
-    if (selectedTrack.normalizationGain != null) { updateTrack(selectedTrack.id, { normalizationGain: undefined }); return; }
-    const snapshot = currentProject, track = selectedTrack;
+  const normalizeTrack = async (trackId: string) => {
+    const snapshot = useStudioStore.getState().project;
+    const track = snapshot?.tracks.find(item => item.id === trackId);
+    if (!snapshot || !track || editLockedRef.current) return;
+    if (track.normalizationGain != null) { updateTrack(track.id, { normalizationGain: undefined }); return; }
     setProcessingTrack(true);
     try {
       const gain = await normalizationGain(snapshot, track.id);
@@ -867,9 +940,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "归一化失败"); }
     finally { setProcessingTrack(false); }
   };
-  const denoiseSelectedTrack = async (strength: number) => {
-    if (!selectedTrack || processingTrack) return;
-    const snapshot = currentProject, track = selectedTrack;
+  const denoiseTrack = async (trackId: string, strength: number) => {
+    const snapshot = useStudioStore.getState().project;
+    const track = snapshot?.tracks.find(item => item.id === trackId);
+    if (!snapshot || !track || editLockedRef.current) return;
     const originals = track.clips.map((clip) => ({ ...clip, assetId: track.denoiseOriginalAssets?.[clip.assetId] ?? clip.assetId }));
     setProcessingTrack(true); engineRef.current?.pause();
     setNcmStatus("正在降噪，原始音频会保留…");
@@ -1038,7 +1112,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             <input ref={localVocalsRef} aria-label="选择本地歌曲提取人声" type="file" accept="audio/*,.ncm,.mp3,.flac,.wav" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importVocalReference(file); event.currentTarget.value = ""; }} />
           </div>
         </div>
-        <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} recording={track.id === recordingTrackId} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} />)}</div>
+        <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} recording={editLocked} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} onContextMenu={(event) => openContextMenu(event, track.id)} onOpenDetails={(element) => openTrackTools(track.id, element)} />)}</div>
         <div className="mt-auto space-y-2 rounded-2xl border border-white/8 bg-white/[0.035] p-3">
           <p className="text-[10px] font-black tracking-[0.15em] text-white/35">伴奏输入</p>
           <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/70 hover:bg-white/15"><Upload size={14} />导入音频<input type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importAudio(file); event.currentTarget.value = ""; }} /></label>
@@ -1072,7 +1146,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
               className={`absolute inset-x-4 inset-y-3 touch-none select-none ${timelineDragging ? "cursor-grabbing" : "cursor-crosshair"}`}>
               {Array.from({ length: Math.ceil(timelineZoom * 4) + 1 }, (_, tick) => { const fraction = tick / Math.ceil(timelineZoom * 4); return <div key={tick} className="pointer-events-none absolute bottom-0 top-5" style={{ left: `${fraction * 100}%` }} aria-hidden="true"><span className={`absolute whitespace-nowrap font-mono text-[10px] text-white/30 ${fraction === 1 ? "-translate-x-full" : fraction === 0 ? "" : "-translate-x-1/2"}`}>{timelineZoom > 1 ? formatPreciseTime(fraction * timelineDuration) : formatTime(fraction * timelineDuration)}</span><span className="absolute bottom-0 top-6 w-px bg-white/5" /></div>; })}
               <div className="absolute inset-x-0 bottom-0 top-12 space-y-3 overflow-y-auto py-1 [scrollbar-width:thin]" aria-label="音轨片段">
-                {currentProject.tracks.map((track) => <div key={track.id} className="space-y-1" onClick={() => setSelectedTrackId(track.id)}>
+                {currentProject.tracks.map((track) => <div key={track.id} className="space-y-1" onPointerDown={(event) => { if (event.button === 0) event.stopPropagation(); }} onClick={() => setSelectedTrackId(track.id)} onContextMenu={(event) => openContextMenu(event, track.id)} onDoubleClick={(event) => { event.stopPropagation(); openTrackTools(track.id, timelineRef.current ?? undefined); }}>
                   <p className="truncate text-[10px] font-bold text-white/40">{track.name}</p>
                   <div className="relative h-12 rounded-lg bg-white/[0.035]">
                     {track.clips.length === 0 && <span className="pointer-events-none flex h-full items-center px-3 text-[10px] text-white/20">暂无音频</span>}
@@ -1083,15 +1157,15 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                       const width = (placed.durationSec / timelineDuration) * 100;
                       return <div key={clip.id} role="button" tabIndex={0} aria-label={`音频片段 ${track.name}`}
                         title={`${asset?.name ?? "音频片段"} · 起点 ${formatPreciseTime(placed.startSec)} · 长度 ${formatPreciseTime(placed.durationSec)} · Ctrl + 方向键微调 10 ms`}
-                        onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }}
+                        onContextMenu={(event) => openContextMenu(event, track.id, clip.id)} onDoubleClick={(event) => { event.stopPropagation(); if (!(event.target as HTMLElement).closest("button")) openTrackTools(track.id, event.currentTarget); }} onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }}
                         onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); event.currentTarget.focus(); beginClipDrag(track.id, clip, "move", event.clientX); }}
-                        onKeyDown={(event) => { if (event.target !== event.currentTarget || recordingTrackId) return; if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); removeClip(track.id, clip.id); } if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const step = event.ctrlKey ? 0.01 : event.shiftKey ? 1 : 0.1; updateClip(track.id, clip.id, { startSec: clip.startSec + (event.key === "ArrowLeft" ? -step : step) }); } }}
+                        onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) { openContextMenu(event, track.id, clip.id); return; } if (editLocked) return; if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); removeClip(track.id, clip.id); } if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const step = event.ctrlKey ? 0.01 : event.shiftKey ? 1 : 0.1; updateClip(track.id, clip.id, { startSec: clip.startSec + (event.key === "ArrowLeft" ? -step : step) }); } }}
                         className={`group absolute inset-y-1 z-[2] min-w-1 rounded-lg border ${track.id === selectedTrackId ? "border-lime-200/40 bg-slate-800" : "border-white/15 bg-slate-900"} cursor-grab active:cursor-grabbing`}
                         style={{ left: `${left}%`, width: `${width}%` }}>
                         <span className="pointer-events-none absolute inset-0 flex min-w-0 items-center gap-2 overflow-hidden px-3 text-[10px] text-white/65"><span className="truncate">{asset?.name ?? track.name}</span><span className="shrink-0 font-mono text-white/35">{timelineZoom > 1 ? formatPreciseTime(clip.durationSec) : formatTime(clip.durationSec)}</span></span>
-                        <button type="button" aria-label="调整片段起点" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "left", event.clientX); }} className="absolute inset-y-0 left-0 z-10 w-2 cursor-ew-resize rounded-l-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
-                        <button type="button" aria-label="调整片段结尾" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "right", event.clientX); }} className="absolute inset-y-0 right-0 z-10 w-2 cursor-ew-resize rounded-r-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
-                        <button type="button" aria-label="删除片段" disabled={Boolean(recordingTrackId)} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); removeClip(track.id, clip.id); }} className="absolute right-2 top-1 z-20 grid h-5 w-5 place-items-center rounded bg-slate-950 text-red-200 opacity-0 transition group-hover:opacity-100 focus:opacity-100">×</button>
+                        <button type="button" aria-label="调整片段起点" onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "left", event.clientX); }} className="absolute inset-y-0 left-0 z-10 w-2 cursor-ew-resize rounded-l-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
+                        <button type="button" aria-label="调整片段结尾" onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "right", event.clientX); }} className="absolute inset-y-0 right-0 z-10 w-2 cursor-ew-resize rounded-r-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
+                        <button type="button" aria-label="删除片段" disabled={editLocked} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); removeClip(track.id, clip.id); }} className="absolute right-2 top-1 z-20 grid h-5 w-5 place-items-center rounded bg-slate-950 text-red-200 opacity-0 transition group-hover:opacity-100 focus:opacity-100">×</button>
                       </div>;
                     })}
                   </div>
@@ -1142,12 +1216,17 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                 level={micLevel} countdown={countdownEnabled} recording={Boolean(recordingTrackId)} saving={savingRecording}
               onCountdownChange={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* optional preference */ } }}
               onRecord={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") void startRecording(selectedTrack.id); }} />
-            <div className="flex items-center justify-between gap-2"><button disabled={!selectedTrack || Boolean(recordingTrackId)} onClick={() => setTrackToolsOpen(true)} className="shrink-0 rounded-lg bg-white/10 px-2.5 py-1.5 text-[11px] font-bold text-lime-100 disabled:opacity-40">音轨调整</button><div title="仅影响之后的新录音：正数提前，负数延后。已有录音请使用音轨偏移。"><SignedMilliseconds label="输入延迟" disabled={Boolean(recordingTrackId)} value={currentProject.inputLatencyMs} onChange={updateLatency} limit={5000} /></div></div>
+            <div className="flex items-center justify-between gap-2"><button disabled={!selectedTrack || editLocked} onClick={(event) => selectedTrack && openTrackTools(selectedTrack.id, event.currentTarget)} className="shrink-0 rounded-lg bg-white/10 px-2.5 py-1.5 text-[11px] font-bold text-lime-100 disabled:opacity-40">音轨调整</button><div title="仅影响之后的新录音：正数提前，负数延后。已有录音请使用音轨偏移。"><SignedMilliseconds label="输入延迟" disabled={Boolean(recordingTrackId)} value={currentProject.inputLatencyMs} onChange={updateLatency} limit={5000} /></div></div>
           </div>
         </div>
       </main>
     </div>
-    {trackToolsOpen && selectedTrack && <StudioTrackTools track={selectedTrack} busy={processingTrack} onClose={() => setTrackToolsOpen(false)} onPan={(pan) => updateMixer(selectedTrack.id, { pan })} onOffset={(offsetMs) => updateTrack(selectedTrack.id, { offsetMs })} onNormalize={() => void normalizeSelectedTrack()} onDenoise={(strength) => void denoiseSelectedTrack(strength)} onRestore={() => updateTrack(selectedTrack.id, { clips: selectedTrack.clips.map((clip) => ({ ...clip, assetId: selectedTrack.denoiseOriginalAssets?.[clip.assetId] ?? clip.assetId })), denoiseOriginalAssets: undefined, normalizationGain: undefined })} />}
+    {contextMenu && menuTrack && <StudioContextMenu x={contextMenu.x} y={contextMenu.y} title={menuClip ? `${menuTrack.name} · 片段` : menuTrack.name} items={menuItems} onClose={closeContextMenu} />}
+    {trackTools && toolsTrack && <StudioTrackTools key={`${currentProject.id}:${toolsTrack.id}`} track={toolsTrack} rename={trackTools.rename} initialTab={trackTools.tab} busy={editLocked} onClose={closeTrackTools}
+      onMixer={(patch) => updateMixer(toolsTrack.id, patch)} onRename={(name) => renameTrack(toolsTrack.id, name)} onOffset={(offsetMs) => updateTrack(toolsTrack.id, { offsetMs })}
+      onNormalize={() => void normalizeTrack(toolsTrack.id)} onDenoise={(strength) => void denoiseTrack(toolsTrack.id, strength)}
+      onRestore={() => updateTrack(toolsTrack.id, { clips: toolsTrack.clips.map((clip) => ({ ...clip, assetId: toolsTrack.denoiseOriginalAssets?.[clip.assetId] ?? clip.assetId })), denoiseOriginalAssets: undefined, normalizationGain: undefined })}
+      effects={<EffectPanel track={toolsTrack} onChange={(effects) => updateEffects(toolsTrack.id, effects)} onReset={() => resetEffects(toolsTrack.id)} clipboardSource={effectsClipboard?.sourceName} onCopy={() => copyEffects(toolsTrack.id)} onPaste={() => pasteEffects(toolsTrack.id)} />} />}
     {exitPromptOpen && <div className="absolute inset-0 z-[240] grid place-items-center bg-black/60 p-5 backdrop-blur-sm" onKeyDown={(event) => { trapStudioDialogTab(event); if (event.key === "Escape" && !savingProject) setExitPromptOpen(false); }}><section role="dialog" aria-modal="true" aria-label="保存本次翻唱" className="w-full max-w-sm space-y-4 rounded-2xl border border-white/15 bg-slate-900 p-6 shadow-2xl"><h2 className="text-base font-bold">返回前保存本次翻唱？</h2><p className="text-xs leading-6 text-white/55">保存音轨、效果和时间调整，之后可从“工程”继续编辑。不保存将放弃上次保存后的编辑。</p>{exitError && <p role="alert" className="text-xs text-red-200">{exitError}</p>}<div className="flex flex-wrap justify-end gap-2"><button autoFocus disabled={savingProject} onClick={() => setExitPromptOpen(false)} className="rounded-lg px-3 py-2 text-xs text-white/60 hover:bg-white/10">取消</button><button disabled={savingProject} onClick={() => { try { localStorage.removeItem(`cove.studio.draft.${currentProject.id}`); } catch { /* optional recovery */ } onBack(structuredClone(savedSnapshotRef.current)); }} className="rounded-lg bg-white/10 px-3 py-2 text-xs">不保存返回</button><button disabled={savingProject} onClick={() => void saveProject().then((saved) => { if (saved) onBack(saved); })} className="rounded-lg bg-lime-200 px-3 py-2 text-xs font-bold text-slate-950">{savingProject ? "正在保存…" : "保存并返回"}</button></div></section></div>}
     {countdownValue !== null && <div className="pointer-events-none absolute inset-0 z-[200] grid place-items-center bg-slate-950/45 backdrop-blur-[2px]" role="status" aria-live="assertive"><div className="flex flex-col items-center gap-3"><div className="grid h-32 w-32 place-items-center rounded-full border border-lime-200/50 bg-slate-950/80 text-7xl font-black text-lime-100 shadow-[0_0_70px_rgba(190,242,100,.25)] animate-pulse">{countdownValue}</div><span className="rounded-full bg-black/40 px-4 py-1.5 text-xs font-bold tracking-[0.2em] text-white/70">准备录音</span></div></div>}
   </div>;

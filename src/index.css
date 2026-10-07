@@ -579,6 +579,32 @@ body *::after {
   }
 }
 
+.studio-volume-fader {
+  appearance: none;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 36px;
+  height: 100%;
+  cursor: ns-resize;
+  background: transparent;
+}
+.studio-volume-fader::-webkit-slider-runnable-track {
+  width: 5px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.14);
+}
+.studio-volume-fader::-webkit-slider-thumb {
+  appearance: none;
+  width: 28px;
+  height: 10px;
+  margin-left: -11.5px;
+  border-radius: 3px;
+  border: 1px solid #ecfccb;
+  background: #d9f99d;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.studio-volume-fader:focus-visible { outline: 1px solid #d9f99d; outline-offset: 5px; border-radius: 6px; }
+
 /* Player shell: liquid-glass displacement filter is applied at runtime via the
    Lightweight static surface: no shader, backdrop filter, or pointer tracking.
    The displacement map is size-aware + corner-shaped, so no corner spikes. */
