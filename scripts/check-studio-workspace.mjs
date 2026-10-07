@@ -31,7 +31,7 @@ try {
     StudioAudioEngine.prototype.subscribePlayback = function (listener) { window.studioEngine = this; return subscribe.call(this, listener); };
     const { useStudioStore } = await import(moduleUrl("/src/studio/studioStore.ts"));
     window.studioStore = useStudioStore;
-    window.__TAURI_INTERNALS__ = { invoke: async (command) => { if (command === "studio_list_projects") return []; return null; } };
+    window.__TAURI_INTERNALS__ = { invoke: async (command, args) => { if (command === "studio_list_projects") return []; if (command === "studio_save_project") window.savedEffectsProject = JSON.parse(JSON.stringify(args.project)); return null; } };
     Object.defineProperty(navigator.mediaDevices, "enumerateDevices", { value: async () => [
       { deviceId: "default", kind: "audioinput", label: "默认麦克风" },
       ...Array.from({ length: 8 }, (_, i) => ({ deviceId: `mic-${i}`, kind: "audioinput", label: `麦克风 ${i + 1} (USB Audio Interface / Realtek High Definition Audio)` })),
@@ -50,6 +50,7 @@ try {
   const pause = page.getByRole("button", { name: "暂停工作室播放", exact: true });
   const mic = page.getByRole("button", { name: "麦克风设备", exact: true });
   await play.waitFor();
+  assert.equal(await page.getByRole("button", { name: "粘贴效果器", exact: true }).isDisabled(), true);
   await mic.click();
   const menu = page.getByRole("menu", { name: "选择麦克风" });
   await menu.waitFor();
@@ -89,6 +90,40 @@ try {
   await page.waitForFunction(() => window.studioEngine.isPlaying && window.studioEngine.currentTime < 2);
   await pause.click();
   await page.getByRole("button", { name: "回到开头", exact: true }).click();
+  // Copy from one track, then modify that source. Pasting during playback must
+  // use the frozen snapshot and keep the existing audio sources scheduled.
+  await page.getByRole("button", { name: "人声轨", exact: true }).click();
+  await page.getByText("人声 1", { exact: true }).first().click();
+  const copiedEffects = {
+    eq: { lowDb: -3, midDb: 5, highDb: 2 },
+    compressor: { thresholdDb: -24, ratio: 4, attackMs: 7, releaseMs: 180 },
+    reverb: { mix: 0.3, decaySec: 2.4 },
+    delay: { mix: 0.2, timeMs: 240, feedback: 0.4 },
+  };
+  await page.evaluate((effects) => {
+    const state = window.studioStore.getState();
+    window.effectsSourceId = state.project.tracks.find(t => t.kind === "vocal").id;
+    state.updateEffects(window.effectsSourceId, effects);
+  }, copiedEffects);
+  await page.getByRole("button", { name: "复制效果器", exact: true }).click();
+  await page.getByRole("button", { name: "恢复默认效果", exact: true }).click();
+  await page.getByText("伴奏", { exact: true }).first().click();
+  await play.click();
+  await page.waitForFunction(() => window.studioEngine.isPlaying);
+  await page.evaluate(() => { window.effectsPlayingSources = window.studioEngine.sources; window.effectsOrigin = window.studioEngine.startContextTime; });
+  await page.getByRole("button", { name: "粘贴效果器", exact: true }).click();
+  await page.waitForFunction(() => window.studioStore.getState().project.tracks[0].effects.eq.midDb === 5);
+  assert.deepEqual(await page.evaluate(() => window.studioStore.getState().project.tracks[0].effects), copiedEffects);
+  assert.equal(await page.evaluate(() => window.studioEngine.sources === window.effectsPlayingSources && window.studioEngine.startContextTime === window.effectsOrigin && window.studioEngine.isPlaying), true);
+  assert.equal(await pause.count(), 1);
+  await page.waitForFunction(() => window.studioEngine.waveform().some(sample => Math.abs(sample - 128) > 2));
+  await pause.click();
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await page.waitForFunction(() => window.savedEffectsProject);
+  assert.deepEqual(await page.evaluate(() => window.savedEffectsProject.tracks[0].effects), copiedEffects);
+  assert.equal(await page.evaluate(() => "effectsClipboard" in window.savedEffectsProject), false);
+  await page.getByRole("button", { name: "恢复默认效果", exact: true }).click();
+  await page.getByRole("button", { name: "回到开头", exact: true }).click();
   const dot = await page.getByRole("button", { name: "拖拽时间线播放头" }).boundingBox();
   const zero = await timeline.getByText("0:00", { exact: true }).boundingBox();
   assert.ok(dot.y + dot.height <= zero.y + 1, "playhead dot and zero label must occupy separate rows");
@@ -96,6 +131,9 @@ try {
   const lane = await page.getByLabel("音轨片段", { exact: true }).getByText("伴奏", { exact: true }).boundingBox();
   assert.ok(lane.y + lane.height <= clip.y, "track label must not overlap clip label");
   await page.screenshot({ path: fileURLToPath(new URL("1080-workspace.png", output)) });
+  const longTrackName = "主唱叠唱和声轨道用于检查效果器复制粘贴按钮是否被挤压";
+  await page.evaluate(name => window.studioStore.getState().renameTrack(window.effectsSourceId, name), longTrackName);
+  await page.getByText(longTrackName, { exact: true }).first().click();
   for (const width of [900, 1080]) {
     await page.setViewportSize({ width, height: 700 });
     await mic.scrollIntoViewIfNeeded();
@@ -104,9 +142,15 @@ try {
     assert.ok(box.x >= 0 && box.x + box.width <= width + 1 && box.y >= 0, "device menu must remain within the viewport");
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
     assert.equal(overflow, false, "workspace must not overflow horizontally");
+    const panel = page.getByRole("group", { name: `${longTrackName} 效果器`, exact: true });
+    const panelBox = await panel.boundingBox();
+    const actionBoxes = await Promise.all(["复制效果器", "粘贴效果器", "恢复默认效果"].map(name => panel.getByRole("button", { name, exact: true }).boundingBox()));
+    for (const box of actionBoxes) assert.ok(box.x >= panelBox.x && box.x + box.width <= panelBox.x + panelBox.width, "effect actions must stay within the panel even with long track names");
+    assert.ok(actionBoxes.every(box => Math.abs(box.y - actionBoxes[0].y) < 1), "effect actions must stay on a single row");
     await page.screenshot({ path: fileURLToPath(new URL(`${width}-responsive-menu.png`, output)) });
     await page.keyboard.press("Escape");
   }
+  await page.evaluate(() => window.studioStore.getState().removeTrack(window.effectsSourceId));
   // Clip editing must keep the same transport state and retain its asset cache.
   await timeline.scrollIntoViewIfNeeded();
   const clipControl = page.getByRole("button", { name: "音频片段 伴奏", exact: true });
@@ -124,7 +168,7 @@ try {
   await page.waitForFunction(() => window.studioStore.getState().project.tracks[0].clips[0].durationSec < 12 && window.studioEngine.isPlaying);
   await pause.click();
   assert.deepEqual(errors, []);
-  console.log("Studio UI PASS: 1080/900 layout, device menu, both scrub controls paused/playing, end/restart, clip move/trim, real Web Audio output.");
+  console.log("Studio UI PASS: effect copy/paste with live uninterrupted audio, explicit save, long-name action layout at 1080/900, device menu, both scrub controls paused/playing, end/restart, clip move/trim, real Web Audio output.");
 } catch (error) {
   await page.screenshot({ path: fileURLToPath(new URL("failure.png", output)) });
   throw error;

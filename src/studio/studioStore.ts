@@ -9,6 +9,7 @@ type StudioState = {
   inputDeviceId: string;
   monitorInput: boolean;
   recordingTrackId: string | null;
+  effectsClipboard: { sourceName: string; effects: StudioEffects } | null;
   setProject: (project: StudioProject | null) => void;
   setCurrentTime: (time: number) => void;
   setPlaying: (playing: boolean) => void;
@@ -22,6 +23,8 @@ type StudioState = {
   renameTrack: (id: string, name: string) => void;
   updateMixer: (id: string, patch: Partial<StudioTrack["mixer"]>) => void;
   updateEffects: (id: string, effects: Partial<StudioEffects>) => void;
+  copyEffects: (id: string) => void;
+  pasteEffects: (id: string) => void;
   resetEffects: (id: string) => void;
   updateClip: (trackId: string, clipId: string, patch: Partial<StudioClip>) => void;
   removeClip: (trackId: string, clipId: string) => void;
@@ -42,6 +45,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   inputDeviceId: "default",
   monitorInput: false,
   recordingTrackId: null,
+  effectsClipboard: null,
   setProject: (project) => set({ project, currentTime: 0, isPlaying: false, recordingTrackId: null }),
   setCurrentTime: (currentTime) => set({ currentTime: Math.max(0, currentTime) }),
   setPlaying: (isPlaying) => set({ isPlaying }),
@@ -90,6 +94,15 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   resetEffects: (id) => set((state) => {
     if (!state.project) return state;
     return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effects: structuredClone(DEFAULT_EFFECTS) } : track) }) };
+  }),
+  copyEffects: (id) => set((state) => {
+    const track = state.project?.tracks.find((item) => item.id === id);
+    return track ? { effectsClipboard: { sourceName: track.name, effects: structuredClone(track.effects) } } : state;
+  }),
+  pasteEffects: (id) => set((state) => {
+    const { project, effectsClipboard } = state;
+    if (!project || !effectsClipboard || !project.tracks.some((track) => track.id === id)) return state;
+    return { project: touch({ ...project, tracks: project.tracks.map((track) => track.id === id ? { ...track, effects: structuredClone(effectsClipboard.effects) } : track) }) };
   }),
   updateClip: (trackId, clipId, patch) => set((state) => {
     if (!state.project) return state;

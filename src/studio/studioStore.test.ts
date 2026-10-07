@@ -13,7 +13,74 @@ function setup() {
 }
 
 describe("studio editing state", () => {
-  afterEach(() => useStudioStore.getState().setProject(null));
+  afterEach(() => {
+    useStudioStore.getState().setProject(null);
+    useStudioStore.setState({ effectsClipboard: null });
+  });
+
+  it("copies an independent effect snapshot and pastes without changing other track properties", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    const effects = {
+      eq: { lowDb: -3, midDb: 5, highDb: 2 },
+      compressor: { thresholdDb: -24, ratio: 4, attackMs: 7, releaseMs: 180 },
+      reverb: { mix: 0.3, decaySec: 2.4 },
+      delay: { mix: 0.2, timeMs: 240, feedback: 0.4 },
+    };
+    store.updateEffects("instrumental", effects);
+    store.updateTrack(vocalId, { offsetMs: -100, normalizationGain: 2 });
+    store.updateMixer(vocalId, { pan: -0.3, gain: 0.6, mute: true });
+    const beforeCopy = useStudioStore.getState().project!;
+    store.copyEffects("instrumental");
+    expect(useStudioStore.getState().project).toBe(beforeCopy);
+    const clipboard = useStudioStore.getState().effectsClipboard!;
+    expect(clipboard.sourceName).toBe("伴奏");
+    store.resetEffects("instrumental");
+    expect(clipboard.effects).toEqual(effects);
+    store.pasteEffects(vocalId);
+    const pasted = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    const original = beforeCopy.tracks.find(t => t.id === vocalId)!;
+    expect({ ...pasted, effects: original.effects }).toEqual(original);
+    expect(pasted.effects).toEqual(effects);
+    for (const key of ["eq", "compressor", "reverb", "delay"] as const) {
+      expect(clipboard.effects[key] === beforeCopy.tracks[0].effects[key]).toBe(false);
+      expect(pasted.effects[key] === clipboard.effects[key]).toBe(false);
+    }
+    store.updateEffects(vocalId, { eq: { ...effects.eq, midDb: -2 } });
+    store.pasteEffects("instrumental");
+    expect(useStudioStore.getState().project!.tracks[0].effects).toEqual(effects);
+    expect(useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!.effects.eq.midDb).toBe(-2);
+    expect(clipboard.effects).toEqual(effects);
+  });
+
+  it("keeps copied effects across projects and saves pasted effects without the clipboard", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    store.updateEffects(vocalId, { eq: { lowDb: 3, midDb: -4, highDb: 6 } });
+    store.copyEffects(vocalId);
+    const expected = structuredClone(useStudioStore.getState().effectsClipboard!.effects);
+    store.removeTrack(vocalId);
+    store.setProject(null);
+    setup();
+    store.pasteEffects("instrumental");
+    const saved = JSON.parse(JSON.stringify(useStudioStore.getState().project));
+    expect(saved.effectsClipboard).toBeUndefined();
+    store.setProject(null);
+    store.setProject(saved);
+    expect(useStudioStore.getState().project!.tracks[0].effects).toEqual(expected);
+  });
+
+  it("does not mark a project edited when paste has no source or target", () => {
+    const { project } = setup();
+    const store = useStudioStore.getState();
+    store.pasteEffects("instrumental");
+    expect(useStudioStore.getState().project).toBe(project);
+    store.copyEffects("missing");
+    expect(useStudioStore.getState().effectsClipboard).toBe(null);
+    store.copyEffects("instrumental");
+    store.pasteEffects("missing");
+    expect(useStudioStore.getState().project).toBe(project);
+  });
 
   it("applies positive input compensation at zero without altering the full take", () => {
     const { vocalId } = setup();

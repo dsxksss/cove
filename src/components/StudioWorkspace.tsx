@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, ChevronDown, Disc3, Download, Headphones, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Square, Trash2, Upload, Volume2 } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Square, Trash2, Upload, Volume2 } from "lucide-react";
 import { StudioInputControls } from "./StudioInputControls";
 import { SignedMilliseconds, StudioTrackTools, trapStudioDialogTab } from "./StudioTrackTools";
 import type { LyricsLine } from "./playerTypes";
@@ -91,10 +91,25 @@ function TrackRow({ track, selected, onSelect, onMixer, onDelete, onRename }: { 
   );
 }
 
-function EffectPanel({ track, onChange, onReset }: { track: StudioTrack; onChange: (effects: Partial<StudioEffects>) => void; onReset: () => void }) {
+function EffectPanel({ track, onChange, onReset, clipboardSource, onCopy, onPaste }: { track: StudioTrack; onChange: (effects: Partial<StudioEffects>) => void; onReset: () => void; clipboardSource?: string; onCopy: () => void; onPaste: () => void }) {
+  const [feedback, setFeedback] = useState<"copy" | "paste" | null>(null);
+  useEffect(() => {
+    if (!feedback) return;
+    const timeout = window.setTimeout(() => setFeedback(null), 1800);
+    return () => window.clearTimeout(timeout);
+  }, [feedback]);
+  const actionClass = "flex shrink-0 items-center gap-1 rounded-lg bg-white/8 px-1.5 py-1 text-[9px] text-white/60 hover:bg-white/15 hover:text-white/90 focus-visible:outline focus-visible:outline-1 focus-visible:outline-lime-200 disabled:cursor-not-allowed disabled:opacity-30";
   const setEq = (key: keyof StudioEffects["eq"], value: number) => onChange({ eq: { ...track.effects.eq, [key]: value } });
-  return <div className="space-y-2 rounded-2xl border border-white/8 bg-white/[0.025] p-3">
-    <div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs font-bold text-white/75"><SlidersHorizontal size={14} /> {track.name} 效果器</div><div className="flex items-center gap-1"><button type="button" onClick={onReset} className="flex items-center gap-1 rounded-lg bg-white/8 px-1.5 py-1 text-[9px] text-white/50 hover:bg-white/15 hover:text-white/80" title="恢复默认效果"><RotateCcw size={11} />默认</button><span className="rounded-full bg-white/8 px-2 py-0.5 text-[9px] text-white/35">实时</span></div></div>
+  return <div role="group" aria-label={`${track.name} 效果器`} className="space-y-2 rounded-2xl border border-white/8 bg-white/[0.025] p-3">
+    <div className="flex items-center justify-between gap-2">
+      <div className="flex min-w-0 flex-1 items-center gap-2 text-xs font-bold text-white/75" title={`${track.name} 效果器`}><SlidersHorizontal size={14} className="shrink-0" /><span className="truncate">{track.name} 效果器</span></div>
+      <div className="flex shrink-0 items-center gap-1">
+        <button type="button" aria-label="复制效果器" title="复制此音轨的 EQ、压缩、混响和延迟设置" onClick={() => { onCopy(); setFeedback("copy"); }} className={actionClass}>{feedback === "copy" ? <Check size={11} className="text-lime-200" /> : <Copy size={11} />}复制</button>
+        <button type="button" aria-label="粘贴效果器" title={clipboardSource ? `粘贴来自「${clipboardSource}」的效果器设置` : "请先从一条音轨复制效果器"} disabled={clipboardSource === undefined} onClick={() => { onPaste(); setFeedback("paste"); }} className={actionClass}>{feedback === "paste" ? <Check size={11} className="text-lime-200" /> : <ClipboardPaste size={11} />}粘贴</button>
+        <button type="button" aria-label="恢复默认效果" onClick={() => { onReset(); setFeedback(null); }} className={actionClass} title="恢复默认效果"><RotateCcw size={11} />默认</button>
+      </div>
+    </div>
+    <span className="sr-only" role="status">{feedback === "copy" ? `已复制「${track.name}」的效果器，可切换音轨粘贴` : feedback === "paste" ? `已将「${clipboardSource}」的效果器粘贴到「${track.name}」` : ""}</span>
     <div className="grid grid-cols-3 gap-2">{(["lowDb", "midDb", "highDb"] as const).map((key) => <label key={key} className="min-w-0 text-[10px] text-white/45"><span className="flex justify-between"><span>{key === "lowDb" ? "低频" : key === "midDb" ? "中频" : "高频"}</span><span className="font-mono text-white/30">{track.effects.eq[key].toFixed(1)}</span></span><input aria-label={key} type="range" min="-12" max="12" step="0.5" value={track.effects.eq[key]} onChange={(event) => setEq(key, Number(event.target.value))} className="w-full accent-lime-200" /></label>)}</div>
     <div className="grid grid-cols-3 gap-2 border-t border-white/8 pt-2"><label className="min-w-0 text-[10px] text-white/45">压缩 <input aria-label="压缩比例" type="range" min="1" max="12" step="0.5" value={track.effects.compressor.ratio} onChange={(event) => onChange({ compressor: { ...track.effects.compressor, ratio: Number(event.target.value) } })} className="w-full accent-lime-200" /><span className="block text-right font-mono text-white/30">{track.effects.compressor.ratio.toFixed(1)}:1</span></label><label className="min-w-0 text-[10px] text-white/45">混响 <input aria-label="混响" type="range" min="0" max="1" step="0.01" value={track.effects.reverb.mix} onChange={(event) => onChange({ reverb: { ...track.effects.reverb, mix: Number(event.target.value) } })} className="w-full accent-lime-200" /><span className="block text-right font-mono text-white/30">{Math.round(track.effects.reverb.mix * 100)}%</span></label><label className="min-w-0 text-[10px] text-white/45">延迟 <input aria-label="延迟" type="range" min="0" max="1" step="0.01" value={track.effects.delay.mix} onChange={(event) => onChange({ delay: { ...track.effects.delay, mix: Number(event.target.value) } })} className="w-full accent-lime-200" /><span className="block text-right font-mono text-white/30">{Math.round(track.effects.delay.mix * 100)}%</span></label></div>
   </div>;
@@ -131,6 +146,9 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const updateMixer = useStudioStore((state) => state.updateMixer);
   const updateEffects = useStudioStore((state) => state.updateEffects);
   const resetEffects = useStudioStore((state) => state.resetEffects);
+  const effectsClipboard = useStudioStore((state) => state.effectsClipboard);
+  const copyEffects = useStudioStore((state) => state.copyEffects);
+  const pasteEffects = useStudioStore((state) => state.pasteEffects);
   const updateClip = useStudioStore((state) => state.updateClip);
   const removeClip = useStudioStore((state) => state.removeClip);
   const addAssetToTrack = useStudioStore((state) => state.addAssetToTrack);
@@ -1028,7 +1046,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             </div> : <div className="flex flex-1 items-center rounded-xl bg-white/[0.035] px-4 text-sm font-bold text-white/45">导入伴奏后开始录制，歌词会跟随原曲时间线</div>}
           </section>
           <div className="min-w-0 space-y-3">
-            {selectedTrack && <EffectPanel track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} onReset={() => resetEffects(selectedTrack.id)} />}
+            {selectedTrack && <EffectPanel key={`${currentProject.id}:${selectedTrack.id}`} track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} onReset={() => resetEffects(selectedTrack.id)} clipboardSource={effectsClipboard?.sourceName} onCopy={() => copyEffects(selectedTrack.id)} onPaste={() => pasteEffects(selectedTrack.id)} />}
             <StudioInputControls devices={devices} deviceId={inputDeviceId} deviceLabel={micLabel} menuOpen={micMenuOpen}
               onMenuChange={(open) => { setMicMenuOpen(open); if (open) setProjectMenuOpen(false); }} onDeviceChange={setInputDeviceId}
                 level={micLevel} countdown={countdownEnabled} recording={Boolean(recordingTrackId)} saving={savingRecording}

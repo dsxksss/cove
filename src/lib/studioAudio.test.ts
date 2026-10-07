@@ -15,10 +15,11 @@ class Node {
 class Context {
   currentTime = 5; sampleRate = 100; destination = new Node();
   sources: Node[] = []; decodes = 0;
+  filters: Node[] = [];
   resume: () => Promise<void> = async () => {};
   createAnalyser() { return new Node(); }
   createGain() { return new Node(); }
-  createBiquadFilter() { return new Node(); }
+  createBiquadFilter() { const node = new Node(); this.filters.push(node); return node; }
   createDynamicsCompressor() { return new Node(); }
   createConvolver() { return new Node(); }
   createDelay() { return new Node(); }
@@ -161,6 +162,26 @@ describe("studio transport state", () => {
     await engine.setProject(unmuted);
     expect(context.sources.length).toBe(1);
     expect(context.sources[0].stopped).toBe(false);
+    engine.dispose();
+  });
+
+  it("applies a pasted effect snapshot to the live graph without interrupting playback", async () => {
+    const engine = new StudioAudioEngine(); const context = engine.context as unknown as Context;
+    const value = project();
+    await engine.setProject(value); await engine.play(2);
+    const source = context.sources[0];
+    const changed = structuredClone(value);
+    changed.tracks[0].effects.eq = { lowDb: -4, midDb: 5, highDb: 2 };
+    context.currentTime += 1;
+    const position = engine.currentTime;
+    await engine.setProject(changed);
+    expect(context.filters.map(filter => filter.gain.value)).toEqual([-4, 5, 2]);
+    expect(context.decodes).toBe(1);
+    expect(context.sources.length).toBe(1);
+    expect(context.sources[0]).toBe(source);
+    expect(source.stopped).toBe(false);
+    expect(engine.currentTime).toBe(position);
+    expect(engine.isPlaying).toBe(true);
     engine.dispose();
   });
 
