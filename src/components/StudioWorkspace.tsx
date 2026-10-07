@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, ChevronDown, Disc3, Download, Headphones, Mic2, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Square, Trash2, Upload, Volume2 } from "lucide-react";
+import { ArrowLeft, ChevronDown, Disc3, Download, Headphones, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Square, Trash2, Upload, Volume2 } from "lucide-react";
+import { StudioInputControls } from "./StudioInputControls";
 import type { LyricsLine } from "./playerTypes";
 import { invokeNative } from "../lib/native";
 import { StudioAudioEngine } from "../lib/studioAudio";
@@ -150,9 +151,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [countdownValue, setCountdownValue] = useState<number | null>(null);
   const autoPrepareRef = useRef<string | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const scrubRef = useRef<{ resume: boolean; projectId: string } | null>(null);
+  const [scrubPlaying, setScrubPlaying] = useState(false);
   const timelineDraggingRef = useRef(false);
   const [timelineDragging, setTimelineDragging] = useState(false);
-  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; startSec: number; offsetSec: number; durationSec: number } | null>(null);
+  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; startSec: number; offsetSec: number; durationSec: number; secondsPerPixel: number } | null>(null);
   const [renamingProject, setRenamingProject] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState(project.title);
   const [micLevel, setMicLevel] = useState<StudioInputLevel>({ rms: 0, peak: 0, clipping: false });
@@ -181,13 +184,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     mountedRef.current = true;
     useStudioStore.getState().setProject(project);
     engineRef.current ??= new StudioAudioEngine();
+    const unsubscribe = engineRef.current.subscribePlayback(setPlaying);
     return () => {
+      unsubscribe();
       mountedRef.current = false;
       countdownAbortRef.current = true;
       recorderRef.current?.dispose();
       if (stemJobRef.current) void invokeNative("studio_cancel_job", { jobId: stemJobRef.current }).catch(() => undefined);
-      // StrictMode replays effects with the same DOM elements. Keep their
-      // MediaElementSource/context association during that synchronous replay.
+      // StrictMode replays effects synchronously; keep the context for that replay.
       queueMicrotask(() => {
         if (!mountedRef.current) engineRef.current?.dispose();
       });
@@ -263,7 +267,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const engine = engineRef.current;
     if (!engine) return;
     void engine.setProject(currentProject).catch((error) => setNcmStatus(error instanceof Error ? error.message : "音频载入失败"));
-  }, [currentProject.tracks]);
+  }, [currentProject.id, currentProject.tracks]);
 
   useEffect(() => {
     if (!persistedProjectIdsRef.current.has(currentProject.id)) return;
@@ -279,10 +283,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const timer = window.setInterval(() => {
       const clock = engineRef.current?.currentTime ?? currentTime;
       setCurrentTime(clock);
-      if (clock >= projectDuration && projectDuration > 0) { engineRef.current?.pause(); setPlaying(false); }
+      if (!scrubRef.current && clock >= projectDuration && projectDuration > 0) { engineRef.current?.pause(); setPlaying(false); }
     }, 50);
     return () => window.clearInterval(timer);
-  }, [projectDuration, currentTime, isPlaying, setCurrentTime, setPlaying]);
+  }, [projectDuration, isPlaying, setCurrentTime, setPlaying]);
 
   useEffect(() => {
     if (!recordingTrackId) { setMicLevel({ rms: 0, peak: 0, clipping: false }); return; }
@@ -292,14 +296,54 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   useEffect(() => { recorderRef.current?.update(inputGain, monitorInput); }, [inputGain, monitorInput]);
 
+  const beginScrub = useCallback(() => {
+    if (scrubRef.current || useStudioStore.getState().recordingTrackId) return;
+    const resume = engineRef.current?.isPlaying ?? false;
+    scrubRef.current = { resume, projectId: useStudioStore.getState().project?.id ?? "" };
+    setScrubPlaying(resume);
+    engineRef.current?.pause();
+  }, []);
+
+  const finishScrub = useCallback(() => {
+    const scrub = scrubRef.current;
+    scrubRef.current = null;
+    clipDragRef.current = null;
+    setScrubPlaying(false);
+    timelineDraggingRef.current = false;
+    setTimelineDragging(false);
+    const state = useStudioStore.getState();
+    if (!scrub || scrub.projectId !== state.project?.id) return;
+    const duration = getProjectDuration(state.project);
+    if (scrub.resume && state.currentTime < duration) {
+      void engineRef.current?.play(state.currentTime, true).catch((error) => setNcmStatus(error instanceof Error ? error.message : "音频播放失败"));
+    }
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("pointerup", finishScrub);
+    window.addEventListener("pointercancel", finishScrub);
+    window.addEventListener("blur", finishScrub);
+    return () => {
+      window.removeEventListener("pointerup", finishScrub);
+      window.removeEventListener("pointercancel", finishScrub);
+      window.removeEventListener("blur", finishScrub);
+    };
+  }, [finishScrub]);
+
+  const seekTo = useCallback((value: number) => {
+    if (useStudioStore.getState().recordingTrackId) return;
+    const next = Math.min(projectDuration, Math.max(0, value));
+    engineRef.current?.seek(next);
+    setCurrentTime(next);
+  }, [projectDuration, setCurrentTime]);
+
   const seekTimelineFromPointer = useCallback((clientX: number) => {
     const bounds = timelineRef.current?.getBoundingClientRect();
     if (!bounds) return;
     const ratio = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
     const value = ratio * Math.max(projectDuration, 1);
-    engineRef.current?.seek(value);
-    setCurrentTime(Math.min(value, projectDuration || value));
-  }, [projectDuration, setCurrentTime]);
+    seekTo(value);
+  }, [projectDuration, seekTo]);
 
   useEffect(() => {
     if (!timelineDragging) return;
@@ -317,20 +361,22 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, [seekTimelineFromPointer, timelineDragging]);
 
   const beginClipDrag = useCallback((trackId: string, clip: StudioClip, mode: "move" | "left" | "right", clientX: number) => {
-    clipDragRef.current = { trackId, clip, mode, originX: clientX, startSec: clip.startSec, offsetSec: clip.offsetSec, durationSec: clip.durationSec };
+    if (useStudioStore.getState().recordingTrackId) return;
+    beginScrub();
+    clipDragRef.current = { trackId, clip, mode, originX: clientX, startSec: clip.startSec, offsetSec: clip.offsetSec, durationSec: clip.durationSec, secondsPerPixel: Math.max(projectDuration, 1) / Math.max(1, timelineRef.current?.clientWidth ?? 1) };
     setSelectedTrackId(trackId);
-  }, []);
+  }, [beginScrub, projectDuration]);
 
   useEffect(() => {
     const move = (event: PointerEvent) => {
       const drag = clipDragRef.current;
       const bounds = timelineRef.current?.getBoundingClientRect();
       if (!drag || !bounds || bounds.width <= 0) return;
-      const delta = (event.clientX - drag.originX) / bounds.width * Math.max(projectDuration, 1);
+      const delta = (event.clientX - drag.originX) * drag.secondsPerPixel;
       if (drag.mode === "move") {
         updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + delta });
       } else if (drag.mode === "left") {
-        const nextDelta = Math.max(-drag.offsetSec, Math.min(drag.durationSec - 0.05, delta));
+        const nextDelta = Math.max(-Math.min(drag.offsetSec, drag.startSec), Math.min(drag.durationSec - 0.05, delta));
         updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + nextDelta, offsetSec: drag.offsetSec + nextDelta, durationSec: drag.durationSec - nextDelta });
       } else {
         updateClip(drag.trackId, drag.clip.id, { durationSec: drag.durationSec + delta });
@@ -355,11 +401,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, [currentProject.lyrics, lyricIndex]);
 
   const togglePlayback = async () => {
-    if (isPlaying) { engineRef.current?.pause(); setPlaying(false); return; }
+    if (scrubRef.current || recordingTrackId) return;
+    if (engineRef.current?.isPlaying) { engineRef.current.pause(); return; }
     try {
-      await engineRef.current?.play(currentTime);
-      setPlaying(true);
-    } catch (error) { setPlaying(false); setNcmStatus(error instanceof Error ? error.message : "音频播放失败"); }
+      const start = currentTime >= projectDuration ? 0 : currentTime;
+      setCurrentTime(start);
+      await engineRef.current?.play(start);
+    } catch (error) { setNcmStatus(error instanceof Error ? error.message : "音频播放失败"); }
   };
 
   const importAudio = async (file: File, trackId = "instrumental", startSec = 0) => {
@@ -459,11 +507,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         }
         setCountdownValue(null);
       }
-    const scheduleAt = (engineRef.current?.context.currentTime ?? 0) + 0.015;
-    recordStartRef.current = recorder.start(scheduleAt);
-    await engineRef.current?.play(currentTime, true);
-    setPlaying(true);
-    setNcmStatus("正在录音，再次点击停止");
+      const scheduleAt = (engineRef.current?.context.currentTime ?? 0) + 0.015;
+      recordStartRef.current = recorder.start(scheduleAt);
+      await engineRef.current?.play(currentTime, true);
+      setNcmStatus("正在录音，再次点击停止");
     } catch (error) {
       recorderRef.current?.dispose();
       recorderRef.current = null;
@@ -703,7 +750,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   };
 
   const timelineProgress = Math.min(100, Math.max(0, (currentTime / Math.max(projectDuration, 1)) * 100));
-  const playheadLeft = `clamp(8px, ${timelineProgress}%, calc(100% - 8px))`;
+  const playheadLeft = `${timelineProgress}%`;
   const hasRenderableAudio = hasAudibleClips(currentProject);
 
   return <div className="relative flex h-full w-full flex-col overflow-hidden bg-slate-950/90 text-white">
@@ -749,18 +796,65 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
           {ncmStatus && <div className="space-y-2 rounded-xl border border-white/8 bg-black/15 p-2.5"><div className="flex items-start gap-2"><p className="min-w-0 flex-1 break-words text-[10px] leading-relaxed text-white/55">{ncmStatus}{jobId ? ` · ${stemStage}` : ""}</p>{jobId && <button type="button" onClick={() => void cancelNcm()} className="shrink-0 rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-white/50 hover:bg-white/15">取消</button>}</div><div className="h-1.5 overflow-hidden rounded-full bg-white/10" role="progressbar" aria-label="伴奏准备进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(stemProgress * 100)}><div className={`h-full rounded-full bg-lime-200 transition-[width] duration-500 ${stemIndeterminate ? "animate-pulse" : ""}`} style={{ width: `${Math.max(2, stemProgress * 100)}%` }} /></div></div>}
         </div>
       </aside>
-      <main className="flex min-w-0 flex-1 flex-col">
-        <div className="flex min-h-0 flex-1 flex-col p-5">
-          <div ref={timelineRef} role="slider" tabIndex={0} aria-label="时间线播放头" aria-valuemin={0} aria-valuemax={Math.max(projectDuration, 1)} aria-valuenow={Math.round(currentTime * 100) / 100} onPointerDown={(event) => { if ((event.target as HTMLElement).closest("button, [role=button]")) return; timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }} onKeyDown={(event) => { const step = event.shiftKey ? 10 : 1; if (event.key === "ArrowLeft") { event.preventDefault(); seekTimelineFromPointer((timelineRef.current?.getBoundingClientRect().left ?? 0) + ((currentTime - step) / Math.max(projectDuration, 1)) * (timelineRef.current?.getBoundingClientRect().width ?? 0)); } if (event.key === "ArrowRight") { event.preventDefault(); seekTimelineFromPointer((timelineRef.current?.getBoundingClientRect().left ?? 0) + ((currentTime + step) / Math.max(projectDuration, 1)) * (timelineRef.current?.getBoundingClientRect().width ?? 0)); } }} className={`relative min-h-72 flex-1 overflow-hidden rounded-3xl border border-white/10 bg-black/20 ${timelineDragging ? "cursor-grabbing" : "cursor-crosshair"}`}>
-            <div className="absolute inset-0 bg-[linear-gradient(90deg,transparent_0,transparent_calc(25%-1px),rgba(255,255,255,.05)_25%,transparent_calc(25%+1px),transparent_calc(50%-1px),rgba(255,255,255,.05)_50%,transparent_calc(50%+1px),transparent_calc(75%-1px),rgba(255,255,255,.05)_75%,transparent_calc(75%+1px),transparent_100%)]" />
-            <div className="absolute inset-x-0 top-4 flex justify-between px-4 text-[10px] font-mono text-white/25"><span>0:00</span><span>{formatTime(projectDuration / 2)}</span><span>{formatTime(projectDuration)}</span></div>
-            <div className="absolute bottom-6 left-0 right-0 space-y-3 px-4">{currentProject.tracks.map((track) => <div key={track.id} className="relative h-14 rounded-xl bg-white/[0.035]" onClick={() => setSelectedTrackId(track.id)}><div className="absolute inset-y-0 left-2 z-[1] flex items-center text-[10px] font-bold text-white/35">{track.name}</div>{track.clips.map((clip) => { const asset = track.assets.find((item) => item.id === clip.assetId); const left = (clip.startSec / Math.max(projectDuration, 1)) * 100; const width = Math.max(2, (clip.durationSec / Math.max(projectDuration, 1)) * 100); return <div key={clip.id} role="button" tabIndex={0} title={`${asset?.name ?? "音频片段"} · ${formatTime(clip.startSec)} · ${formatTime(clip.durationSec)}`} onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }} onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "move", event.clientX); }} onKeyDown={(event) => { if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); removeClip(track.id, clip.id); } }} className={`group absolute inset-y-2 z-[2] overflow-visible rounded-lg border ${track.id === selectedTrackId ? "border-lime-200/60 bg-lime-200/15" : "border-white/15 bg-white/10"} cursor-grab active:cursor-grabbing`} style={{ left: `${left}%`, width: `${width}%` }}><span className="absolute inset-0 truncate px-3 py-2 text-[10px] font-bold text-white/55">{track.name} · {formatTime(clip.durationSec)}</span><button type="button" aria-label="缩短片段起点" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "left", event.clientX); }} className="absolute left-0 top-1/2 z-10 h-8 w-1 -translate-x-1/2 -translate-y-1/2 cursor-ew-resize rounded-full bg-lime-200/80 opacity-0 transition group-hover:opacity-100" /><button type="button" aria-label="调整片段结尾" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "right", event.clientX); }} className="absolute right-0 top-1/2 z-10 h-8 w-1 translate-x-1/2 -translate-y-1/2 cursor-ew-resize rounded-full bg-lime-200/80 opacity-0 transition group-hover:opacity-100" /><button type="button" aria-label="删除片段" onClick={(event) => { event.stopPropagation(); removeClip(track.id, clip.id); }} className="absolute -right-1.5 -top-1.5 z-20 grid h-4 w-4 place-items-center rounded-full bg-red-300 text-[11px] font-black text-slate-950 opacity-0 transition group-hover:opacity-100">×</button></div>; })}</div>)}</div>
-            <div className="pointer-events-none absolute bottom-0 top-0 z-10 w-px -translate-x-1/2 bg-lime-200/85" style={{ left: playheadLeft }} />
-            <button type="button" aria-label="拖拽时间线播放头" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }} className={`absolute top-3 z-20 h-3 w-3 -translate-x-1/2 rounded-full border border-lime-100/90 bg-lime-200 transition-transform hover:scale-110 ${timelineDragging ? "scale-110 cursor-grabbing" : "cursor-grab"}`} style={{ left: playheadLeft }} />
+      <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">
+        <div className="flex min-h-[328px] flex-1 flex-col p-5">
+          <div className="relative min-h-60 flex-1 rounded-3xl border border-white/10 bg-black/20">
+            <div ref={timelineRef} role="slider" tabIndex={0} aria-label="时间线播放头" aria-disabled={Boolean(recordingTrackId)}
+              aria-valuemin={0} aria-valuemax={Math.max(projectDuration, 1)} aria-valuenow={Math.round(currentTime * 100) / 100}
+              onPointerDown={(event) => {
+                if (recordingTrackId || event.button !== 0 || (event.target as HTMLElement).closest("button, [role=button]")) return;
+                beginScrub(); timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX);
+              }}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget || recordingTrackId) return;
+                const step = event.shiftKey ? 10 : 1;
+                if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); seekTo(currentTime + (event.key === "ArrowLeft" ? -step : step)); }
+              }}
+              className={`absolute inset-x-4 inset-y-3 touch-none select-none ${timelineDragging ? "cursor-grabbing" : "cursor-crosshair"}`}>
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 top-12 flex justify-between" aria-hidden="true">{[0, 1, 2, 3, 4].map((tick) => <span key={tick} className="w-px bg-white/5" />)}</div>
+              <div className="pointer-events-none absolute inset-x-0 top-5 flex justify-between text-[10px] font-mono text-white/30"><span>0:00</span><span>{formatTime(projectDuration / 2)}</span><span>{formatTime(projectDuration)}</span></div>
+              <div className="absolute inset-x-0 bottom-0 top-12 space-y-3 overflow-y-auto py-1 [scrollbar-width:thin]" aria-label="音轨片段">
+                {currentProject.tracks.map((track) => <div key={track.id} className="space-y-1" onClick={() => setSelectedTrackId(track.id)}>
+                  <p className="truncate text-[10px] font-bold text-white/40">{track.name}</p>
+                  <div className="relative h-12 rounded-lg bg-white/[0.035]">
+                    {track.clips.length === 0 && <span className="pointer-events-none flex h-full items-center px-3 text-[10px] text-white/20">暂无音频</span>}
+                    {track.clips.map((clip) => {
+                      const asset = track.assets.find((item) => item.id === clip.assetId);
+                      const left = (clip.startSec / Math.max(projectDuration, 1)) * 100;
+                      const width = (clip.durationSec / Math.max(projectDuration, 1)) * 100;
+                      return <div key={clip.id} role="button" tabIndex={0} aria-label={`音频片段 ${track.name}`}
+                        title={`${asset?.name ?? "音频片段"} · ${formatTime(clip.startSec)} · ${formatTime(clip.durationSec)}`}
+                        onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }}
+                        onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); event.currentTarget.focus(); beginClipDrag(track.id, clip, "move", event.clientX); }}
+                        onKeyDown={(event) => { if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); if (!recordingTrackId) removeClip(track.id, clip.id); } }}
+                        className={`group absolute inset-y-1 z-[2] min-w-1 rounded-lg border ${track.id === selectedTrackId ? "border-lime-200/40 bg-slate-800" : "border-white/15 bg-slate-900"} cursor-grab active:cursor-grabbing`}
+                        style={{ left: `${left}%`, width: `${width}%` }}>
+                        <span className="pointer-events-none absolute inset-0 flex min-w-0 items-center gap-2 px-3 text-[10px] text-white/65"><span className="truncate">{asset?.name ?? track.name}</span><span className="shrink-0 font-mono text-white/35">{formatTime(clip.durationSec)}</span></span>
+                        <button type="button" aria-label="调整片段起点" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "left", event.clientX); }} className="absolute inset-y-0 left-0 z-10 w-2 cursor-ew-resize rounded-l-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
+                        <button type="button" aria-label="调整片段结尾" onPointerDown={(event) => { event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "right", event.clientX); }} className="absolute inset-y-0 right-0 z-10 w-2 cursor-ew-resize rounded-r-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
+                        <button type="button" aria-label="删除片段" disabled={Boolean(recordingTrackId)} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); removeClip(track.id, clip.id); }} className="absolute right-2 top-1 z-20 grid h-5 w-5 place-items-center rounded bg-slate-950 text-red-200 opacity-0 transition group-hover:opacity-100 focus:opacity-100">×</button>
+                      </div>;
+                    })}
+                  </div>
+                </div>)}
+              </div>
+              <div className="pointer-events-none absolute bottom-0 top-2 z-10 w-px -translate-x-1/2 bg-lime-200/75" style={{ left: playheadLeft }} />
+              <button type="button" aria-label="拖拽时间线播放头" disabled={Boolean(recordingTrackId)}
+                onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); beginScrub(); timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }}
+                className={`absolute -top-1 z-20 grid h-6 w-6 -translate-x-1/2 touch-none place-items-center ${timelineDragging ? "cursor-grabbing" : "cursor-grab"}`} style={{ left: playheadLeft }}><span className="h-3 w-3 rounded-full bg-lime-200" /></button>
+            </div>
           </div>
-          <div className="mt-4 flex items-center gap-3"><button type="button" onClick={() => void togglePlayback()} className="grid h-11 w-11 place-items-center rounded-full bg-white text-slate-950">{isPlaying ? <Pause size={18} /> : <Play size={18} fill="currentColor" />}</button><button type="button" onClick={() => { engineRef.current?.seek(0); setCurrentTime(0); }} className="grid h-9 w-9 place-items-center rounded-full bg-white/10 text-white/70 hover:bg-white/15" aria-label="回到开头"><Square size={13} /></button><span className="font-mono text-xs text-white/55">{formatTime(currentTime)} / {formatTime(projectDuration)}</span><div className="flex-1"><input aria-label="工作室进度" type="range" min="0" max={Math.max(projectDuration, 1)} step="0.01" value={Math.min(currentTime, projectDuration || 1)} onChange={(event) => { const value = Number(event.target.value); engineRef.current?.seek(value); setCurrentTime(value); }} style={{ "--studio-progress": `${Math.min(100, (currentTime / Math.max(projectDuration, 1)) * 100)}%` } as React.CSSProperties} className="studio-progress-slider w-full" /></div><span className="flex items-center gap-1 text-xs text-white/40"><Headphones size={14} />耳机监听</span><input type="checkbox" checked={monitorInput} onChange={(event) => setMonitorInput(event.target.checked)} className="accent-lime-200" /></div>
+          <div className="mt-4 flex shrink-0 flex-wrap items-center gap-3" aria-label="播放控制">
+            <button type="button" aria-label={isPlaying || scrubPlaying ? "暂停工作室播放" : "播放工作室"} disabled={Boolean(recordingTrackId)} onClick={() => void togglePlayback()} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-white text-slate-950 disabled:opacity-50">{isPlaying || scrubPlaying ? <Pause size={18} /> : <Play size={18} fill="currentColor" />}</button>
+            <button type="button" disabled={Boolean(recordingTrackId)} onClick={() => seekTo(0)} className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 text-white/70 hover:bg-white/15 disabled:opacity-50" aria-label="回到开头"><Square size={13} /></button>
+            <span className="whitespace-nowrap font-mono text-xs text-white/55">{formatTime(currentTime)} / {formatTime(projectDuration)}</span>
+            <input aria-label="工作室进度" disabled={Boolean(recordingTrackId)} type="range" min="0" max={Math.max(projectDuration, 1)} step="0.01" value={Math.min(currentTime, projectDuration || 1)}
+              onPointerDown={beginScrub} onKeyDown={(event) => { if (["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key)) beginScrub(); }} onKeyUp={finishScrub} onBlur={finishScrub}
+              onChange={(event) => seekTo(Number(event.target.value))} style={{ "--studio-progress": `${timelineProgress}%` } as React.CSSProperties} className="studio-progress-slider min-w-24 flex-1" />
+            <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-white/45"><Headphones size={14} />耳机监听<input type="checkbox" checked={monitorInput} onChange={(event) => setMonitorInput(event.target.checked)} className="accent-lime-200" /></label>
+          </div>
         </div>
-        <div className="flex min-h-32 shrink-0 gap-5 border-t border-white/10 px-5 py-4">
+        <div className="grid shrink-0 grid-cols-1 gap-4 border-t border-white/10 px-5 py-4 lg:grid-cols-[minmax(0,1fr)_320px]">
           <section className="flex min-h-[190px] min-w-0 flex-1 flex-col rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3" aria-label="同步歌词">
             <div className="mb-2 flex items-center justify-between gap-2 text-[10px] font-black tracking-[0.15em] text-white/35">
               <span>同步歌词</span>
@@ -769,7 +863,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             {lyricRows.length > 0 ? <div className="flex min-h-0 flex-1 flex-col justify-center gap-2 overflow-hidden">
               {lyricRows.map(({ line, index }) => {
                 const active = index === lyricIndex;
-                return <button key={`${index}-${line.time}`} type="button" onClick={() => { engineRef.current?.seek(line.time); setCurrentTime(line.time); }} className={`group w-full rounded-xl px-3 py-2 text-left transition ${active ? "bg-lime-200/10 ring-1 ring-lime-200/25" : "hover:bg-white/[0.04]"}`}>
+                return <button key={`${index}-${line.time}`} type="button" onClick={() => { seekTo(line.time); }} className={`group w-full rounded-xl px-3 py-2 text-left transition ${active ? "bg-lime-200/10 ring-1 ring-lime-200/25" : "hover:bg-white/[0.04]"}`}>
                   <div className={`truncate text-sm font-bold leading-5 ${active ? "text-lime-100" : index < lyricIndex ? "text-white/35" : "text-white/60"}`}>{line.text || "♪"}</div>
                   {line.tr && <div className={`mt-0.5 truncate text-[11px] leading-4 ${active ? "text-lime-100/55" : "text-white/25"}`}>{line.tr}</div>}
                   <span className="sr-only">{formatTime(line.time)}</span>
@@ -777,7 +871,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
               })}
             </div> : <div className="flex flex-1 items-center rounded-xl bg-white/[0.035] px-4 text-sm font-bold text-white/45">导入伴奏后开始录制，歌词会跟随原曲时间线</div>}
           </section>
-          <div className="w-80 space-y-3">{selectedTrack && <EffectPanel track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} onReset={() => resetEffects(selectedTrack.id)} />}<div className="flex items-center gap-2"><div className="relative min-w-0 flex-1"><button type="button" aria-label="麦克风设备" aria-haspopup="menu" aria-expanded={micMenuOpen} onClick={() => { setMicMenuOpen((open) => !open); setProjectMenuOpen(false); }} className="flex w-full items-center justify-between gap-2 rounded-lg bg-white/8 px-2 py-1.5 text-left text-[11px] text-white/70 outline-none transition hover:bg-white/12"><span className="truncate">{micLabel}</span><ChevronDown size={13} className={`shrink-0 transition-transform ${micMenuOpen ? "rotate-180" : ""}`} /></button>{micMenuOpen && <div role="menu" className="absolute bottom-full left-0 z-[100] mb-2 w-full rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl"><button type="button" role="menuitem" onClick={() => { setInputDeviceId("default"); setMicMenuOpen(false); }} className={`w-full rounded-lg px-3 py-2 text-left text-[11px] transition hover:bg-white/10 ${inputDeviceId === "default" ? "bg-white/10 text-white" : "text-white/65"}`}>默认麦克风</button>{devices.map((device) => <button type="button" role="menuitem" key={device.deviceId} onClick={() => { setInputDeviceId(device.deviceId); setMicMenuOpen(false); }} className={`w-full truncate rounded-lg px-3 py-2 text-left text-[11px] transition hover:bg-white/10 ${inputDeviceId === device.deviceId ? "bg-white/10 text-white" : "text-white/65"}`}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</button>)}</div>}</div><div className="min-w-24 rounded-lg bg-black/15 px-2 py-1.5" title={micLevel.clipping ? "输入过载，请降低距离或增益" : "录音时显示麦克风输入电平"}><div className="flex items-center justify-between text-[9px] text-white/40"><span>麦克风</span><span className={micLevel.clipping ? "text-red-200" : micLevel.rms > 0.01 ? "text-lime-100" : "text-white/35"}>{micLevel.clipping ? "过载" : micLevel.rms > 0.01 ? "有声音" : "等待"}</span></div><div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/10"><div className={`h-full rounded-full transition-[width] ${micLevel.clipping ? "bg-red-300" : "bg-lime-200"}`} style={{ width: `${Math.min(100, Math.max(2, micLevel.peak * 100))}%` }} /></div></div><button type="button" role="switch" aria-checked={countdownEnabled} onClick={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* storage is optional */ } }} className={`flex h-8 items-center gap-1.5 rounded-lg px-2 text-[10px] font-bold transition ${countdownEnabled ? "bg-lime-200/15 text-lime-100" : "bg-white/8 text-white/45 hover:bg-white/12"}`} title="录音前显示 3 秒倒计时"><span className={`relative h-3.5 w-6 rounded-full transition ${countdownEnabled ? "bg-lime-200/70" : "bg-white/20"}`}><span className={`absolute top-0.5 h-2.5 w-2.5 rounded-full bg-white transition ${countdownEnabled ? "left-3" : "left-0.5"}`} /></span>倒计时</button><button type="button" onClick={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") { setRecordingTrackId(selectedTrack.id); void startRecording(); } else setNcmStatus("请先添加并选择人声轨"); }} className={`grid h-8 w-8 place-items-center rounded-full ${recordingTrackId ? "bg-red-400 text-white" : "bg-white/10 text-white/65 hover:bg-white/15"}`} aria-label={recordingTrackId ? "停止录音" : "准备录音"}>{recordingTrackId ? <Square size={13} fill="currentColor" /> : <Mic2 size={15} />}</button>{recordingTrackId && <button type="button" onClick={stopRecording} className="rounded-lg bg-red-400/20 px-2 py-1 text-[10px] font-bold text-red-100">停止</button>}</div></div>
+          <div className="min-w-0 space-y-3">
+            {selectedTrack && <EffectPanel track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} onReset={() => resetEffects(selectedTrack.id)} />}
+            <StudioInputControls devices={devices} deviceId={inputDeviceId} deviceLabel={micLabel} menuOpen={micMenuOpen}
+              onMenuChange={(open) => { setMicMenuOpen(open); if (open) setProjectMenuOpen(false); }} onDeviceChange={setInputDeviceId}
+              level={micLevel} countdown={countdownEnabled} recording={Boolean(recordingTrackId)}
+              onCountdownChange={() => { const next = !countdownEnabled; setCountdownEnabled(next); try { localStorage.setItem(RECORD_COUNTDOWN_KEY, next ? "1" : "0"); } catch { /* optional preference */ } }}
+              onRecord={() => { if (recordingTrackId) stopRecording(); else if (selectedTrack?.kind === "vocal") { setRecordingTrackId(selectedTrack.id); void startRecording(); } else setNcmStatus("请先添加并选择人声轨"); }} />
+          </div>
         </div>
       </main>
     </div>
