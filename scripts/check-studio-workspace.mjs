@@ -106,10 +106,12 @@ try {
   await play.click();
   await page.waitForFunction(() => window.studioEngine.waveform().some((sample) => Math.abs(sample - 128) > 2));
   await pause.click();
-  // End-of-track playback starts from zero rather than falsely lighting pause.
+  // A cue at the end must not silently change to song zero.
   await slider.focus(); await page.keyboard.press("End"); await play.click();
-  await page.waitForFunction(() => window.studioEngine.isPlaying && window.studioEngine.currentTime < 2);
-  await pause.click();
+  await page.getByText("此位置没有可播放音频，请先导入音频或回到开头", { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.studioEngine.isPlaying), false);
+  assert.equal(await play.count(), 1);
+  assert.equal(await page.evaluate(() => window.studioEngine.currentTime), await slider.evaluate(el => Number(el.max)));
   await timeline.focus(); await page.keyboard.press("Home");
   // Copy from one track, then modify that source. Pasting during playback must
   // use the frozen snapshot and keep the existing audio sources scheduled.

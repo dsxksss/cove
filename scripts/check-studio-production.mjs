@@ -25,13 +25,44 @@ try {
     const { StudioAudioEngine } = await import("/src/lib/studioAudio.ts");
     const { renderStudioMix, normalizationGain } = await import("/src/lib/studioExport.ts");
     const { encodePcmWav } = await import("/src/lib/studioWav.ts");
-    const { createStudioProject } = await import("/src/studio/types.ts");
+    const { createStudioProject, createReferenceTrack, createVocalTrack } = await import("/src/studio/types.ts");
+    const { createTrackGraph } = await import("/src/lib/studioDsp.ts");
     const pcm = Float32Array.from({ length: 48000 * 2 }, (_, i) => 0.2 * Math.sin(2 * Math.PI * 220 * i / 48000));
     const asset = { id: "audio", name: "本地伴奏.wav", url: URL.createObjectURL(encodePcmWav([pcm], 48000, 16)), durationSec: 2, mimeType: "audio/wav" };
     const project = createStudioProject({ songId: "test", title: "Production test", artist: "Test", coverUrl: "", durationSec: 2, lyrics: [] });
     project.tracks[0].assets = [asset];
     project.tracks[0].clips = [{ id: "clip", assetId: asset.id, startSec: 0, offsetSec: 0, durationSec: 2 }];
     project.instrumental = asset;
+    // Neutral defaults must pass actual stereo PCM unchanged, with no
+    // compressor lookahead or effect tail. Exercise all track factories and
+    // enabling/resetting routing repeatedly (no duplicate connections).
+    const dryChecks = [];
+    for (const track of [project.tracks[0], createVocalTrack(1), createReferenceTrack(), createReferenceTrack("vocals")]) {
+      const offline = new OfflineAudioContext(2, 4800, 48000);
+      const graph = createTrackGraph(offline, offline.destination);
+      const defaults = structuredClone(track.effects);
+      for (let pass = 0; pass < 2; pass++) {
+        track.effects = { ...defaults, compressor: { ...defaults.compressor, ratio: 4 }, reverb: { ...defaults.reverb, mix: 0.4 }, delay: { ...defaults.delay, mix: 0.3 } };
+        graph.update(track, false);
+        track.effects = defaults; graph.update(track, false);
+      }
+      // Reference tracks are intentionally muted on import; unmute explicitly.
+      graph.update({ ...track, mixer: { ...track.mixer, mute: false, gain: 1, pan: 0 } }, false);
+      const input = offline.createBuffer(2, 4800, 48000);
+      for (let channel = 0; channel < 2; channel++) {
+        const samples = input.getChannelData(channel);
+        for (let i = 0; i < 2400; i++) samples[i] = i === 0 ? 0.9 : 0.7 * Math.sin(i * (channel + 1) * 0.04);
+      }
+      const source = offline.createBufferSource(); source.buffer = input; source.connect(graph.input); source.start();
+      const rendered = await offline.startRendering();
+      let error = 0;
+      for (let channel = 0; channel < 2; channel++) {
+        const expected = input.getChannelData(channel), actual = rendered.getChannelData(channel);
+        for (let i = 0; i < actual.length; i++) error = Math.max(error, Math.abs(actual[i] - expected[i]));
+      }
+      dryChecks.push({ kind: track.referenceStem ?? track.kind, error });
+      graph.dispose();
+    }
     const engine = new StudioAudioEngine();
     let playbackError = null, exportError = null, samples = false, wav = null;
     try {
@@ -87,13 +118,14 @@ try {
     engine.dispose();
     URL.revokeObjectURL(stereoUrl); URL.revokeObjectURL(antiUrl);
     URL.revokeObjectURL(asset.url);
-    return { playbackError, exportError, samples, wav, violations, dsp, channels };
+    return { playbackError, exportError, samples, wav, violations, dsp, channels, dryChecks };
   });
   console.log(JSON.stringify({ ...result, wav: result.wav ? "generated" : null }));
   assert.equal(result.playbackError, null, "packaged CSP must permit playback of local audio");
   assert.equal(result.exportError, null, "packaged CSP must permit offline export");
   assert.equal(result.samples, true, "realtime playback must produce audio samples");
   assert.deepEqual(result.violations, []);
+  assert.ok(result.dryChecks.every(check => check.error < 0.000001), "all default/reset effect chains preserve stereo PCM with no gain, latency or tail");
   assert.ok(Math.abs(result.dsp.measured - result.dsp.expected) < 0.005, "normalization must measure the summed dry source peak");
   assert.ok(result.dsp.left > 0.5 && result.dsp.right < 0.0001, "export must honor per-track pan");
   assert.ok(result.dsp.beginsAt >= 0.25 && result.dsp.beginsAt < 0.27, "export must honor millisecond track offset");

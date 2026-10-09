@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { StudioEffects, StudioProject, StudioTrack, StudioAsset, StudioTake, StudioClip } from "./types";
 import { createReferenceTrack, createVocalTrack, DEFAULT_EFFECTS } from "./types";
 import { repairStudioAssetNames } from "./assetNames";
+import { migrateStudioEffectDefaults } from "./effectDefaults";
 import { splitStudioClipAt } from "./clipEditing";
 
 type StudioState = {
@@ -50,7 +51,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   monitorInput: false,
   recordingTrackId: null,
   effectsClipboard: null,
-  setProject: (project) => set({ project: project ? repairStudioAssetNames(project) : null, currentTime: 0, isPlaying: false, recordingTrackId: null }),
+  setProject: (project) => set({ project: project ? migrateStudioEffectDefaults(repairStudioAssetNames(project)) : null, currentTime: 0, isPlaying: false, recordingTrackId: null }),
   setCurrentTime: (currentTime) => set({ currentTime: Math.max(0, currentTime) }),
   setPlaying: (isPlaying) => set({ isPlaying }),
   setInputDeviceId: (inputDeviceId) => set({ inputDeviceId }),
@@ -95,11 +96,11 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   }),
   updateEffects: (id, effects) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effects: { ...track.effects, ...effects, eq: { ...track.effects.eq, ...effects.eq }, compressor: { ...track.effects.compressor, ...effects.compressor }, reverb: { ...track.effects.reverb, ...effects.reverb }, delay: { ...track.effects.delay, ...effects.delay } } } : track) }) };
+    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: { ...track.effects, ...effects, eq: { ...track.effects.eq, ...effects.eq }, compressor: { ...track.effects.compressor, ...effects.compressor }, reverb: { ...track.effects.reverb, ...effects.reverb }, delay: { ...track.effects.delay, ...effects.delay } } } : track) }) };
   }),
   resetEffects: (id) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effects: structuredClone(DEFAULT_EFFECTS) } : track) }) };
+    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: structuredClone(DEFAULT_EFFECTS) } : track) }) };
   }),
   copyEffects: (id) => set((state) => {
     const track = state.project?.tracks.find((item) => item.id === id);
@@ -108,7 +109,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   pasteEffects: (id) => set((state) => {
     const { project, effectsClipboard } = state;
     if (!project || !effectsClipboard || !project.tracks.some((track) => track.id === id)) return state;
-    return { project: touch({ ...project, tracks: project.tracks.map((track) => track.id === id ? { ...track, effects: structuredClone(effectsClipboard.effects) } : track) }) };
+    return { project: touch({ ...project, tracks: project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: structuredClone(effectsClipboard.effects) } : track) }) };
   }),
   updateClip: (trackId, clipId, patch) => set((state) => {
     if (!state.project || state.recordingTrackId) return state;

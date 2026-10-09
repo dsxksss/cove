@@ -98,14 +98,41 @@ try {
   const play = page.getByRole("button", { name: "播放工作室", exact: true });
   const pause = page.getByRole("button", { name: "暂停工作室播放", exact: true });
   const slider = page.getByRole("slider", { name: "工作室进度", exact: true });
+  const ruler = page.getByRole("slider", { name: "时间线播放头", exact: true });
+  await ruler.focus();
+  for (let i = 0; i < 8; i++) await page.keyboard.press("ArrowRight");
+  const cue = await page.evaluate(() => window.shortcutStudioStore.getState().currentTime);
+  assert.equal(cue, 8, "keyboard positioning establishes a non-zero playback origin");
   await blur();
   await page.keyboard.press("Space");
   await expectPlaying(true);
   await pause.waitFor();
   await page.waitForFunction(() => window.shortcutStudioEngine.waveform().some((sample) => Math.abs(sample - 128) > 2));
+  await page.waitForFunction((start) => window.shortcutStudioEngine.currentTime > start + 0.3, cue);
   await page.keyboard.press("Space");
   await expectPlaying(false);
   await noBackgroundActions(original, "studio blank-space shortcut must not change the ordinary player");
+  const pausedTime = await page.evaluate(() => window.shortcutStudioEngine.currentTime);
+  const range = page.locator("[data-studio-played-range]");
+  const rulerBounds = await ruler.boundingBox(), rangeBounds = await range.boundingBox();
+  assert.ok(Math.abs(rangeBounds.x - rulerBounds.x - rulerBounds.width * cue / 60) < 1);
+  assert.ok(Math.abs(rangeBounds.width - rulerBounds.width * (pausedTime - cue) / 60) < 1, "shade extends only from the cue to the paused playhead");
+  await page.getByRole("button", { name: "放大时间轴", exact: true }).click();
+  const viewport = page.getByLabel("时间轴视图", { exact: true });
+  await viewport.evaluate(el => { el.scrollLeft = 80; });
+  const zoomedRuler = await ruler.boundingBox(), zoomedRange = await range.boundingBox();
+  assert.ok(Math.abs(zoomedRange.x - zoomedRuler.x - zoomedRuler.width * cue / 60) < 1);
+  assert.ok(Math.abs(zoomedRange.width - zoomedRuler.width * (pausedTime - cue) / 60) < 1, "zoom/scroll preserves shade alignment");
+  assert.equal(await range.evaluate(el => getComputedStyle(el).pointerEvents), "none", "shade cannot intercept clip edits");
+  // Freeze a later clock sample for a readable visual regression image.
+  await page.evaluate(() => { window.shortcutStudioEngine.seek(28); window.shortcutStudioStore.getState().setCurrentTime(28); });
+  await page.screenshot({ path: fileURLToPath(new URL("studio-played-range.png", output)) });
+  await page.evaluate(time => { window.shortcutStudioEngine.seek(time); window.shortcutStudioStore.getState().setCurrentTime(time); }, pausedTime);
+  await page.getByRole("button", { name: "重置时间轴缩放", exact: true }).click();
+  await page.keyboard.press("Space");
+  await expectPlaying(false);
+  assert.equal(await page.evaluate(() => window.shortcutStudioEngine.currentTime), cue, "second Space returns to the last cue without playing");
+  assert.equal((await range.boundingBox()).width, 0, "returning to the cue clears the played-range shade");
 
   // One physical hold has one effect, including repeated keydown events.
   await page.keyboard.down("Space");
@@ -116,18 +143,47 @@ try {
   await page.keyboard.press("Space");
   await expectPlaying(false);
 
-  // Sliders support the studio shortcut; native buttons retain their own click.
-  await slider.focus();
+  // Ordinary focus never turns Space into a native button click.
+  const initialIpc = await page.evaluate(() => window.shortcutIpc.length);
+  for (const target of [slider, play, page.getByRole("button", { name: "重新播放", exact: true }), page.getByRole("button", { name: "保存", exact: true }), page.getByRole("button", { name: "M", exact: true }).first()]) {
+    await target.focus();
+    await page.keyboard.press("Space"); // paused -> cue
+    await expectPlaying(false);
+    assert.equal(await page.evaluate(() => window.shortcutStudioEngine.currentTime), cue);
+    await page.keyboard.press("Space"); // cue -> play
+    await expectPlaying(true);
+    await page.keyboard.press("Space"); // play -> pause
+    await expectPlaying(false);
+  }
+  assert.equal(await page.evaluate(start => window.shortcutIpc.slice(start).filter(([command]) => command === "studio_save_project").length, initialIpc), 0, "Space on Save must not save the project");
+  assert.ok(await page.evaluate(() => !window.shortcutStudioStore.getState().project.tracks[0].mixer.mute), "Space on M must not mute the track");
+
+  // A new pointer cue cancels the return step from the previous pause.
+  await ruler.click({ position: { x: rulerBounds.width / 4, y: 8 } });
+  const draggedCue = await page.evaluate(() => window.shortcutStudioStore.getState().currentTime);
+  assert.ok(Math.abs(draggedCue - 15) < 0.1);
+  await page.keyboard.press("Space"); await expectPlaying(true);
+  await page.keyboard.press("Space"); await expectPlaying(false);
+  await page.keyboard.press("Space"); await expectPlaying(false);
+  assert.equal(await page.evaluate(() => window.shortcutStudioEngine.currentTime), draggedCue);
+
+  // A pending AudioContext resume is cancellable without a late restart.
+  await page.evaluate(() => {
+    const context = window.shortcutStudioEngine.context;
+    window.originalResume = context.resume.bind(context);
+    context.resume = () => new Promise(resolve => { window.finishResume = resolve; });
+  });
+  await page.keyboard.press("Space"); await expectPlaying(true);
+  await page.keyboard.press("Space"); await expectPlaying(false);
+  await page.keyboard.press("Space"); await expectPlaying(false);
+  await page.evaluate(() => { window.shortcutStudioEngine.context.resume = window.originalResume; window.finishResume(); });
+  assert.equal(await playing(), false);
+  assert.equal(await page.evaluate(() => window.shortcutStudioEngine.currentTime), draggedCue);
+  // Record preparation is locked even with a transport button focused.
+  await page.evaluate(() => window.shortcutStudioStore.getState().setRecordingTrackId("instrumental"));
   await page.keyboard.press("Space");
-  await expectPlaying(true);
-  await page.keyboard.press("Space");
-  await expectPlaying(false);
-  await play.focus();
-  await page.keyboard.press("Space");
-  await expectPlaying(true);
-  await pause.focus();
-  await page.keyboard.press("Space");
-  await expectPlaying(false);
+  assert.equal(await playing(), false);
+  await page.evaluate(() => window.shortcutStudioStore.getState().setRecordingTrackId(null));
 
   await page.getByRole("button", { name: "重命名工程", exact: true }).click();
   const title = page.getByRole("textbox", { name: "工程名称", exact: true });
@@ -251,7 +307,7 @@ try {
   assert.ok(await page.evaluate(() => window.shortcutIpc.some(([command, args]) => command === "studio_save_project" && args.project.title === "保存后播放")));
   console.log("App preview handoff PASS: confirmation, cancel, real player failure retained, no-save current mix with saved editor baseline, explicit save/reopen.");
   assert.deepEqual(errors, [], "no full-App runtime errors");
-  console.log("Studio shortcuts PASS: full App entry/exit, keyboard ownership, real studio audio, held/IME Space, range/native button focus, project/track text spaces, background shortcut isolation, MediaSession isolation/restoration.");
+  console.log("Studio shortcuts PASS: play/pause/return/play at nonzero cues, zoomed shade alignment, button/range focus ownership, held/IME Space, pending resume cancellation, recording lock, text input, background shortcut and MediaSession isolation/restoration.");
 } catch (error) {
   await page.screenshot({ path: fileURLToPath(new URL("failure.png", output)) });
   console.error("Browser errors:", errors);

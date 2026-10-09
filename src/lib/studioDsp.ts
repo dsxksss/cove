@@ -39,23 +39,37 @@ export function createTrackGraph(context: BaseAudioContext, destination: AudioNo
   const echo = context.createGain();
   const gain = context.createGain();
   const pan = context.createStereoPanner();
-  input.connect(low).connect(mid).connect(high).connect(compressor).connect(dry).connect(gain);
-  compressor.connect(reverb).connect(wet).connect(gain);
-  compressor.connect(delay).connect(echo).connect(gain);
-  delay.connect(feedback).connect(delay);
   gain.connect(pan).connect(destination);
   const nodes = [input, low, mid, high, compressor, dry, reverb, wet, delay, feedback, echo, gain, pan];
+  const effectNodes = [input, low, mid, high, compressor, dry, reverb, wet, delay, feedback, echo];
+  let routing = "";
   let decay = 0;
   return {
     input,
     update(track: StudioTrack, hasSolo: boolean) {
       const e = normalizeEffects(track.effects);
+      const enabled = [e.eq.lowDb !== 0, e.eq.midDb !== 0, e.eq.highDb !== 0, e.compressor.ratio > 1, e.reverb.mix > 0, e.delay.mix > 0];
+      const nextRouting = enabled.join(",");
+      if (routing !== nextRouting) {
+        // A neutral compressor still introduces lookahead. Disconnect unused
+        // effects completely, for identical dry playback and offline export.
+        effectNodes.forEach(node => node.disconnect());
+        let output: AudioNode = input;
+        [low, mid, high, compressor].forEach((node, index) => { if (enabled[index]) { output.connect(node); output = node; } });
+        output.connect(dry).connect(gain);
+        if (enabled[4]) output.connect(reverb).connect(wet).connect(gain);
+        if (enabled[5]) {
+          output.connect(delay).connect(echo).connect(gain);
+          delay.connect(feedback).connect(delay);
+        }
+        routing = nextRouting;
+      }
       input.gain.value = clamp(track.normalizationGain ?? 1, 0, 100);
       low.gain.value = e.eq.lowDb; mid.gain.value = e.eq.midDb; high.gain.value = e.eq.highDb;
       compressor.threshold.value = e.compressor.thresholdDb; compressor.ratio.value = e.compressor.ratio;
       compressor.attack.value = e.compressor.attackMs / 1000; compressor.release.value = e.compressor.releaseMs / 1000;
       dry.gain.value = 1 - e.reverb.mix; wet.gain.value = e.reverb.mix;
-      if (decay !== e.reverb.decaySec) { reverb.buffer = impulse(context, e.reverb.decaySec); decay = e.reverb.decaySec; }
+      if (e.reverb.mix > 0 && decay !== e.reverb.decaySec) { reverb.buffer = impulse(context, e.reverb.decaySec); decay = e.reverb.decaySec; }
       echo.gain.value = e.delay.mix; delay.delayTime.value = e.delay.timeMs / 1000; feedback.gain.value = e.delay.feedback;
       gain.gain.value = track.mixer.mute || (hasSolo && !track.mixer.solo) ? 0 : clamp(track.mixer.gain, 0, 2);
       // Fold the complete effect output before panning. Preserve the previous

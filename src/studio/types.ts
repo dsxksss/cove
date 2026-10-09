@@ -49,6 +49,7 @@ export type StudioTrack = {
   assets: StudioAsset[];
   mixer: { gain: number; pan: number; mute: boolean; solo: boolean; armed: boolean; channelMode?: "stereo" | "mono" };
   effects: StudioEffects;
+  effectsVersion?: 1;
 };
 
 export type StudioProject = {
@@ -72,8 +73,8 @@ export type StudioProject = {
 
 export const DEFAULT_EFFECTS: StudioEffects = {
   eq: { lowDb: 0, midDb: 0, highDb: 0 },
-  compressor: { thresholdDb: -18, ratio: 3, attackMs: 10, releaseMs: 120 },
-  reverb: { mix: 0.12, decaySec: 1.8 },
+  compressor: { thresholdDb: -18, ratio: 1, attackMs: 10, releaseMs: 120 },
+  reverb: { mix: 0, decaySec: 1.8 },
   delay: { mix: 0, timeMs: 180, feedback: 0.2 },
 };
 
@@ -113,6 +114,7 @@ export function createStudioProject(input: {
         assets: [],
         mixer: { gain: 1, pan: 0, mute: false, solo: false, armed: false },
         effects: structuredClone(DEFAULT_EFFECTS),
+        effectsVersion: 1,
       },
     ],
     createdAt: now,
@@ -132,6 +134,7 @@ export function createVocalTrack(index: number): StudioTrack {
     assets: [],
     mixer: { gain: 1, pan: 0, mute: false, solo: false, armed: false },
     effects: structuredClone(DEFAULT_EFFECTS),
+    effectsVersion: 1,
   };
 }
 
@@ -149,5 +152,6 @@ export function createReferenceTrack(stem: "original" | "vocals" = "original"): 
     // default. The user can unmute or solo it when needed.
     mixer: { gain: 1, pan: 0, mute: true, solo: false, armed: false },
     effects: structuredClone(DEFAULT_EFFECTS),
+    effectsVersion: 1,
   };
 }

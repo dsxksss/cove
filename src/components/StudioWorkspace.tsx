@@ -115,7 +115,7 @@ function EffectPanel({ track, onChange, onReset, clipboardSource, onCopy, onPast
       <div className="flex shrink-0 items-center gap-1">
         <button type="button" aria-label="复制效果器" title="复制此音轨的 EQ、压缩、混响和延迟设置" onClick={() => { onCopy(); setFeedback("copy"); }} className={actionClass}>{feedback === "copy" ? <Check size={11} className="text-lime-200" /> : <Copy size={11} />}复制</button>
         <button type="button" aria-label="粘贴效果器" title={clipboardSource ? `粘贴来自「${clipboardSource}」的效果器设置` : "请先从一条音轨复制效果器"} disabled={clipboardSource === undefined} onClick={() => { onPaste(); setFeedback("paste"); }} className={actionClass}>{feedback === "paste" ? <Check size={11} className="text-lime-200" /> : <ClipboardPaste size={11} />}粘贴</button>
-        <button type="button" aria-label="恢复默认效果" onClick={() => { onReset(); setFeedback(null); }} className={actionClass} title="恢复默认效果"><RotateCcw size={11} />默认</button>
+        <button type="button" aria-label="恢复默认效果" onClick={() => { onReset(); setFeedback(null); }} className={actionClass} title="重置为原声：关闭 EQ、压缩、混响和延迟"><RotateCcw size={11} />原声</button>
       </div>
     </div>
     <span className="sr-only" role="status">{feedback === "copy" ? `已复制「${track.name}」的效果器，可切换音轨粘贴` : feedback === "paste" ? `已将「${clipboardSource}」的效果器粘贴到「${track.name}」` : ""}</span>
@@ -200,6 +200,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [countdownValue, setCountdownValue] = useState<number | null>(null);
   const autoPrepareRef = useRef<string | null>(null);
   const [playbackStart, setPlaybackStart] = useState(0);
+  const spaceRewindPendingRef = useRef(false);
+  const spaceHandledRef = useRef(false);
   const [editingDuration, setEditingDuration] = useState<number | null>(null);
   const [timelineTool, setTimelineTool] = useState<"move" | "cut">("move");
   const [cutPreview, setCutPreview] = useState<{ clipId: string; trackId: string; timeSec: number } | null>(null);
@@ -313,6 +315,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setProjectTitleDraft(currentProject.title);
     setRenamingProject(false);
     setPlaybackStart(0); setEditingDuration(null);
+    spaceRewindPendingRef.current = false;
     setTimelineTool("move"); setCutPreview(null);
     scrubRef.current = null; clipDragRef.current = null; timelineDraggingRef.current = false;
     setScrubPlaying(false); setTimelineDragging(false); setLocalImportOpen(false);
@@ -391,7 +394,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const timer = window.setInterval(() => {
       const clock = engineRef.current?.currentTime ?? currentTime;
       setCurrentTime(clock);
-      if (!scrubRef.current && clock >= projectDuration && projectDuration > 0) { engineRef.current?.pause(); setPlaying(false); }
+      if (!scrubRef.current && clock >= projectDuration && projectDuration > 0) { engineRef.current?.pause(); setPlaying(false); spaceRewindPendingRef.current = true; }
     }, 50);
     return () => window.clearInterval(timer);
   }, [projectDuration, isPlaying, setCurrentTime, setPlaying]);
@@ -414,6 +417,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     scrubRef.current = { resume, projectId: useStudioStore.getState().project?.id ?? "" };
     setScrubPlaying(resume);
     engineRef.current?.pause();
+    spaceRewindPendingRef.current = false;
   }, []);
 
   const finishScrub = useCallback(() => {
@@ -450,6 +454,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     engineRef.current?.seek(next);
     setCurrentTime(next);
     setPlaybackStart(next);
+    spaceRewindPendingRef.current = false;
   }, [projectDuration, setCurrentTime]);
 
   const seekTimelineFromPointer = useCallback((clientX: number) => {
@@ -583,9 +588,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   const togglePlayback = useCallback(async () => {
     if (scrubRef.current || recordingTrackId) return;
-    if (engineRef.current?.isPlaying) { engineRef.current.pause(); setCurrentTime(engineRef.current.currentTime); return; }
+    if (engineRef.current?.isPlaying) { engineRef.current.pause(); setCurrentTime(engineRef.current.currentTime); spaceRewindPendingRef.current = true; return; }
     try {
-      const start = currentTime >= projectDuration ? (playbackStart < projectDuration ? playbackStart : 0) : currentTime;
+      const position = engineRef.current?.currentTime ?? currentTime;
+      const start = position >= projectDuration ? Math.min(playbackStart, projectDuration) : position;
+      spaceRewindPendingRef.current = false;
       setCurrentTime(start);
       await engineRef.current?.play(start);
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "音频播放失败"); }
@@ -593,26 +600,49 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   const restartPlayback = async () => {
     if (scrubRef.current || useStudioStore.getState().recordingTrackId) return;
-    const start = playbackStart < projectDuration ? playbackStart : 0;
+    const start = Math.min(playbackStart, projectDuration);
+    spaceRewindPendingRef.current = false;
     try { setCurrentTime(start); await engineRef.current?.play(start); }
     catch (error) { setNcmStatus(error instanceof Error ? error.message : "音频播放失败"); }
   };
 
+  const spacePlayback = useCallback(() => {
+    if (scrubRef.current || editLockedRef.current) return;
+    if (!engineRef.current?.isPlaying && spaceRewindPendingRef.current) {
+      const start = Math.min(playbackStart, projectDuration);
+      engineRef.current?.pause();
+      engineRef.current?.seek(start);
+      setCurrentTime(start);
+      spaceRewindPendingRef.current = false;
+      return;
+    }
+    void togglePlayback();
+  }, [playbackStart, projectDuration, setCurrentTime, togglePlayback]);
+
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
-      if (exitPromptOpen || trackTools || contextMenu) return;
       if (event.key !== " " && event.code !== "Space") return;
+      if (event.type === "keyup") {
+        if (spaceHandledRef.current) { event.preventDefault(); event.stopPropagation(); spaceHandledRef.current = false; }
+        return;
+      }
+      if (exitPromptOpen || trackTools || contextMenu || projectMenuOpen || exportMenuOpen || micMenuOpen || localImportOpen) return;
       if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
       const target = event.target instanceof Element ? event.target : null;
-      // Preserve typing and native controls. A focused play button already
-      // activates on Space keyup; handling it here as well would toggle twice.
-      if (target?.closest('input:not([type="range"]), textarea, select, button, summary, [contenteditable]:not([contenteditable="false"])')) return;
+      if (target?.closest('input:not([type="range"]):not([type="checkbox"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return;
+      // Space belongs to transport, even after clicking a different button.
+      // Capture both edges to prevent that button's native keyup click.
       event.preventDefault();
-      if (!event.repeat) void togglePlayback();
+      event.stopPropagation();
+      spaceHandledRef.current = true;
+      if (!event.repeat) spacePlayback();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlayback, exitPromptOpen, trackTools, contextMenu]);
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("keyup", onKey, true);
+    const release = () => { spaceHandledRef.current = false; };
+    window.addEventListener("blur", release);
+    return () => { window.removeEventListener("keydown", onKey, true); window.removeEventListener("keyup", onKey, true); window.removeEventListener("blur", release); };
+  }, [spacePlayback, exitPromptOpen, trackTools, contextMenu, projectMenuOpen, exportMenuOpen, micMenuOpen, localImportOpen]);
 
   const queueAssetWrite = (projectId: string, assetId: string, write: () => Promise<unknown>) => {
     const key = `${projectId}:${assetId}`;
@@ -1255,7 +1285,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                   </div>
                 </div>)}
               </div>
-              <div className="pointer-events-none absolute bottom-0 top-3 w-px border-l border-dashed border-white/25" title="播放起点" style={{ left: `${Math.min(100, playbackStart / timelineDuration * 100)}%` }} />
+              <div aria-hidden="true" data-studio-played-range="" className="pointer-events-none absolute bottom-0 top-2 z-[5] bg-lime-200/[0.06]" style={{ left: `${Math.min(100, playbackStart / timelineDuration * 100)}%`, width: `${Math.max(0, Math.min(currentTime, timelineDuration) - playbackStart) / timelineDuration * 100}%` }} />
+              <div className="pointer-events-none absolute bottom-0 top-3 z-[6] w-px border-l border-dashed border-white/25" title="播放起点" style={{ left: `${Math.min(100, playbackStart / timelineDuration * 100)}%` }} />
               <div className="pointer-events-none absolute bottom-0 top-2 z-10 w-px -translate-x-1/2 bg-lime-200/75" style={{ left: playheadLeft }} />
               <button type="button" aria-label="拖拽时间线播放头" disabled={Boolean(recordingTrackId)}
                 onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); timelineRef.current?.focus(); beginScrub(); timelineDraggingRef.current = true; setTimelineDragging(true); seekTimelineFromPointer(event.clientX); }}
@@ -1265,7 +1296,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             </div>
           </div>
           <div className="mt-3 flex shrink-0 flex-wrap items-center gap-3" aria-label="播放控制">
-            <button type="button" aria-label={isPlaying || scrubPlaying ? "暂停工作室播放" : "播放工作室"} disabled={Boolean(recordingTrackId)} onClick={() => void togglePlayback()} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-white text-slate-950 disabled:opacity-50">{isPlaying || scrubPlaying ? <Pause size={18} /> : <Play size={18} fill="currentColor" />}</button>
+            <button type="button" aria-label={isPlaying || scrubPlaying ? "暂停工作室播放" : "播放工作室"} aria-keyshortcuts="Space" title="空格：播放 → 暂停 → 回到定位起点 → 播放" disabled={Boolean(recordingTrackId)} onClick={() => void togglePlayback()} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-white text-slate-950 disabled:opacity-50">{isPlaying || scrubPlaying ? <Pause size={18} /> : <Play size={18} fill="currentColor" />}</button>
             <button type="button" disabled={Boolean(recordingTrackId)} onClick={() => void restartPlayback()} title={`从 ${formatPreciseTime(playbackStart)} 重新播放`} className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 text-white/70 hover:bg-white/15 disabled:opacity-50" aria-label="重新播放"><RotateCcw size={15} /></button>
             <span className="whitespace-nowrap font-mono text-xs text-white/55">{formatTime(currentTime)} / {formatTime(projectDuration)}</span>
             <input aria-label="工作室进度" disabled={Boolean(recordingTrackId)} type="range" min="0" max={Math.max(projectDuration, 1)} step="0.01" value={Math.min(currentTime, projectDuration || 1)}
