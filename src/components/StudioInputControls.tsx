@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown, Mic2, Plus, Square } from "lucide-react";
 import type { StudioInputLevel } from "../lib/studioRecorder";
 
@@ -23,18 +24,57 @@ type Props = {
 
 export function StudioInputControls(props: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
+  const popupRef = useRef<HTMLDivElement>(null);
+  const menuChangeRef = useRef(props.onMenuChange); menuChangeRef.current = props.onMenuChange;
+  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number; width: number; maxHeight: number; transform: string } | null>(null);
+  useLayoutEffect(() => {
+    if (!props.menuOpen) { setMenuPosition(null); return; }
+    const position = () => {
+      const anchor = menuRef.current, bounds = anchor?.getBoundingClientRect();
+      if (!anchor || !bounds) return;
+      let visibleTop = 0, visibleBottom = innerHeight;
+      for (let parent = anchor.parentElement; parent; parent = parent.parentElement) {
+        if (/(auto|scroll|hidden|clip)/.test(getComputedStyle(parent).overflowY)) {
+          const rect = parent.getBoundingClientRect();
+          visibleTop = Math.max(visibleTop, rect.top); visibleBottom = Math.min(visibleBottom, rect.bottom);
+        }
+      }
+      if (bounds.bottom <= visibleTop || bounds.top >= visibleBottom) { menuChangeRef.current(false); return; }
+      const above = bounds.top - 16, below = innerHeight - bounds.bottom - 16;
+      const useAbove = above >= Math.min(224, below);
+      const maxHeight = Math.max(40, Math.min(224, useAbove ? above : below));
+      const width = Math.min(innerWidth - 24, Math.max(280, bounds.width));
+      setMenuPosition({ left: Math.max(12, Math.min(bounds.left, innerWidth - width - 12)), top: useAbove ? bounds.top - 8 : bounds.bottom + 8, width, maxHeight, transform: useAbove ? "translateY(-100%)" : "none" });
+    };
+    position();
+    // Native focus scrolling can finish just after the opening click. Follow
+    // the anchor instead of immediately dismissing the newly opened menu.
+    const scroll = (event: Event) => { if (!popupRef.current?.contains(event.target as Node)) position(); };
+    document.addEventListener("scroll", scroll, true);
+    window.addEventListener("resize", position);
+    return () => { document.removeEventListener("scroll", scroll, true); window.removeEventListener("resize", position); };
+  }, [props.menuOpen]);
+  const menuReady = props.menuOpen && !!menuPosition;
+  useEffect(() => {
+    if (!menuReady) return;
+    const selected = popupRef.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]');
+    const item = selected ?? popupRef.current?.querySelector<HTMLButtonElement>("button");
+    item?.focus({ preventScroll: true });
+    if (item && popupRef.current) popupRef.current.scrollTop = item.offsetTop - popupRef.current.clientHeight / 2 + item.offsetHeight / 2;
+  }, [menuReady]);
+  const focusTrigger = () => menuRef.current?.querySelector("button")?.focus({ preventScroll: true });
   useEffect(() => {
     if (!props.menuOpen) return;
     const dismiss = (event: PointerEvent) => {
-      if (!menuRef.current?.contains(event.target as Node)) props.onMenuChange(false);
+      if (!menuRef.current?.contains(event.target as Node) && !popupRef.current?.contains(event.target as Node)) props.onMenuChange(false);
     };
-    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") props.onMenuChange(false); };
+    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") { props.onMenuChange(false); focusTrigger(); } };
     document.addEventListener("pointerdown", dismiss);
     document.addEventListener("keydown", escape);
     return () => { document.removeEventListener("pointerdown", dismiss); document.removeEventListener("keydown", escape); };
   }, [props.menuOpen, props.onMenuChange]);
 
-  const choose = (id: string) => { if (props.recording || props.saving) return; props.onDeviceChange(id); props.onMenuChange(false); };
+  const choose = (id: string) => { if (props.recording || props.saving) return; props.onDeviceChange(id); props.onMenuChange(false); focusTrigger(); };
   // Windows reports the default device both as an alias and in the device list.
   const devices = props.devices.filter((device) => device.deviceId && device.deviceId !== "default");
   if (!props.targetName && !props.recording) return <section aria-label="录音控制" className="rounded-xl border border-dashed border-white/15 bg-white/[0.025] p-3">
@@ -52,14 +92,22 @@ export function StudioInputControls(props: Props) {
         <Mic2 size={14} className="shrink-0 text-white/40" /><span className="min-w-0 flex-1 truncate">{props.deviceLabel}</span>
         <ChevronDown size={14} className={`shrink-0 transition-transform ${props.menuOpen ? "rotate-180" : ""}`} />
       </button>
-      {props.menuOpen && !props.recording && <div role="menu" aria-label="选择麦克风" className="absolute inset-x-0 bottom-full z-[100] mb-2 max-h-56 overflow-y-auto rounded-xl border border-white/12 bg-slate-900 p-1.5 shadow-2xl">
+      {props.menuOpen && !props.recording && menuPosition && createPortal(<div ref={popupRef} role="menu" aria-label="选择麦克风" style={menuPosition} onKeyDown={(event) => {
+        if (event.key === "Tab") { props.onMenuChange(false); focusTrigger(); return; }
+        if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const items = Array.from(popupRef.current?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+        const index = items.indexOf(document.activeElement as HTMLButtonElement);
+        const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
+      }} className="fixed z-[200] overflow-y-auto overscroll-y-contain rounded-xl border border-white/12 bg-slate-900 p-1.5 shadow-2xl">
         {[{ deviceId: "default", label: "默认麦克风" }, ...devices].map((device) => <button key={device.deviceId}
           type="button" role="menuitemradio" aria-checked={props.deviceId === device.deviceId}
           onClick={() => choose(device.deviceId)} title={device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}
           className={`block w-full whitespace-normal break-words rounded-lg px-3 py-2.5 text-left text-xs leading-5 transition hover:bg-white/10 ${props.deviceId === device.deviceId ? "bg-lime-200/10 text-lime-100" : "text-white/70"}`}>
           {device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}
         </button>)}
-      </div>}
+      </div>, document.body)}
     </div>
     <div className="flex items-center gap-2">
       <div className="min-w-16 flex-1 rounded-lg bg-black/15 px-2 py-1.5" aria-label="麦克风输入电平" title="录音时显示真实输入电平">

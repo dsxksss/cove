@@ -41,7 +41,7 @@ export function StudioInstrumentalPopover({ open, busy, status, onOpenChange, ch
       {busy && <span className="sr-only">正在处理伴奏，点击查看进度</span>}
     </button>
     {open && <div ref={panel} id={id} role="dialog" aria-label="伴奏输入" tabIndex={-1}
-      className="absolute right-0 top-full z-[120] mt-2 max-h-[calc(100vh-96px)] w-80 max-w-[calc(100vw-40px)] space-y-3 overflow-y-auto rounded-2xl border border-white/12 bg-slate-900/95 p-4 shadow-2xl backdrop-blur-xl outline-none">
+      className="absolute right-0 top-full z-[120] mt-2 max-h-[calc(100vh-96px)] w-80 max-w-[calc(100vw-40px)] space-y-3 overflow-y-auto overscroll-y-contain rounded-2xl border border-white/12 bg-slate-900/95 p-4 shadow-2xl backdrop-blur-xl outline-none">
       <div className="flex items-center justify-between gap-2"><div><h2 className="text-xs font-bold text-white/85">伴奏输入</h2><p className="mt-1 text-[10px] text-white/40">导入音频或重新生成当前歌曲的伴奏</p></div><button type="button" aria-label="关闭伴奏输入" onClick={() => { onOpenChange(false); trigger.current?.focus({ preventScroll: true }); }} className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-white/40 hover:bg-white/10 hover:text-white"><X size={14} /></button></div>
       {children}
     </div>}

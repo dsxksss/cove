@@ -182,6 +182,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [savingRecording, setSavingRecording] = useState(false);
   const countdownAbortRef = useRef(false);
   const [selectedTrackId, setSelectedTrackId] = useState("instrumental");
+  const lyricViewportRef = useRef<HTMLDivElement>(null);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [ncmStatus, setNcmStatus] = useState<string | null>(null);
   const [instrumentalOpen, setInstrumentalOpen] = useState(false);
@@ -601,6 +602,21 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       index: start + offset,
     }));
   }, [currentProject.lyrics, lyricIndex]);
+
+  useEffect(() => {
+    const viewport = lyricViewportRef.current;
+    const active = viewport?.querySelector<HTMLElement>('[aria-current="true"]');
+    if (!viewport || !active) return;
+    const center = () => {
+      const top = active.getBoundingClientRect().top - viewport.getBoundingClientRect().top + viewport.scrollTop;
+      // Follow lyrics inside their own panel, never scroll the workspace.
+      viewport.scrollTop = Math.max(0, top - (viewport.clientHeight - active.offsetHeight) / 2);
+    };
+    center();
+    const resize = new ResizeObserver(center);
+    resize.observe(viewport);
+    return () => resize.disconnect();
+  }, [lyricIndex, currentProject.id]);
 
   const togglePlayback = useCallback(async () => {
     if (scrubRef.current || recordingTrackId) return;
@@ -1192,7 +1208,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       <button type="button" disabled={savingProject || Boolean(recordingTrackId)} onClick={() => void saveProject()} className="flex items-center gap-1.5 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/15 disabled:opacity-40"><Save size={14} />{savingProject ? "保存中…" : "保存"}</button>
       <div className="relative no-drag">
         <button type="button" disabled={Boolean(recordingTrackId) || savingProject || exporting || processingTrack} title={recordingTrackId ? "请先停止录音" : undefined} aria-haspopup="menu" aria-expanded={projectMenuOpen} onClick={() => { setProjectMenuOpen((open) => !open); setMicMenuOpen(false); setExportMenuOpen(false); }} className="flex items-center justify-between gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/75 transition hover:bg-white/15 disabled:opacity-40"><span>工程</span><ChevronDown size={14} className={`transition-transform ${projectMenuOpen ? "rotate-180" : ""}`} /></button>
-        {projectMenuOpen && <div role="menu" className="absolute right-0 top-full z-[100] mt-2 max-h-60 w-64 overflow-y-auto rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
+        {projectMenuOpen && <div role="menu" aria-label="工程列表" className="absolute right-0 top-full z-[100] mt-2 max-h-60 w-64 overflow-y-auto overscroll-y-contain rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
           <p className="px-3 pt-2 text-[10px] text-white/35">打开本地工程</p>
           <button type="button" role="menuitem" onClick={() => void importProjectPackage()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-bold text-lime-100/80 hover:bg-lime-200/10"><Upload size={13} />导入 .cove-studio 工程包</button>
           <p className="px-3 pb-2 text-[10px] leading-relaxed text-white/25">新工程点击“保存”后才会出现在这里</p>
@@ -1232,9 +1248,9 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       {taskStatus}
     </div>}
     <div className="flex min-h-0 flex-1">
-      <aside className="flex w-72 shrink-0 flex-col gap-3 overflow-y-auto border-r border-white/10 p-4">
-        <div className="flex items-center justify-between gap-2"><span className="text-[11px] font-black tracking-[0.16em] text-white/35">轨道</span><button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} onClick={createAndSelectVocal} className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-[11px] font-bold text-white/70 hover:bg-white/15 disabled:opacity-40"><Plus size={13} />人声轨</button></div>
-        <div className="grid grid-cols-3 gap-1.5" aria-label="参考音轨导入">
+      <aside className="flex min-h-0 w-72 shrink-0 flex-col gap-3 overflow-hidden border-r border-white/10 p-4">
+        <div className="flex shrink-0 items-center justify-between gap-2"><span className="text-[11px] font-black tracking-[0.16em] text-white/35">轨道</span><button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} onClick={createAndSelectVocal} className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-[11px] font-bold text-white/70 hover:bg-white/15 disabled:opacity-40"><Plus size={13} />人声轨</button></div>
+        <div className="grid shrink-0 grid-cols-3 gap-1.5" aria-label="参考音轨导入">
           <button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} title="导入整首原曲作为参考轨" onClick={() => void importOriginalCurrentSong()} className="rounded-lg bg-white/8 px-2 py-2 text-[11px] font-bold text-white/65 hover:bg-white/15 disabled:opacity-40">原曲</button>
           <button type="button" aria-label="原曲人声参考" title="导入分离出的原唱人声作为参考轨" disabled={loadingVocals || Boolean(jobId) || Boolean(recordingTrackId) || processingTrack || exporting} onClick={() => void importVocalReference()} className="rounded-lg bg-white/8 px-1 py-2 text-[11px] font-bold text-white/65 hover:bg-white/15 disabled:opacity-40">{loadingVocals ? "提取中…" : "原曲人声"}</button>
           <div ref={localImportRef} className="relative min-w-0">
@@ -1247,16 +1263,16 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             <input ref={localVocalsRef} aria-label="选择本地歌曲提取人声" type="file" accept="audio/*,.ncm,.mp3,.flac,.wav" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importVocalReference(file); event.currentTarget.value = ""; }} />
           </div>
         </div>
-        <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} recording={editLocked} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} onContextMenu={(event) => openContextMenu(event, track.id)} onOpenDetails={(element) => openTrackTools(track.id, element)} />)}</div>
+        <div aria-label="音轨列表" className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-y-contain [scrollbar-width:thin]">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} recording={editLocked} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} onContextMenu={(event) => openContextMenu(event, track.id)} onOpenDetails={(element) => openTrackTools(track.id, element)} />)}</div>
       </aside>
-      <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">
-        <div className="flex min-h-[288px] flex-1 flex-col px-5 pt-4 pb-3">
+      <main aria-label="工作室编辑区" className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex min-h-0 flex-1 flex-col px-5 pt-4 pb-3">
           <div onKeyDown={(event) => {
             if (editLocked || editingDuration !== null || event.defaultPrevented || event.repeat || event.nativeEvent.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
             if ((event.target as HTMLElement).closest('input,textarea,select,[contenteditable="true"]')) return;
             const key = event.key.toLowerCase();
             if (key === "c" || key === "v" || (key === "escape" && timelineTool === "cut")) { event.preventDefault(); event.stopPropagation(); chooseTimelineTool(key === "c" ? "cut" : "move"); }
-          }} className="relative flex min-h-52 flex-1 flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/20">
+          }} className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/20">
             <div className="flex min-h-9 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-white/5 px-3 py-1 text-[10px] text-white/40">
               <div role="group" aria-label="时间线编辑工具" className="flex shrink-0 items-center gap-1">
                 <button type="button" aria-label="移动工具" aria-pressed={timelineTool === "move"} aria-keyshortcuts="V" title="移动片段（V）；拖动左右细线裁剪" disabled={editLocked || editingDuration !== null} onClick={() => chooseTimelineTool("move")} className={`flex items-center gap-1 rounded px-2 py-1 disabled:opacity-30 ${timelineTool === "move" ? "bg-white/10 text-white/85" : "hover:bg-white/5"}`}><MousePointer2 size={12} />移动</button>
@@ -1265,7 +1281,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
               <span className="min-w-0 truncate" title="拖动定位后暂停，播放和重新播放从定位点开始">起点 <span className="font-mono text-lime-100/70" aria-label="播放起点">{formatPreciseTime(playbackStart)}</span></span>
               <div className="flex shrink-0 items-center gap-1"><span className="mr-1 hidden xl:inline">Ctrl + 滚轮缩放</span><button type="button" aria-label="缩小时间轴" title="Ctrl + 滚轮缩放" disabled={Boolean(recordingTrackId) || timelineZoom <= 1} onClick={() => changeZoom(timelineZoom / 1.5)} className="rounded p-1 hover:bg-white/10 disabled:opacity-30"><Minus size={12} /></button><button type="button" aria-label="重置时间轴缩放" title="显示完整歌曲" disabled={Boolean(recordingTrackId)} onClick={() => changeZoom(1)} className="w-10 rounded py-1 font-mono hover:bg-white/10">{Math.round(timelineZoom * 100)}%</button><button type="button" aria-label="放大时间轴" title="Ctrl + 滚轮缩放" disabled={Boolean(recordingTrackId) || timelineZoom >= 64} onClick={() => changeZoom(timelineZoom * 1.5)} className="rounded p-1 hover:bg-white/10 disabled:opacity-30"><Plus size={12} /></button></div>
             </div>
-            <div ref={timelineViewportRef} aria-label="时间轴视图" className="relative min-h-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:thin]">
+            <div ref={timelineViewportRef} aria-label="时间轴视图" className="relative min-h-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain [scrollbar-width:thin]">
             <div className="relative h-full" style={{ width: `${timelineZoom * 100}%` }}>
             <div ref={timelineRef} role="slider" tabIndex={0} aria-label="时间线播放头" aria-disabled={Boolean(recordingTrackId)}
               aria-valuemin={0} aria-valuemax={Math.max(projectDuration, 1)} aria-valuenow={Math.round(currentTime * 100) / 100}
@@ -1282,7 +1298,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
               }}
               className={`absolute inset-x-4 inset-y-3 touch-none select-none ${timelineDragging ? "cursor-grabbing" : "cursor-crosshair"}`}>
               {Array.from({ length: Math.ceil(timelineZoom * 4) + 1 }, (_, tick) => { const fraction = tick / Math.ceil(timelineZoom * 4); return <div key={tick} className="pointer-events-none absolute bottom-0 top-5" style={{ left: `${fraction * 100}%` }} aria-hidden="true"><span className={`absolute whitespace-nowrap font-mono text-[10px] text-white/30 ${fraction === 1 ? "-translate-x-full" : fraction === 0 ? "" : "-translate-x-1/2"}`}>{timelineZoom > 1 ? formatPreciseTime(fraction * timelineDuration) : formatTime(fraction * timelineDuration)}</span><span className="absolute bottom-0 top-6 w-px bg-white/5" /></div>; })}
-              <div className="absolute inset-x-0 bottom-0 top-12 space-y-3 overflow-y-auto py-1 [scrollbar-width:thin]" aria-label="音轨片段">
+              <div className="absolute inset-x-0 bottom-0 top-12 space-y-3 overflow-y-auto overscroll-y-contain py-1 [scrollbar-width:thin]" aria-label="音轨片段">
                 {currentProject.tracks.map((track) => <div key={track.id} className="space-y-1" onPointerDown={(event) => { if (event.button === 0) event.stopPropagation(); }} onClick={() => setSelectedTrackId(track.id)} onContextMenu={(event) => openContextMenu(event, track.id)} onDoubleClick={(event) => { event.stopPropagation(); openTrackTools(track.id, timelineRef.current ?? undefined); }}>
                   <p className="truncate text-[10px] font-bold text-white/40">{track.name}</p>
                   <div className="relative h-12 rounded-lg bg-white/[0.035]">
@@ -1332,24 +1348,24 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
             <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-white/45"><Headphones size={14} />耳机监听<input type="checkbox" checked={monitorInput} onChange={(event) => setMonitorInput(event.target.checked)} className="accent-lime-200" /></label>
           </div>
         </div>
-        <div className="grid shrink-0 grid-cols-1 gap-4 border-t border-white/10 px-5 py-3 lg:grid-cols-[minmax(0,1fr)_320px]">
-          <section className="flex min-h-[190px] min-w-0 flex-1 flex-col rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3" aria-label="同步歌词">
-            <div className="mb-2 flex items-center justify-between gap-2 text-[10px] font-black tracking-[0.15em] text-white/35">
+        <div className="grid h-[360px] max-h-[60%] min-h-0 shrink-0 grid-cols-1 grid-rows-[minmax(0,0.8fr)_minmax(0,1.2fr)] gap-4 border-t border-white/10 px-5 py-3 lg:grid-cols-[minmax(0,1fr)_320px] lg:grid-rows-[minmax(0,1fr)]">
+          <section className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3" aria-label="同步歌词">
+            <div className="mb-2 flex shrink-0 items-center justify-between gap-2 text-[10px] font-black tracking-[0.15em] text-white/35">
               <span>同步歌词</span>
               <span className="font-mono tracking-normal text-white/25">{lyricIndex >= 0 ? `${lyricIndex + 1}/${currentProject.lyrics.length}` : "等待播放"}</span>
             </div>
-            {lyricRows.length > 0 ? <div className="flex min-h-0 flex-1 flex-col justify-center gap-2 overflow-hidden">
+            {lyricRows.length > 0 ? <div ref={lyricViewportRef} aria-label="歌词内容" className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain [scrollbar-width:thin]"><div className="flex min-h-full flex-col justify-center gap-2 py-1">
               {lyricRows.map(({ line, index }) => {
                 const active = index === lyricIndex;
-                return <button key={`${index}-${line.time}`} type="button" onClick={() => { seekTo(line.time); }} className={`group w-full rounded-xl px-3 py-2 text-left transition ${active ? "bg-lime-200/10 ring-1 ring-lime-200/25" : "hover:bg-white/[0.04]"}`}>
+                return <button key={`${index}-${line.time}`} type="button" aria-current={active ? "true" : undefined} onClick={() => { seekTo(line.time); }} className={`group w-full shrink-0 rounded-xl px-3 py-2 text-left transition ${active ? "bg-lime-200/10 ring-1 ring-lime-200/25" : "hover:bg-white/[0.04]"}`}>
                   <div className={`truncate text-sm font-bold leading-5 ${active ? "text-lime-100" : index < lyricIndex ? "text-white/35" : "text-white/60"}`}>{line.text || "♪"}</div>
                   {line.tr && <div className={`mt-0.5 truncate text-[11px] leading-4 ${active ? "text-lime-100/55" : "text-white/25"}`}>{line.tr}</div>}
                   <span className="sr-only">{formatTime(line.time)}</span>
                 </button>;
               })}
-            </div> : <div className="flex flex-1 items-center rounded-xl bg-white/[0.035] px-4 text-sm font-bold text-white/45">导入伴奏后开始录制，歌词会跟随原曲时间线</div>}
+            </div></div> : <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain rounded-xl bg-white/[0.035] px-4 py-3 text-sm font-bold text-white/45">导入伴奏后开始录制，歌词会跟随原曲时间线</div>}
           </section>
-          <div className="min-w-0 space-y-3">
+          <div aria-label="混音与录音设置" className="min-h-0 min-w-0 space-y-3 overflow-y-auto overscroll-y-contain [scrollbar-width:thin]">
             {selectedTrack && <EffectPanel key={`${currentProject.id}:${selectedTrack.id}`} track={selectedTrack} onChange={(effects) => updateEffects(selectedTrack.id, effects)} onReset={() => resetEffects(selectedTrack.id)} clipboardSource={effectsClipboard?.sourceName} onCopy={() => copyEffects(selectedTrack.id)} onPaste={() => pasteEffects(selectedTrack.id)} />}
             <StudioInputControls devices={devices} deviceId={inputDeviceId} deviceLabel={micLabel} menuOpen={micMenuOpen}
               targetName={recordingTarget?.name} hasVocalTracks={currentProject.tracks.some(track => track.kind === "vocal")} blocked={processingTrack || exporting || savingProject}

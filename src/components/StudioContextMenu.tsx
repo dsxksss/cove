@@ -31,7 +31,7 @@ export function StudioContextMenu({ x, y, title, items, onClose }: { x: number; 
       const index = controls.indexOf(document.activeElement as HTMLButtonElement);
       const next = event.key === "Home" ? 0 : event.key === "End" ? controls.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + controls.length) % controls.length;
       controls[next]?.focus();
-    }} style={position} className="fixed z-[300] max-h-[calc(100vh-16px)] w-60 overflow-y-auto rounded-xl border border-white/15 bg-slate-900 p-1.5 text-xs text-white/80 shadow-2xl">
+    }} style={position} className="fixed z-[300] max-h-[calc(100vh-16px)] w-60 overflow-y-auto overscroll-y-contain rounded-xl border border-white/15 bg-slate-900 p-1.5 text-xs text-white/80 shadow-2xl">
     <p className="truncate px-3 py-2 text-[10px] font-bold text-white/35" title={title}>{title}</p>
     {items.map(item => <div key={item.id} className={item.separator ? "mt-1 border-t border-white/10 pt-1" : undefined}>
       <button type="button" aria-label={item.label} role={item.checked === undefined ? "menuitem" : "menuitemcheckbox"} aria-checked={item.checked} disabled={item.disabled} onClick={() => { onClose(true); item.action(); }}
