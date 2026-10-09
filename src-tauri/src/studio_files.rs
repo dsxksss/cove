@@ -263,9 +263,13 @@ pub fn studio_cache_remove(cache_id: String) -> Result<(), String> {
 }
 
 fn safe_cache_name(name: &str) -> String {
-    let candidate = Path::new(name).file_name().and_then(|value| value.to_str()).unwrap_or("instrumental.wav");
-    let clean = candidate.chars().map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ' | '(' | ')') { ch } else { '_' }).collect::<String>();
-    if clean.is_empty() { "instrumental.wav".into() } else { clean }
+    // This is display metadata, never a disk path. Keep song names and their
+    // punctuation intact; actual cache paths use validated IDs and fixed names.
+    // Recognize both path separators even when reading Windows names elsewhere.
+    let candidate = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let clean = candidate.chars().filter(|ch| !ch.is_control()).collect::<String>();
+    let clean = clean.trim();
+    if clean.is_empty() || matches!(clean, "." | "..") { "instrumental.wav".into() } else { clean.into() }
 }
 #[tauri::command]
 pub fn studio_save_project(project: Value) -> Result<(), String> {
@@ -545,6 +549,41 @@ mod tests {
         assert_eq!(stem_cache_names(None).unwrap(), ("meta.json", "instrumental.audio"));
         assert_eq!(stem_cache_names(Some("vocals")).unwrap(), ("vocals.meta.json", "vocals.audio"));
         assert!(stem_cache_names(Some("../vocals")).is_err());
+    }
+    #[test]
+    fn cache_display_names_preserve_unicode_and_song_punctuation() {
+        for name in [
+            "夜空中最亮的星 (伴奏).wav",
+            "サンキュー!! (伴奏).wav",
+            "Beyoncé & Jay-Z – Déjà Vu [Live] (Vocals).wav",
+            "What's Next?：现场版 💛 (人声).wav",
+        ] {
+            let meta = json!({ "name": safe_cache_name(name), "version": 1 });
+            let persisted: Value = serde_json::from_slice(&serde_json::to_vec(&meta).unwrap()).unwrap();
+            assert_eq!(persisted["name"].as_str(), Some(name));
+        }
+    }
+    #[test]
+    fn cache_display_names_strip_directory_components_on_both_platforms() {
+        for (input, expected) in [
+            (r"C:\音乐\サンキュー!! (伴奏).wav", "サンキュー!! (伴奏).wav"),
+            ("../转换/夜空 (伴奏).wav", "夜空 (伴奏).wav"),
+            (r"\\server\share\现场 (人声).wav", "现场 (人声).wav"),
+            (r"folder\mixed/歌曲.wav", "歌曲.wav"),
+        ] {
+            assert_eq!(safe_cache_name(input), expected);
+        }
+        // Display-name cleanup must not relax the IDs used for actual paths.
+        assert!(component("../歌曲").is_err());
+        assert_eq!(stem_cache_names(None).unwrap().1, "instrumental.audio");
+        assert_eq!(stem_cache_names(Some("vocals")).unwrap().1, "vocals.audio");
+    }
+    #[test]
+    fn cache_display_names_remove_controls_and_fall_back_for_empty_components() {
+        assert_eq!(safe_cache_name("  \0夜\u{0007}空\r\n (伴奏).wav  "), "夜空 (伴奏).wav");
+        for name in ["", " \t\r\n", "\0", "/", r"C:\music\", ".", "..", "dir/.", "dir/.."] {
+            assert_eq!(safe_cache_name(name), "instrumental.wav");
+        }
     }
     #[test]
     fn exports_only_declared_assets_after_replacement() {

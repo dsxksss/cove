@@ -444,6 +444,26 @@ try {
     await page.screenshot({ path: fileURLToPath(new URL(`${width}-cut-trim.png`, output)) });
   }
   console.log("Cut/export PASS: narrow trim markers, negative-offset left trim, zoomed/scrolled cut preview and click, C/V/Escape and S, no empty boundary clips, delete/save halves, real WAV duration and audible final samples.");
+  // Existing projects must show their song name rather than the cache's old
+  // ASCII-only filename, and the workspace must use larger window dimensions.
+  await page.evaluate(() => {
+    const state = window.studioStore.getState();
+    const project = structuredClone(state.project);
+    project.title = "サンキュー!!";
+    project.tracks[0].assets[0].name = "_______ (__).wav";
+    project.instrumental.name = "_______ (__).wav";
+    state.setProject(project);
+  });
+  await page.getByText("サンキュー!! (伴奏).wav", { exact: true }).first().waitFor();
+  assert.equal(await page.getByText("_______ (__).wav", { exact: true }).count(), 0);
+  for (const [width, height] of [[1440, 900], [1920, 1080]]) {
+    await page.setViewportSize({ width, height });
+    const viewportBox = await viewport.boundingBox();
+    assert.ok(viewportBox.width > 1000, "studio timeline expands with the larger window");
+    assert.ok(viewportBox.height > 250, "studio timeline can use taller windows");
+    await page.screenshot({ path: fileURLToPath(new URL(`${width}-unicode-workspace.png`, output)) });
+  }
+  console.log("Window/name PASS: 1440x900 and 1920x1080 workspace layouts, legacy cached stem display restored in cards and clips.");
   assert.deepEqual(errors, []);
   console.log("Studio UI PASS: reference inputs, recording guidance, locate/restart, zoom/move/trim, contextual track/clip actions and recording locks, precise split/duplicate, double-click details without audio interruption, volume/pan/mono, effect paste/reset, rename cancellation, save, 1080/900 layout, real Web Audio output.");
 } catch (error) {

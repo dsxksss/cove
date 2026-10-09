@@ -14,6 +14,7 @@ import { downloadStudioOriginal, resolveStudioSourceUrl } from "../studio/source
 import type { StudioAsset, StudioClip, StudioEffects, StudioProject, StudioTrack } from "../studio/types";
 import { getProjectDuration, hasAudibleClips, scheduledClip } from "../lib/studioSchedule";
 import { canSplitStudioClip } from "../studio/clipEditing";
+import { studioStemName } from "../studio/assetNames";
 
 type Props = {
   project: StudioProject;
@@ -824,12 +825,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                 const audio = await invokeNative<{ name: string; base64: string }>("studio_job_audio", { jobId: started.jobId });
                 if (!isCurrentProject(projectId)) { resolve(); return; }
                 const bytes = Uint8Array.from(atob(audio.base64), (char) => char.charCodeAt(0));
-                if (target === "instrumental") await importAudio(new File([bytes], audio.name, { type: audio.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav" }));
+                const audioName = studioStemName(currentProject.title, "instrumental", audio.name);
+                if (target === "instrumental") await importAudio(new File([bytes], audioName, { type: audio.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav" }));
                 if (!isCurrentProject(projectId)) { resolve(); return; }
                 try {
                   await invokeNative("studio_cache_write", {
                     cacheId: instrumentalCacheId(currentProject),
-                    name: audio.name,
+                    name: audioName,
                     mimeType: audio.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav",
                     inputBase64: audio.base64,
                   });
@@ -841,11 +843,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                 if (status.vocalOutputPath) {
                   const vocals = await invokeNative<{ name: string; base64: string }>("studio_job_audio", { jobId: started.jobId, stem: "vocals" });
                   if (!isCurrentProject(projectId)) { resolve(); return; }
-                  try { await invokeNative("studio_cache_write", { cacheId: instrumentalCacheId(currentProject), stem: "vocals", name: vocals.name, mimeType: "audio/wav", inputBase64: vocals.base64 }); } catch { /* importing remains possible without a shared cache */ }
+                  const vocalName = studioStemName(currentProject.title, "vocals", vocals.name);
+                  try { await invokeNative("studio_cache_write", { cacheId: instrumentalCacheId(currentProject), stem: "vocals", name: vocalName, mimeType: "audio/wav", inputBase64: vocals.base64 }); } catch { /* importing remains possible without a shared cache */ }
                   if (!isCurrentProject(projectId)) { resolve(); return; }
                   if (target === "vocals") {
                     const trackId = addReferenceTrack("vocals");
-                    if (trackId) await importAudio(new File([Uint8Array.from(atob(vocals.base64), ch => ch.charCodeAt(0))], vocals.name, { type: "audio/wav" }), trackId);
+                    if (trackId) await importAudio(new File([Uint8Array.from(atob(vocals.base64), ch => ch.charCodeAt(0))], vocalName, { type: "audio/wav" }), trackId);
                   }
                 } else if (target === "vocals") throw new Error("运行包未输出人声，请先安装本次人声分离脚本补丁后重试");
                 setStemProgress(1); setStemIndeterminate(false);
@@ -884,7 +887,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     if (!isCurrentProject(currentProject.id)) return true;
     if (!cached?.base64) return false;
     const bytes = Uint8Array.from(atob(cached.base64), (char) => char.charCodeAt(0));
-    const file = new File([bytes], cached.name || `${currentProject.title}-伴奏.wav`, { type: cached.mimeType || "audio/wav" });
+    const file = new File([bytes], studioStemName(currentProject.title, "instrumental", cached.name, cached.mimeType), { type: cached.mimeType || "audio/wav" });
     await importAudio(file);
     if (!isCurrentProject(currentProject.id)) return true;
     setStemProgress(1);
@@ -902,7 +905,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         if (!isCurrentProject(projectId)) return;
         if (cached?.base64) {
           const trackId = addReferenceTrack("vocals");
-          if (trackId) await importAudio(new File([Uint8Array.from(atob(cached.base64), ch => ch.charCodeAt(0))], cached.name, { type: cached.mimeType }), trackId);
+          if (trackId) await importAudio(new File([Uint8Array.from(atob(cached.base64), ch => ch.charCodeAt(0))], studioStemName(currentProject.title, "vocals", cached.name, cached.mimeType), { type: cached.mimeType }), trackId);
           setNcmStatus("已导入缓存原曲人声，默认静音，点击 S 独奏试听");
           return;
         }

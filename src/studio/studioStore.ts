@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { StudioEffects, StudioProject, StudioTrack, StudioAsset, StudioTake, StudioClip } from "./types";
 import { createReferenceTrack, createVocalTrack, DEFAULT_EFFECTS } from "./types";
+import { repairStudioAssetNames } from "./assetNames";
 import { splitStudioClipAt } from "./clipEditing";
 
 type StudioState = {
@@ -49,7 +50,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   monitorInput: false,
   recordingTrackId: null,
   effectsClipboard: null,
-  setProject: (project) => set({ project, currentTime: 0, isPlaying: false, recordingTrackId: null }),
+  setProject: (project) => set({ project: project ? repairStudioAssetNames(project) : null, currentTime: 0, isPlaying: false, recordingTrackId: null }),
   setCurrentTime: (currentTime) => set({ currentTime: Math.max(0, currentTime) }),
   setPlaying: (isPlaying) => set({ isPlaying }),
   setInputDeviceId: (inputDeviceId) => set({ inputDeviceId }),
