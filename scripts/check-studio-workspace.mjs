@@ -50,6 +50,30 @@ try {
   const pause = page.getByRole("button", { name: "暂停工作室播放", exact: true });
   const mic = page.getByRole("button", { name: "麦克风设备", exact: true });
   await play.waitFor();
+  const inputTrigger = page.getByRole("button", { name: "伴奏输入", exact: true });
+  const inputPopover = page.getByRole("dialog", { name: "伴奏输入", exact: true });
+  assert.equal(await inputTrigger.innerText(), "", "accompaniment entry is icon-only");
+  assert.equal(await page.locator("aside").getByText("伴奏输入", { exact: true }).count(), 0, "sidebar no longer contains the input panel");
+  await inputTrigger.focus(); await page.keyboard.press("Enter");
+  await inputPopover.waitFor();
+  assert.equal(await inputPopover.getByRole("button", { name: "导入音频", exact: true }).evaluate(el => el === document.activeElement), true);
+  await page.keyboard.press("Escape");
+  assert.equal(await inputPopover.count(), 0);
+  assert.equal(await inputTrigger.evaluate(el => el === document.activeElement), true, "Escape restores trigger focus");
+  for (const width of [700, 1080]) {
+    await page.setViewportSize({ width, height: 700 });
+    await inputTrigger.click();
+    const box = await inputPopover.boundingBox();
+    assert.ok(box.x >= 0 && box.x + box.width <= width && box.y + box.height < 700, "input popover fits small and normal windows");
+    await page.screenshot({ path: fileURLToPath(new URL(`${width}-instrumental-popover.png`, output)) });
+    await page.getByRole("button", { name: "导出", exact: true }).click();
+    assert.equal(await inputPopover.count(), 0, "opening export closes accompaniment popover");
+    await page.keyboard.press("Escape");
+  }
+  await inputTrigger.click();
+  await page.getByRole("button", { name: "重命名工程", exact: true }).click();
+  assert.equal(await inputPopover.count(), 0, "clicking elsewhere in the header also closes it");
+  await page.keyboard.press("Escape");
   assert.equal(await page.getByRole("button", { name: "粘贴效果器", exact: true }).isDisabled(), true);
   assert.equal(await page.getByRole("button", { name: "开始录音", exact: true }).count(), 0, "record controls must be unavailable before choosing a vocal track");
   await page.screenshot({ path: fileURLToPath(new URL("1080-no-vocal.png", output)) });
@@ -466,6 +490,46 @@ try {
     await page.screenshot({ path: fileURLToPath(new URL(`${width}-unicode-workspace.png`, output)) });
   }
   console.log("Window/name PASS: 1440x900 and 1920x1080 workspace layouts, legacy cached stem display restored in cards and clips.");
+  // Native file inputs stay mounted if the popover closes during selection.
+  await page.setViewportSize({ width: 1080, height: 700 });
+  const importedWav = await page.evaluate(async () => {
+    const { encodePcmWav } = await import("/src/lib/studioWav.ts");
+    return Array.from(new Uint8Array(await encodePcmWav([Float32Array.from({ length: 4800 }, (_, i) => 0.1 * Math.sin(i * 0.03))], 48000, 16).arrayBuffer()));
+  });
+  await inputTrigger.click();
+  const audioChooserEvent = page.waitForEvent("filechooser");
+  await inputPopover.getByRole("button", { name: "导入音频", exact: true }).press("Space");
+  const audioChooser = await audioChooserEvent;
+  await page.keyboard.press("Escape");
+  await audioChooser.setFiles({ name: "浮层导入.wav", mimeType: "audio/wav", buffer: Buffer.from(importedWav) });
+  await page.getByText("浮层导入.wav", { exact: true }).first().waitFor();
+  assert.equal(await inputPopover.count(), 0);
+  await page.evaluate(() => {
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    window.popoverJobCancelled = false;
+    window.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "studio_prepare_instrumental") return { jobId: "popover-job" };
+      if (command === "studio_job_status") return { state: window.popoverJobCancelled ? "cancelled" : "running", stage: "separate", progress: 0.35, message: "正在准备测试伴奏" };
+      if (command === "studio_cancel_job") { window.popoverJobCancelled = true; return; }
+      return invoke(command, args);
+    };
+  });
+  await inputTrigger.click();
+  const ncmChooserEvent = page.waitForEvent("filechooser");
+  await inputPopover.getByRole("button", { name: "选择 .ncm 生成伴奏", exact: true }).click();
+  await (await ncmChooserEvent).setFiles({ name: "测试.ncm", mimeType: "application/octet-stream", buffer: Buffer.from("fixture") });
+  await inputPopover.getByRole("progressbar", { name: "伴奏准备进度" }).waitFor();
+  assert.equal(await inputPopover.getByRole("button", { name: "导入音频", exact: true }).isDisabled(), true);
+  await page.keyboard.press("Escape");
+  assert.equal(await inputPopover.count(), 0);
+  assert.equal(await page.evaluate(() => window.popoverJobCancelled), false, "closing the panel does not cancel the task");
+  assert.equal(await inputTrigger.locator(".animate-spin").count(), 1, "closed trigger still shows the running task");
+  await inputTrigger.click();
+  await inputPopover.getByRole("button", { name: "取消", exact: true }).click();
+  await page.waitForFunction(() => window.popoverJobCancelled);
+  await page.keyboard.press("Escape");
+  await page.getByText(/已取消/).first().waitFor();
+  console.log("Instrumental popover PASS: icon-only header entry, 700/1080 bounds, Enter/Space/Escape, focus return, outside/menu dismissal, stable file selection, visible task/cancel status while collapsed.");
   assert.deepEqual(errors, []);
   console.log("Studio UI PASS: reference inputs, recording guidance, locate/restart, zoom/move/trim, contextual track/clip actions and recording locks, precise split/duplicate, double-click details without audio interruption, volume/pan/mono, effect paste/reset, rename cancellation, save, 1080/900 layout, real Web Audio output.");
 } catch (error) {

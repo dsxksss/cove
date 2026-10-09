@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, MousePointer2, Pause, Pencil, Play, Plus, RotateCcw, Save, Scissors, SlidersHorizontal, Trash2, Upload, Volume2 } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, MousePointer2, Pause, Pencil, Play, Plus, RotateCcw, Save, Scissors, SlidersHorizontal, Trash2, Upload, Volume2, X } from "lucide-react";
+import { StudioInstrumentalPopover } from "./StudioInstrumentalPopover";
 import { StudioInputControls } from "./StudioInputControls";
 import { useStudioTimelineViewport } from "./useStudioTimelineViewport";
 import { SignedMilliseconds, StudioTrackTools, trapStudioDialogTab } from "./StudioTrackTools";
@@ -183,6 +184,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [selectedTrackId, setSelectedTrackId] = useState("instrumental");
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [ncmStatus, setNcmStatus] = useState<string | null>(null);
+  const [instrumentalOpen, setInstrumentalOpen] = useState(false);
+  const [statusNoticeVisible, setStatusNoticeVisible] = useState(false);
+  const instrumentalFileRef = useRef<HTMLInputElement>(null);
+  const ncmFileRef = useRef<HTMLInputElement>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [stemProgress, setStemProgress] = useState(0);
   const [stemStage, setStemStage] = useState("准备文件");
@@ -254,6 +259,16 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, [contextMenu, currentProject, trackTools, toolsTrack]);
 
   useEffect(() => {
+    setStatusNoticeVisible(Boolean(ncmStatus));
+    if (jobId || exporting) return;
+    const timer = window.setTimeout(() => setStatusNoticeVisible(false), 6000);
+    return () => window.clearTimeout(timer);
+  }, [ncmStatus, jobId, exporting, savingProject]);
+  useEffect(() => {
+    if (recordingTrackId || exitPromptOpen || trackTools || contextMenu || projectMenuOpen || exportMenuOpen || micMenuOpen || localImportOpen) setInstrumentalOpen(false);
+  }, [recordingTrackId, exitPromptOpen, trackTools, contextMenu, projectMenuOpen, exportMenuOpen, micMenuOpen, localImportOpen]);
+
+  useEffect(() => {
     const dismiss = (event: PointerEvent) => {
       if (!localImportRef.current?.contains(event.target as Node)) setLocalImportOpen(false);
       if (!headerMenuRef.current?.contains(event.target as Node)) {
@@ -315,6 +330,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setProjectTitleDraft(currentProject.title);
     setRenamingProject(false);
     setPlaybackStart(0); setEditingDuration(null);
+    setInstrumentalOpen(false);
     spaceRewindPendingRef.current = false;
     setTimelineTool("move"); setCutPreview(null);
     scrubRef.current = null; clipDragRef.current = null; timelineDraggingRef.current = false;
@@ -626,7 +642,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         if (spaceHandledRef.current) { event.preventDefault(); event.stopPropagation(); spaceHandledRef.current = false; }
         return;
       }
-      if (exitPromptOpen || trackTools || contextMenu || projectMenuOpen || exportMenuOpen || micMenuOpen || localImportOpen) return;
+      if (exitPromptOpen || trackTools || contextMenu || projectMenuOpen || exportMenuOpen || micMenuOpen || localImportOpen || instrumentalOpen) return;
       if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
       const target = event.target instanceof Element ? event.target : null;
       if (target?.closest('input:not([type="range"]):not([type="checkbox"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return;
@@ -642,7 +658,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     const release = () => { spaceHandledRef.current = false; };
     window.addEventListener("blur", release);
     return () => { window.removeEventListener("keydown", onKey, true); window.removeEventListener("keyup", onKey, true); window.removeEventListener("blur", release); };
-  }, [spacePlayback, exitPromptOpen, trackTools, contextMenu, projectMenuOpen, exportMenuOpen, micMenuOpen, localImportOpen]);
+  }, [spacePlayback, exitPromptOpen, trackTools, contextMenu, projectMenuOpen, exportMenuOpen, micMenuOpen, localImportOpen, instrumentalOpen]);
 
   const queueAssetWrite = (projectId: string, assetId: string, write: () => Promise<unknown>) => {
     const key = `${projectId}:${assetId}`;
@@ -1161,6 +1177,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const timelineProgress = Math.min(100, Math.max(0, (currentTime / Math.max(projectDuration, 1)) * 100));
   const playheadLeft = `${Math.min(100, Math.max(0, currentTime / timelineDuration * 100))}%`;
   const hasRenderableAudio = hasAudibleClips(currentProject);
+  const taskStatus = ncmStatus && <div role="status" className="space-y-2 rounded-xl border border-white/8 bg-black/15 p-2.5">
+    <div className="flex items-start gap-2"><p className="min-w-0 flex-1 break-words text-[11px] leading-relaxed text-white/65">{ncmStatus}{jobId ? ` · ${stemStage}` : ""}</p>{jobId && <button type="button" onClick={() => void cancelNcm()} className="shrink-0 rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-white/50 hover:bg-white/15">取消</button>}</div>
+    {(jobId || exporting) && <div className="h-1.5 overflow-hidden rounded-full bg-white/10" role="progressbar" aria-label={exporting ? "导出进度" : "伴奏准备进度"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={exporting || stemIndeterminate ? undefined : Math.round(stemProgress * 100)}>
+      <div className={`h-full rounded-full bg-lime-200 transition-[width] duration-500 ${exporting || stemIndeterminate ? "animate-pulse" : ""}`} style={{ width: exporting || stemIndeterminate ? "40%" : `${Math.max(2, stemProgress * 100)}%` }} />
+    </div>}
+  </div>;
 
   return <div className="relative flex h-full w-full flex-col overflow-hidden bg-slate-950/90 text-white">
     <header ref={headerMenuRef} data-tauri-drag-region className="flex h-16 shrink-0 items-center gap-3 border-b border-white/10 px-5">
@@ -1191,7 +1213,24 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
           <p className="mt-1 border-t border-white/10 px-3 pt-2 pb-1 text-[10px] text-white/35">导出时选择保存位置</p>
         </div>}
       </div>
+      <StudioInstrumentalPopover open={instrumentalOpen} busy={Boolean(jobId)} status={ncmStatus} onOpenChange={open => {
+        setInstrumentalOpen(open);
+        if (open) { setProjectMenuOpen(false); setExportMenuOpen(false); setMicMenuOpen(false); setLocalImportOpen(false); }
+      }}>
+        <div className="space-y-2">
+          <button type="button" data-autofocus disabled={editLocked || Boolean(jobId)} onClick={() => instrumentalFileRef.current?.click()} className="flex w-full items-center justify-center gap-2 rounded-xl bg-white/10 px-3 py-2.5 text-xs font-bold text-white/75 hover:bg-white/15 disabled:opacity-35"><Upload size={14} />导入音频</button>
+          <button type="button" disabled={editLocked || Boolean(jobId)} onClick={() => ncmFileRef.current?.click()} className="flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 px-3 py-2.5 text-xs font-bold text-white/55 hover:bg-white/8 disabled:opacity-35"><Upload size={14} />选择 .ncm 生成伴奏</button>
+          {(currentProject.source ?? "netease") === "netease" && <button type="button" disabled={editLocked || Boolean(jobId)} onClick={() => void handleCurrentSong()} className="flex w-full items-center justify-center gap-2 rounded-xl border border-lime-200/20 bg-lime-200/[0.06] px-3 py-2.5 text-[11px] font-bold text-lime-100/70 transition hover:bg-lime-200/10 hover:text-lime-100 disabled:opacity-35" title="重新下载当前歌曲并生成伴奏"><RotateCcw size={13} className={jobId ? "animate-spin" : ""} />{jobId ? "正在重新转换…" : "重新导入并转换当前歌曲"}</button>}
+        </div>
+        {taskStatus}
+      </StudioInstrumentalPopover>
     </header>
+    <input ref={instrumentalFileRef} aria-label="选择伴奏音频" type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file && !editLockedRef.current && !stemJobRef.current) void importAudio(file); event.currentTarget.value = ""; }} />
+    <input ref={ncmFileRef} aria-label="选择 NCM 伴奏源" type="file" accept=".ncm" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file && !editLockedRef.current && !stemJobRef.current) void handleNcm(file); event.currentTarget.value = ""; }} />
+    {!instrumentalOpen && !jobId && !exitPromptOpen && ncmStatus && (statusNoticeVisible || exporting) && <div className="absolute right-5 top-[72px] z-[80] w-80 max-w-[calc(100vw-40px)] rounded-xl border border-white/10 bg-slate-900/95 p-1 shadow-xl backdrop-blur-xl">
+      {!exporting && <button type="button" aria-label="关闭工作室提示" onClick={() => setStatusNoticeVisible(false)} className="float-right m-1 grid h-5 w-5 place-items-center rounded text-white/35 hover:bg-white/10 hover:text-white"><X size={12} /></button>}
+      {taskStatus}
+    </div>}
     <div className="flex min-h-0 flex-1">
       <aside className="flex w-72 shrink-0 flex-col gap-3 overflow-y-auto border-r border-white/10 p-4">
         <div className="flex items-center justify-between gap-2"><span className="text-[11px] font-black tracking-[0.16em] text-white/35">轨道</span><button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} onClick={createAndSelectVocal} className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-[11px] font-bold text-white/70 hover:bg-white/15 disabled:opacity-40"><Plus size={13} />人声轨</button></div>
@@ -1209,18 +1248,6 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
           </div>
         </div>
         <div className="space-y-2">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} recording={editLocked} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} onContextMenu={(event) => openContextMenu(event, track.id)} onOpenDetails={(element) => openTrackTools(track.id, element)} />)}</div>
-        <div className="mt-auto space-y-2 rounded-2xl border border-white/8 bg-white/[0.035] p-3">
-          <p className="text-[10px] font-black tracking-[0.15em] text-white/35">伴奏输入</p>
-          <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/70 hover:bg-white/15"><Upload size={14} />导入音频<input type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importAudio(file); event.currentTarget.value = ""; }} /></label>
-          <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 px-3 py-2 text-xs font-bold text-white/55 hover:bg-white/8"><Upload size={14} />选择 .ncm 生成伴奏<input type="file" accept=".ncm" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void handleNcm(file); event.currentTarget.value = ""; }} /></label>
-          {(currentProject.source ?? "netease") === "netease" && <button type="button" disabled={Boolean(jobId)} onClick={() => void handleCurrentSong()} className="flex w-full items-center justify-center gap-2 rounded-xl border border-lime-200/20 bg-lime-200/[0.06] px-3 py-1.5 text-[11px] font-bold text-lime-100/70 transition hover:bg-lime-200/10 hover:text-lime-100 disabled:cursor-wait disabled:opacity-40" title="重新下载当前歌曲并生成伴奏"><RotateCcw size={13} className={jobId ? "animate-spin" : ""} />{jobId ? "正在重新转换…" : "重新导入并转换当前歌曲"}</button>}
-          {ncmStatus && <div className="space-y-2 rounded-xl border border-white/8 bg-black/15 p-2.5">
-            <div className="flex items-start gap-2"><p className="min-w-0 flex-1 break-words text-[10px] leading-relaxed text-white/55">{ncmStatus}{jobId ? ` · ${stemStage}` : ""}</p>{jobId && <button type="button" onClick={() => void cancelNcm()} className="shrink-0 rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-white/50 hover:bg-white/15">取消</button>}</div>
-            {(jobId || exporting) && <div className="h-1.5 overflow-hidden rounded-full bg-white/10" role="progressbar" aria-label={exporting ? "导出进度" : "伴奏准备进度"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={exporting || stemIndeterminate ? undefined : Math.round(stemProgress * 100)}>
-              <div className={`h-full rounded-full bg-lime-200 transition-[width] duration-500 ${exporting || stemIndeterminate ? "animate-pulse" : ""}`} style={{ width: exporting || stemIndeterminate ? "40%" : `${Math.max(2, stemProgress * 100)}%` }} />
-            </div>}
-          </div>}
-        </div>
       </aside>
       <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">
         <div className="flex min-h-[288px] flex-1 flex-col px-5 pt-4 pb-3">
