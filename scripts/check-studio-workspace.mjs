@@ -354,6 +354,96 @@ try {
   await pause.click();
   await page.getByRole("button", { name: "保存", exact: true }).click();
   assert.equal(await page.evaluate(() => window.savedEffectsProject.tracks.find(t => t.id === window.menuTrackId).mixer.channelMode), "mono");
+
+  // Thin trim markers must still track the visible edge of shifted audio.
+  await page.evaluate(() => {
+    const store = window.studioStore.getState();
+    store.removeTrack(window.menuTrackId);
+    store.updateTrack("instrumental", { offsetMs: -350 });
+    store.updateClip("instrumental", "clip", { startSec: 0.1, offsetSec: 0.2, durationSec: 2 });
+    store.resetEffects("instrumental");
+    store.updateMixer("instrumental", { solo: false, mute: false, gain: 1 });
+    store.setCurrentTime(0);
+  });
+  await timeline.scrollIntoViewIfNeeded();
+  ruler = await timeline.boundingBox();
+  const leftTrim = zoomClip.getByRole("button", { name: "调整片段起点", exact: true });
+  const trimStyle = await leftTrim.evaluate(el => ({ width: el.getBoundingClientRect().width, line: el.firstElementChild.getBoundingClientRect().width, fill: getComputedStyle(el).backgroundColor }));
+  assert.ok(trimStyle.width <= 6 && trimStyle.line === 1 && trimStyle.fill === "rgba(0, 0, 0, 0)", "trim affordance is a one-pixel edge with a transparent narrow hit target");
+  const leftBox = await leftTrim.boundingBox();
+  await page.mouse.move(leftBox.x + leftBox.width / 2, leftBox.y + leftBox.height / 2); await page.mouse.down();
+  await page.mouse.move(leftBox.x + leftBox.width / 2 + ruler.width * 0.2 / 12, leftBox.y + leftBox.height / 2, { steps: 5 }); await page.mouse.up();
+  edited = await page.evaluate(() => window.studioStore.getState().project.tracks[0].clips[0]);
+  assert.ok(Math.abs(edited.startSec - 0.55) < 0.002 && Math.abs(edited.offsetSec - 0.65) < 0.002 && Math.abs(edited.durationSec - 1.55) < 0.002, "left trimming responds immediately even when a negative track offset hides the source head");
+  await page.evaluate(() => window.studioStore.getState().updateClip("instrumental", "clip", { startSec: 0.1, offsetSec: 0.2, durationSec: 2 }));
+  const rightBox = await zoomClip.getByRole("button", { name: "调整片段结尾", exact: true }).boundingBox();
+  await page.mouse.move(rightBox.x + rightBox.width / 2, rightBox.y + rightBox.height / 2); await page.mouse.down();
+  await page.mouse.move(ruler.x - 12, rightBox.y + rightBox.height / 2, { steps: 5 }); await page.mouse.up();
+  edited = await page.evaluate(() => window.studioStore.getState().project.tracks[0].clips[0]);
+  assert.ok(Math.abs(edited.durationSec - 0.3) < 0.002, `right trim retains 50ms of visible audio after the hidden 250ms head, instead of making the clip disappear: ${JSON.stringify({ edited, rightBox, ruler })}`);
+
+  // The cut pointer must use song time after both zoom and horizontal scroll.
+  await page.evaluate(() => {
+    const store = window.studioStore.getState();
+    store.updateTrack("instrumental", { offsetMs: -100 });
+    store.updateClip("instrumental", "clip", { startSec: 2, offsetSec: 1, durationSec: 4 });
+  });
+  await page.getByRole("button", { name: "放大时间轴", exact: true }).click();
+  await page.getByRole("button", { name: "放大时间轴", exact: true }).click();
+  await viewport.evaluate(el => { el.scrollLeft = el.scrollWidth * 0.12; });
+  await timeline.focus(); await page.keyboard.press("c");
+  const cutTool = page.getByRole("button", { name: "切分工具", exact: true });
+  assert.equal(await cutTool.getAttribute("aria-pressed"), "true");
+  await page.keyboard.press("v");
+  assert.equal(await cutTool.getAttribute("aria-pressed"), "false");
+  await cutTool.click();
+  assert.equal(await cutTool.getAttribute("aria-pressed"), "true");
+  ruler = await timeline.boundingBox();
+  const cuttingBox = await zoomClip.boundingBox();
+  const cutX = ruler.x + ruler.width * 3.25 / 12, cutY = cuttingBox.y + cuttingBox.height / 2;
+  await page.mouse.move(cutX, cutY);
+  await page.screenshot({ path: fileURLToPath(new URL("1080-cut-preview.png", output)) });
+  await page.mouse.click(cutX, cutY);
+  let parts = await page.evaluate(() => window.studioStore.getState().project.tracks[0].clips);
+  assert.equal(parts.length, 2);
+  assert.ok(Math.abs(parts[0].durationSec - 1.35) < 0.002 && Math.abs(parts[1].offsetSec - 2.35) < 0.002, "cut tool preserves source continuity at the pointed song time");
+  assert.equal(await page.evaluate(() => window.studioEngine.isPlaying), false);
+  await page.keyboard.press("Escape");
+  assert.equal(await cutTool.getAttribute("aria-pressed"), "false");
+  await page.evaluate(() => window.studioStore.getState().setCurrentTime(4.25));
+  await page.getByRole("button", { name: "音频片段 伴奏", exact: true }).last().focus();
+  await page.keyboard.press("s");
+  parts = await page.evaluate(() => window.studioStore.getState().project.tracks[0].clips);
+  assert.equal(parts.length, 3);
+  assert.ok(Math.abs(parts[1].durationSec - 1) < 0.002 && Math.abs(parts[2].startSec - 4.35) < 0.002, "S cuts only the focused clip at the playhead");
+  await page.keyboard.press("s");
+  assert.equal(await page.getByRole("button", { name: "音频片段 伴奏", exact: true }).count(), 3, "repeat cutting at an existing boundary does not create empty clips");
+  await page.getByRole("button", { name: "音频片段 伴奏", exact: true }).last().focus();
+  await page.keyboard.press("Delete");
+
+  // Decode the exported WAV to verify the real renderer ends at the cut,
+  // despite the source song and retained asset still being twelve seconds.
+  const cutExport = await page.evaluate(async () => {
+    const { renderStudioMix } = await import("/src/lib/studioExport.ts");
+    const project = window.studioStore.getState().project;
+    const decode = new AudioContext();
+    try {
+      const audio = await decode.decodeAudioData(await (await renderStudioMix(project)).arrayBuffer());
+      const end = audio.getChannelData(0).slice(-4800);
+      return { duration: audio.duration, songDuration: project.durationSec, tailPeak: end.reduce((peak, value) => Math.max(peak, Math.abs(value)), 0) };
+    } finally { await decode.close(); }
+  });
+  assert.ok(Math.abs(cutExport.duration - 4.25) < 1 / 48000 && cutExport.songDuration === 12 && cutExport.tailPeak > 0.01, "cut-and-delete export ends with audio at 4.25s, not a silent tail to the 12s song end");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.savedEffectsProject.tracks[0].clips.length), 2, "cut clips are persisted independently");
+  for (const width of [900, 1080]) {
+    await page.setViewportSize({ width, height: 700 });
+    const controls = page.getByRole("group", { name: "时间线编辑工具", exact: true });
+    const box = await controls.boundingBox();
+    assert.ok(box.x >= 0 && box.x + box.width <= width, "cut/move controls fit the window");
+    await page.screenshot({ path: fileURLToPath(new URL(`${width}-cut-trim.png`, output)) });
+  }
+  console.log("Cut/export PASS: narrow trim markers, negative-offset left trim, zoomed/scrolled cut preview and click, C/V/Escape and S, no empty boundary clips, delete/save halves, real WAV duration and audible final samples.");
   assert.deepEqual(errors, []);
   console.log("Studio UI PASS: reference inputs, recording guidance, locate/restart, zoom/move/trim, contextual track/clip actions and recording locks, precise split/duplicate, double-click details without audio interruption, volume/pan/mono, effect paste/reset, rename cancellation, save, 1080/900 layout, real Web Audio output.");
 } catch (error) {

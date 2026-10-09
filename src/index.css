@@ -872,6 +872,39 @@ body *::after {
   }
 }
 
+/* The visible trim marker follows the actual clip edge. Keep its pointer
+   target transparent so it never looks like an extra block of audio. */
+.studio-clip-trim {
+  position: absolute;
+  inset-block: 0;
+  z-index: 10;
+  width: 6px;
+  max-width: 25%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: ew-resize;
+  touch-action: none;
+}
+.studio-clip-trim--left { left: 0; }
+.studio-clip-trim--right { right: 0; }
+.studio-clip-trim > span {
+  position: absolute;
+  top: 50%;
+  width: 1px;
+  height: 14px;
+  transform: translateY(-50%);
+  background: rgb(217 249 157 / 55%);
+}
+.studio-clip-trim--left > span { left: 0; }
+.studio-clip-trim--right > span { right: 0; }
+.studio-clip-trim:is(:hover, :focus-visible, :active) > span {
+  background: rgb(217 249 157);
+  height: 24px;
+}
+.studio-clip-trim:focus-visible { outline: 1px solid rgb(217 249 157 / 70%); }
+.studio-clip-trim:disabled { cursor: default; opacity: 0.3; }
+
 /* White play button — conic glow on hover (paused when idle) */
 .liquid-glass-play {
   position: relative;

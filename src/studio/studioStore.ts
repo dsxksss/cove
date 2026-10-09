@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { StudioEffects, StudioProject, StudioTrack, StudioAsset, StudioTake, StudioClip } from "./types";
 import { createReferenceTrack, createVocalTrack, DEFAULT_EFFECTS } from "./types";
+import { splitStudioClipAt } from "./clipEditing";
 
 type StudioState = {
   project: StudioProject | null;
@@ -144,10 +145,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const track = project?.tracks.find(track => track.id === trackId);
     const clip = track?.clips.find(clip => clip.id === clipId);
     if (!project || !track || !clip || state.recordingTrackId || !Number.isFinite(timeSec)) return state;
-    const delta = timeSec - clip.startSec - (track.offsetMs ?? 0) / 1000;
-    if (delta < 0.05 || delta > clip.durationSec - 0.05) return state;
-    const right = { ...clip, id: `clip-${crypto.randomUUID()}`, startSec: clip.startSec + delta, offsetSec: clip.offsetSec + delta, durationSec: clip.durationSec - delta };
-    return { project: touch({ ...project, tracks: project.tracks.map(item => item.id === trackId ? { ...item, clips: item.clips.flatMap(part => part.id === clipId ? [{ ...part, durationSec: delta }, right] : [part]) } : item) }) };
+    const split = splitStudioClipAt(track, clip, timeSec);
+    if (!split) return state;
+    const right = { ...split.right, id: `clip-${crypto.randomUUID()}` };
+    return { project: touch({ ...project, tracks: project.tracks.map(item => item.id === trackId ? { ...item, clips: item.clips.flatMap(part => part.id === clipId ? [split.left, right] : [part]) } : item) }) };
   }),
   addAssetToTrack: (trackId, asset, take, startSec = 0) => set((state) => {
     if (!state.project) return state;

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createStudioProject, createVocalTrack } from "./types";
 import { useStudioStore } from "./studioStore";
+import { canSplitStudioClip } from "./clipEditing";
+import { scheduledClip } from "../lib/studioSchedule";
 
 function setup() {
   const project = createStudioProject({ songId: "1", title: "Song", artist: "Artist", coverUrl: "", durationSec: 10, lyrics: [] });
@@ -219,6 +221,106 @@ describe("studio editing state", () => {
     store.removeClip(vocalId, "clip-1");
     store.updateClip(vocalId, "clip-1", { startSec: 4 });
     expect(useStudioStore.getState().project).toBe(snapshot);
+  });
+
+  it("rejects an inaudible left half at song zero and splits the visible portion without a gap", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    store.updateClip(vocalId, "clip-1", { startSec: 0.1, offsetSec: 0.2, durationSec: 2 });
+    store.updateTrack(vocalId, { offsetMs: -350 });
+    const snapshot = useStudioStore.getState().project!;
+    const before = snapshot.tracks.find(track => track.id === vocalId)!;
+    const original = scheduledClip(before.clips[0], before.assets[0], before);
+    for (const time of [0, 0.049, 1.701]) {
+      expect(canSplitStudioClip(before, before.clips[0], time)).toBe(false);
+      store.splitClip(vocalId, "clip-1", time);
+      expect(useStudioStore.getState().project).toBe(snapshot);
+    }
+    expect(canSplitStudioClip(before, before.clips[0], 0.05)).toBe(true);
+    store.splitClip(vocalId, "clip-1", 0.05);
+    const after = useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!;
+    const left = scheduledClip(after.clips[0], after.assets[0], after);
+    const right = scheduledClip(after.clips[1], after.assets[0], after);
+    expect(left.startSec).toBe(0);
+    expect(left.durationSec).toBeCloseTo(0.05, 9);
+    expect(right.startSec).toBeCloseTo(left.startSec + left.durationSec, 9);
+    expect(right.offsetSec).toBeCloseTo(left.offsetSec + left.durationSec, 9);
+    expect(left.offsetSec).toBeCloseTo(original.offsetSec, 9);
+    expect(left.durationSec + right.durationSec).toBeCloseTo(original.durationSec, 9);
+    expect(after.assets).toBe(before.assets);
+    expect(after.takes).toBe(before.takes);
+  });
+
+  it("limits cuts to source audio even when a legacy clip extends past its asset", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    store.updateTrack(vocalId, { clips: [{ id: "clip-1", assetId: "take-1", startSec: 2, offsetSec: 3, durationSec: 10 }] });
+    const snapshot = useStudioStore.getState().project!;
+    const track = snapshot.tracks.find(item => item.id === vocalId)!;
+    expect(canSplitStudioClip(track, track.clips[0], 4)).toBe(false);
+    store.splitClip(vocalId, "clip-1", 4);
+    expect(useStudioStore.getState().project).toBe(snapshot);
+    store.splitClip(vocalId, "clip-1", 2.5);
+    const clips = useStudioStore.getState().project!.tracks.find(item => item.id === vocalId)!.clips;
+    expect(clips[0].durationSec).toBe(0.5);
+    expect(clips[1].offsetSec).toBe(3.5);
+    expect(clips[1].durationSec).toBe(0.5);
+    expect(clips[1].offsetSec + clips[1].durationSec).toBe(4);
+  });
+
+  it("uses the same normalized channel offset as playback for imported settings", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    store.updateClip(vocalId, "clip-1", { startSec: 2 });
+    store.updateTrack(vocalId, { offsetMs: 45000 });
+    store.splitClip(vocalId, "clip-1", 33);
+    let track = useStudioStore.getState().project!.tracks.find(item => item.id === vocalId)!;
+    expect(track.clips[0].durationSec).toBe(1);
+    expect(scheduledClip(track.clips[1], track.assets[0], track).startSec).toBe(33);
+    store.updateTrack(vocalId, { offsetMs: NaN });
+    const rightId = track.clips[1].id;
+    store.splitClip(vocalId, rightId, 4);
+    track = useStudioStore.getState().project!.tracks.find(item => item.id === vocalId)!;
+    expect(track.clips.length).toBe(3);
+    expect(track.clips[2].startSec).toBe(4);
+    expect(track.clips[2].offsetSec).toBe(2);
+  });
+
+  it("keeps latency-trimmed recordings sample-contiguous across a cut", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    const asset = { id: "compensated-cut", name: "vocal.wav", url: "blob:vocal", mimeType: "audio/wav", durationSec: 3 };
+    store.addAssetToTrack(vocalId, asset, undefined, -0.1);
+    const before = useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!;
+    const take = before.clips[before.clips.length - 1];
+    store.splitClip(vocalId, take.id, 1);
+    const after = useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!;
+    const [left, right] = after.clips.slice(-2);
+    expect(left.offsetSec).toBeCloseTo(0.1);
+    expect(left.durationSec).toBe(1);
+    expect(right.startSec).toBe(1);
+    expect(right.offsetSec).toBeCloseTo(1.1);
+    expect(right.durationSec).toBeCloseTo(1.9);
+    expect(after.assets).toBe(before.assets);
+    expect(after.takes).toBe(before.takes);
+  });
+
+  it("does not split missing, fully hidden or invalid source clips", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    const before = useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!;
+    for (const patch of [{ assetId: "missing" }, { offsetSec: 4 }, { durationSec: NaN }, { startSec: NaN }, { offsetSec: NaN }]) {
+      store.updateTrack(vocalId, { clips: [{ ...before.clips[0], ...patch }] });
+      const snapshot = useStudioStore.getState().project!;
+      const track = snapshot.tracks.find(item => item.id === vocalId)!;
+      expect(canSplitStudioClip(track, track.clips[0], 1)).toBe(false);
+      store.splitClip(vocalId, "clip-1", 1);
+      expect(useStudioStore.getState().project).toBe(snapshot);
+    }
+    store.updateTrack(vocalId, { clips: before.clips, offsetMs: -5000 });
+    const hidden = useStudioStore.getState().project!;
+    store.splitClip(vocalId, "clip-1", 0);
+    expect(useStudioStore.getState().project).toBe(hidden);
   });
 
   it("persists channel mode and keeps legacy projects in stereo by default", () => {

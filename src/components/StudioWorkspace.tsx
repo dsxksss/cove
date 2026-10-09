@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, Pause, Pencil, Play, Plus, RotateCcw, Save, SlidersHorizontal, Trash2, Upload, Volume2 } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, MousePointer2, Pause, Pencil, Play, Plus, RotateCcw, Save, Scissors, SlidersHorizontal, Trash2, Upload, Volume2 } from "lucide-react";
 import { StudioInputControls } from "./StudioInputControls";
 import { useStudioTimelineViewport } from "./useStudioTimelineViewport";
 import { SignedMilliseconds, StudioTrackTools, trapStudioDialogTab } from "./StudioTrackTools";
@@ -13,6 +13,7 @@ import { useStudioStore } from "../studio/studioStore";
 import { downloadStudioOriginal, resolveStudioSourceUrl } from "../studio/source";
 import type { StudioAsset, StudioClip, StudioEffects, StudioProject, StudioTrack } from "../studio/types";
 import { getProjectDuration, hasAudibleClips, scheduledClip } from "../lib/studioSchedule";
+import { canSplitStudioClip } from "../studio/clipEditing";
 
 type Props = {
   project: StudioProject;
@@ -199,6 +200,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const autoPrepareRef = useRef<string | null>(null);
   const [playbackStart, setPlaybackStart] = useState(0);
   const [editingDuration, setEditingDuration] = useState<number | null>(null);
+  const [timelineTool, setTimelineTool] = useState<"move" | "cut">("move");
+  const [cutPreview, setCutPreview] = useState<{ clipId: string; trackId: string; timeSec: number } | null>(null);
   const timelineDuration = editingDuration ?? Math.max(projectDuration, 1);
   const [localImportOpen, setLocalImportOpen] = useState(false);
   const localImportRef = useRef<HTMLDivElement>(null);
@@ -209,7 +212,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const timelineDraggingRef = useRef(false);
   const [timelineDragging, setTimelineDragging] = useState(false);
   const { timelineRef, viewportRef: timelineViewportRef, zoom: timelineZoom, changeZoom } = useStudioTimelineViewport(currentProject.id, Boolean(recordingTrackId) || timelineDragging || editingDuration !== null);
-  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; clientX: number; originScroll: number; startSec: number; offsetSec: number; durationSec: number; secondsPerPixel: number; started: boolean } | null>(null);
+  const clipDragRef = useRef<{ trackId: string; clip: StudioClip; mode: "move" | "left" | "right"; originX: number; clientX: number; originScroll: number; startSec: number; offsetSec: number; durationSec: number; minimumDurationSec: number; secondsPerPixel: number; started: boolean } | null>(null);
   const [renamingProject, setRenamingProject] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState(project.title);
   const [micLevel, setMicLevel] = useState<StudioInputLevel>({ rms: 0, peak: 0, clipping: false });
@@ -309,6 +312,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setProjectTitleDraft(currentProject.title);
     setRenamingProject(false);
     setPlaybackStart(0); setEditingDuration(null);
+    setTimelineTool("move"); setCutPreview(null);
     scrubRef.current = null; clipDragRef.current = null; timelineDraggingRef.current = false;
     setScrubPlaying(false); setTimelineDragging(false); setLocalImportOpen(false);
   }, [currentProject.id]);
@@ -472,10 +476,29 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   const beginClipDrag = useCallback((trackId: string, clip: StudioClip, mode: "move" | "left" | "right", clientX: number) => {
     if (useStudioStore.getState().recordingTrackId || editLockedRef.current) return;
+    const track = useStudioStore.getState().project?.tracks.find(item => item.id === trackId);
+    if (!track) return;
+    const placed = scheduledClip(clip, track.assets.find(asset => asset.id === clip.assetId) ?? { durationSec: clip.offsetSec + clip.durationSec }, track);
+    if (placed.durationSec <= 0) return;
+    // Begin left trimming at the visible source boundary, including audio
+    // already hidden before time zero by a negative channel offset.
+    const skipped = mode === "left" ? Math.max(0, placed.offsetSec - clip.offsetSec) : 0;
     setEditingDuration(Math.max(projectDuration, 1));
-    clipDragRef.current = { trackId, clip, mode, started: false, originX: clientX, clientX, originScroll: timelineViewportRef.current?.scrollLeft ?? 0, startSec: clip.startSec, offsetSec: clip.offsetSec, durationSec: clip.durationSec, secondsPerPixel: Math.max(projectDuration, 1) / Math.max(1, timelineRef.current?.clientWidth ?? 1) };
+    const minimumDurationSec = 0.05 + (mode === "right" ? Math.max(0, placed.offsetSec - clip.offsetSec) : 0);
+    clipDragRef.current = { trackId, clip, mode, started: false, originX: clientX, clientX, originScroll: timelineViewportRef.current?.scrollLeft ?? 0, startSec: clip.startSec + skipped, offsetSec: clip.offsetSec + skipped, durationSec: mode === "left" ? placed.durationSec : clip.durationSec, minimumDurationSec, secondsPerPixel: Math.max(projectDuration, 1) / Math.max(1, timelineRef.current?.clientWidth ?? 1) };
     setSelectedTrackId(trackId);
   }, [projectDuration]);
+
+  const cutAt = (track: StudioTrack, clip: StudioClip, timeSec: number) => {
+    if (editLockedRef.current || !canSplitStudioClip(track, clip, timeSec)) return;
+    splitClip(track.id, clip.id, timeSec);
+    setCutPreview(null);
+  };
+  const pointerTime = (clientX: number) => {
+    const bounds = timelineRef.current?.getBoundingClientRect();
+    return bounds && bounds.width > 0 ? (clientX - bounds.left) / bounds.width * timelineDuration : NaN;
+  };
+  const chooseTimelineTool = (tool: "move" | "cut") => { setTimelineTool(tool); setCutPreview(null); };
 
   useEffect(() => {
     const applyDrag = () => {
@@ -496,7 +519,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         const nextDelta = Math.max(-Math.min(drag.offsetSec, drag.startSec), Math.min(drag.durationSec - 0.05, delta));
         updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + nextDelta, offsetSec: drag.offsetSec + nextDelta, durationSec: drag.durationSec - nextDelta });
       } else {
-        updateClip(drag.trackId, drag.clip.id, { durationSec: drag.durationSec + delta });
+        updateClip(drag.trackId, drag.clip.id, { durationSec: Math.max(drag.minimumDurationSec, drag.durationSec + delta) });
       }
     };
     const move = (event: PointerEvent) => { if (clipDragRef.current) clipDragRef.current.clientX = event.clientX; applyDrag(); };
@@ -536,11 +559,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     { id: "audio", label: "归一化 / 降噪…", disabled: editLocked || !menuTrack.clips.length, action: menuAction(track => openTrackTools(track.id, undefined, { tab: "audio" })) },
   ] : [];
   if (menuClip && contextMenu) {
-    const splitDelta = currentTime - menuClip.startSec - (menuTrack?.offsetMs ?? 0) / 1000;
     menuItems.push(
       { id: "locate", label: "定位到片段起点", separator: true, disabled: editLocked, action: menuAction((track, clip) => { if (clip) seekTo(scheduledClip(clip, track.assets.find(asset => asset.id === clip.assetId) ?? { durationSec: clip.offsetSec + clip.durationSec }, track).startSec); }) },
       { id: "duplicate", label: "复制片段到末尾", disabled: editLocked, action: menuAction((track, clip) => { if (clip) duplicateClip(track.id, clip.id); }) },
-      { id: "split", label: "在播放头处分割", disabled: editLocked || splitDelta < 0.05 || splitDelta > menuClip.durationSec - 0.05, action: menuAction((track, clip) => { if (clip) splitClip(track.id, clip.id, useStudioStore.getState().currentTime); }) },
+      { id: "split", label: "在播放头处分割", hint: "S", disabled: editLocked || !menuTrack || !canSplitStudioClip(menuTrack, menuClip, currentTime), action: menuAction((track, clip) => { if (clip) cutAt(track, clip, useStudioStore.getState().currentTime); }) },
       { id: "restore-clip", label: "恢复完整片段", disabled: editLocked, action: menuAction((track, clip) => { const asset = track.assets.find(item => item.id === clip?.assetId); if (clip && asset) updateClip(track.id, clip.id, { offsetSec: 0, durationSec: asset.durationSec }); }) },
       { id: "delete-clip", label: "删除片段", hint: "Delete", separator: true, danger: true, disabled: editLocked, action: menuAction((track, clip) => { if (clip) { removeClip(track.id, clip.id); timelineRef.current?.focus({ preventScroll: true }); } }) },
     );
@@ -1169,10 +1191,19 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       </aside>
       <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">
         <div className="flex min-h-[288px] flex-1 flex-col px-5 pt-4 pb-3">
-          <div className="relative flex min-h-52 flex-1 flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/20">
-            <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-white/5 px-4 text-[10px] text-white/40">
+          <div onKeyDown={(event) => {
+            if (editLocked || editingDuration !== null || event.defaultPrevented || event.repeat || event.nativeEvent.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
+            if ((event.target as HTMLElement).closest('input,textarea,select,[contenteditable="true"]')) return;
+            const key = event.key.toLowerCase();
+            if (key === "c" || key === "v" || (key === "escape" && timelineTool === "cut")) { event.preventDefault(); event.stopPropagation(); chooseTimelineTool(key === "c" ? "cut" : "move"); }
+          }} className="relative flex min-h-52 flex-1 flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/20">
+            <div className="flex min-h-9 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-white/5 px-3 py-1 text-[10px] text-white/40">
+              <div role="group" aria-label="时间线编辑工具" className="flex shrink-0 items-center gap-1">
+                <button type="button" aria-label="移动工具" aria-pressed={timelineTool === "move"} aria-keyshortcuts="V" title="移动片段（V）；拖动左右细线裁剪" disabled={editLocked || editingDuration !== null} onClick={() => chooseTimelineTool("move")} className={`flex items-center gap-1 rounded px-2 py-1 disabled:opacity-30 ${timelineTool === "move" ? "bg-white/10 text-white/85" : "hover:bg-white/5"}`}><MousePointer2 size={12} />移动</button>
+                <button type="button" aria-label="切分工具" aria-pressed={timelineTool === "cut"} aria-keyshortcuts="C" title="切分片段（C）：点击要切开的位置；S 在播放头处切分；V 或 Esc 返回移动" disabled={editLocked || editingDuration !== null} onClick={() => chooseTimelineTool("cut")} className={`flex items-center gap-1 rounded px-2 py-1 disabled:opacity-30 ${timelineTool === "cut" ? "bg-lime-200/15 text-lime-100" : "hover:bg-white/5"}`}><Scissors size={12} />切分</button>
+              </div>
               <span className="min-w-0 truncate" title="拖动定位后暂停，播放和重新播放从定位点开始">起点 <span className="font-mono text-lime-100/70" aria-label="播放起点">{formatPreciseTime(playbackStart)}</span></span>
-              <div className="flex shrink-0 items-center gap-1"><span className="mr-1 hidden sm:inline">Ctrl + 滚轮缩放</span><button type="button" aria-label="缩小时间轴" disabled={Boolean(recordingTrackId) || timelineZoom <= 1} onClick={() => changeZoom(timelineZoom / 1.5)} className="rounded p-1 hover:bg-white/10 disabled:opacity-30"><Minus size={12} /></button><button type="button" aria-label="重置时间轴缩放" title="显示完整歌曲" disabled={Boolean(recordingTrackId)} onClick={() => changeZoom(1)} className="w-10 rounded py-1 font-mono hover:bg-white/10">{Math.round(timelineZoom * 100)}%</button><button type="button" aria-label="放大时间轴" disabled={Boolean(recordingTrackId) || timelineZoom >= 64} onClick={() => changeZoom(timelineZoom * 1.5)} className="rounded p-1 hover:bg-white/10 disabled:opacity-30"><Plus size={12} /></button></div>
+              <div className="flex shrink-0 items-center gap-1"><span className="mr-1 hidden xl:inline">Ctrl + 滚轮缩放</span><button type="button" aria-label="缩小时间轴" title="Ctrl + 滚轮缩放" disabled={Boolean(recordingTrackId) || timelineZoom <= 1} onClick={() => changeZoom(timelineZoom / 1.5)} className="rounded p-1 hover:bg-white/10 disabled:opacity-30"><Minus size={12} /></button><button type="button" aria-label="重置时间轴缩放" title="显示完整歌曲" disabled={Boolean(recordingTrackId)} onClick={() => changeZoom(1)} className="w-10 rounded py-1 font-mono hover:bg-white/10">{Math.round(timelineZoom * 100)}%</button><button type="button" aria-label="放大时间轴" title="Ctrl + 滚轮缩放" disabled={Boolean(recordingTrackId) || timelineZoom >= 64} onClick={() => changeZoom(timelineZoom * 1.5)} className="rounded p-1 hover:bg-white/10 disabled:opacity-30"><Plus size={12} /></button></div>
             </div>
             <div ref={timelineViewportRef} aria-label="时间轴视图" className="relative min-h-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:thin]">
             <div className="relative h-full" style={{ width: `${timelineZoom * 100}%` }}>
@@ -1201,17 +1232,21 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
                       const placed = scheduledClip(clip, asset ?? { durationSec: clip.offsetSec + clip.durationSec }, track);
                       const left = (placed.startSec / timelineDuration) * 100;
                       const width = (placed.durationSec / timelineDuration) * 100;
+                      const preview = !editLocked && timelineTool === "cut" && cutPreview?.trackId === track.id && cutPreview.clipId === clip.id ? cutPreview : null;
                       return <div key={clip.id} role="button" tabIndex={0} aria-label={`音频片段 ${track.name}`}
-                        title={`${asset?.name ?? "音频片段"} · 起点 ${formatPreciseTime(placed.startSec)} · 长度 ${formatPreciseTime(placed.durationSec)} · Ctrl + 方向键微调 10 ms`}
-                        onContextMenu={(event) => openContextMenu(event, track.id, clip.id)} onDoubleClick={(event) => { event.stopPropagation(); if (!(event.target as HTMLElement).closest("button")) openTrackTools(track.id, event.currentTarget); }} onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }}
-                        onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); event.currentTarget.focus(); beginClipDrag(track.id, clip, "move", event.clientX); }}
-                        onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) { openContextMenu(event, track.id, clip.id); return; } if (editLocked) return; if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); removeClip(track.id, clip.id); } if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const step = event.ctrlKey ? 0.01 : event.shiftKey ? 1 : 0.1; updateClip(track.id, clip.id, { startSec: clip.startSec + (event.key === "ArrowLeft" ? -step : step) }); } }}
-                        className={`group absolute inset-y-1 z-[2] min-w-1 rounded-lg border ${track.id === selectedTrackId ? "border-lime-200/40 bg-slate-800" : "border-white/15 bg-slate-900"} cursor-grab active:cursor-grabbing`}
+                        aria-keyshortcuts="S"
+                        title={`${asset?.name ?? "音频片段"} · 起点 ${formatPreciseTime(placed.startSec)} · 长度 ${formatPreciseTime(placed.durationSec)} · ${timelineTool === "cut" ? "点击切分 · V 返回移动" : "S 在播放头处切分 · Ctrl + 方向键微调 10 ms"}`}
+                        onContextMenu={(event) => openContextMenu(event, track.id, clip.id)} onDoubleClick={(event) => { event.stopPropagation(); if (timelineTool !== "cut" && !(event.target as HTMLElement).closest("button")) openTrackTools(track.id, event.currentTarget); }} onClick={(event) => { event.stopPropagation(); setSelectedTrackId(track.id); }}
+                        onPointerMove={(event) => { if (timelineTool !== "cut" || editLocked) return; const timeSec = pointerTime(event.clientX); setCutPreview(canSplitStudioClip(track, clip, timeSec) ? { trackId: track.id, clipId: clip.id, timeSec } : null); }}
+                        onPointerLeave={() => setCutPreview(null)}
+                        onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); event.currentTarget.focus(); setSelectedTrackId(track.id); if (timelineTool === "cut") cutAt(track, clip, pointerTime(event.clientX)); else beginClipDrag(track.id, clip, "move", event.clientX); }}
+                        onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) { openContextMenu(event, track.id, clip.id); return; } if (editLocked) return; if (event.key.toLowerCase() === "s" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.repeat && !event.nativeEvent.isComposing) { event.preventDefault(); event.stopPropagation(); cutAt(track, clip, useStudioStore.getState().currentTime); } if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); removeClip(track.id, clip.id); } if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const step = event.ctrlKey ? 0.01 : event.shiftKey ? 1 : 0.1; updateClip(track.id, clip.id, { startSec: clip.startSec + (event.key === "ArrowLeft" ? -step : step) }); } }}
+                        className={`group absolute inset-y-1 z-[2] min-w-1 rounded-sm border ${track.id === selectedTrackId ? "border-lime-200/40 bg-slate-800" : "border-white/15 bg-slate-900"} ${timelineTool === "cut" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"}`}
                         style={{ left: `${left}%`, width: `${width}%` }}>
-                        <span className="pointer-events-none absolute inset-0 flex min-w-0 items-center gap-2 overflow-hidden px-3 text-[10px] text-white/65"><span className="truncate">{asset?.name ?? track.name}</span><span className="shrink-0 font-mono text-white/35">{timelineZoom > 1 ? formatPreciseTime(clip.durationSec) : formatTime(clip.durationSec)}</span></span>
-                        <button type="button" aria-label="调整片段起点" onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "left", event.clientX); }} className="absolute inset-y-0 left-0 z-10 w-2 cursor-ew-resize rounded-l-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
-                        <button type="button" aria-label="调整片段结尾" onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, "right", event.clientX); }} className="absolute inset-y-0 right-0 z-10 w-2 cursor-ew-resize rounded-r-lg bg-lime-200/15 transition hover:bg-lime-200/60" />
-                        <button type="button" aria-label="删除片段" disabled={editLocked} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); removeClip(track.id, clip.id); }} className="absolute right-2 top-1 z-20 grid h-5 w-5 place-items-center rounded bg-slate-950 text-red-200 opacity-0 transition group-hover:opacity-100 focus:opacity-100">×</button>
+                        <span className="pointer-events-none absolute inset-0 flex min-w-0 items-center gap-2 overflow-hidden px-2 text-[10px] text-white/65"><span className="truncate">{asset?.name ?? track.name}</span><span className="shrink-0 font-mono text-white/35">{timelineZoom > 1 ? formatPreciseTime(placed.durationSec) : formatTime(placed.durationSec)}</span></span>
+                        {timelineTool === "move" && <>{(["left", "right"] as const).map(edge => <button key={edge} type="button" aria-label={edge === "left" ? "调整片段起点" : "调整片段结尾"} title={`${edge === "left" ? "起点" : "结尾"} ${formatPreciseTime(placed.startSec + (edge === "right" ? placed.durationSec : 0))} · 拖动裁剪`} disabled={editLocked} onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); event.preventDefault(); beginClipDrag(track.id, clip, edge, event.clientX); }} className={`studio-clip-trim studio-clip-trim--${edge}`}><span aria-hidden="true" /></button>)}
+                        <button type="button" aria-label="删除片段" disabled={editLocked} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); removeClip(track.id, clip.id); }} className="absolute right-2 top-1 z-20 grid h-5 w-5 place-items-center rounded bg-slate-950 text-red-200 opacity-0 transition group-hover:opacity-100 focus:opacity-100">×</button></>}
+                        {preview && <div aria-hidden="true" className="pointer-events-none absolute inset-y-0 z-20 w-px bg-lime-100" style={{ left: `${(preview.timeSec - placed.startSec) / placed.durationSec * 100}%` }}><span className="absolute -top-5 -translate-x-1/2 whitespace-nowrap rounded bg-slate-950 px-1 py-0.5 font-mono text-[9px] text-lime-100">{formatPreciseTime(preview.timeSec)}</span></div>}
                       </div>;
                     })}
                   </div>
