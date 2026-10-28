@@ -1047,7 +1047,7 @@ export default function App() {
 
   return (
     <div className="app-window-frame relative w-screen h-screen overflow-hidden font-sans">
-      <ToastHost />
+      <ToastHost hidden={studioOpen} />
       <AnimatePresence>
         {showHint && !searchOpen && !queueOpen && !playlistsOpen && (
           <motion.div
@@ -1094,7 +1094,7 @@ export default function App() {
       />}
 
       <div className="relative z-10 w-full h-full">
-        <StudioQueueIndicator hidden={queueOpen || searchOpen || playlistsOpen || settingsOpen} />
+        <StudioQueueIndicator hidden={studioOpen || queueOpen || searchOpen || playlistsOpen || settingsOpen} />
         {studioOpen && studioProject ? (
           <StudioWorkspace
             key={studioProject.id}

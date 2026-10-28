@@ -37,7 +37,7 @@ function toneRing(tone: ToastTone): string {
 }
 
 /** Renders toasts + bridges playerStore.error into visible notifications. */
-export function ToastHost() {
+export function ToastHost({ hidden = false }: { hidden?: boolean }) {
   const items = useToastStore((s) => s.items);
   const dismiss = useToastStore((s) => s.dismiss);
   const error = usePlayerStore((s) => s.error);
@@ -62,7 +62,7 @@ export function ToastHost() {
     };
   }, [items, dismiss]);
 
-  return (
+  return hidden ? null : (
     <div
       className="pointer-events-none absolute inset-x-0 top-4 z-[200] flex flex-col items-center gap-2 px-4"
       aria-live="polite"

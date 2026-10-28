@@ -173,6 +173,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const copyEffects = useStudioStore((state) => state.copyEffects);
   const pasteEffects = useStudioStore((state) => state.pasteEffects);
   const updateClip = useStudioStore((state) => state.updateClip);
+  const previewClip = useStudioStore((state) => state.previewClip);
   const removeClip = useStudioStore((state) => state.removeClip);
   const duplicateClip = useStudioStore((state) => state.duplicateClip);
   const splitClip = useStudioStore((state) => state.splitClip);
@@ -599,12 +600,12 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         beginScrub(true);
       }
       if (drag.mode === "move") {
-        updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + delta });
+        previewClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + delta });
       } else if (drag.mode === "left") {
         const nextDelta = Math.max(-Math.min(drag.offsetSec, drag.startSec), Math.min(drag.durationSec - 0.05, delta));
-        updateClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + nextDelta, offsetSec: drag.offsetSec + nextDelta, durationSec: drag.durationSec - nextDelta });
+        previewClip(drag.trackId, drag.clip.id, { startSec: drag.startSec + nextDelta, offsetSec: drag.offsetSec + nextDelta, durationSec: drag.durationSec - nextDelta });
       } else {
-        updateClip(drag.trackId, drag.clip.id, { durationSec: Math.max(drag.minimumDurationSec, drag.durationSec + delta) });
+        previewClip(drag.trackId, drag.clip.id, { durationSec: Math.max(drag.minimumDurationSec, drag.durationSec + delta) });
       }
     };
     const move = (event: PointerEvent) => { if (clipDragRef.current) clipDragRef.current.clientX = event.clientX; applyDrag(); };
@@ -617,7 +618,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
     return () => { viewport?.removeEventListener("scroll", applyDrag); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); };
-  }, [projectDuration, updateClip, beginScrub, beginHistoryTransaction, endHistoryTransaction]);
+  }, [projectDuration, previewClip, beginScrub, beginHistoryTransaction, endHistoryTransaction]);
 
   const selectedTrack = currentProject.tracks.find((track) => track.id === selectedTrackId) ?? currentProject.tracks[0];
   const recordingTarget = recordingTrackId ? currentProject.tracks.find(track => track.id === recordingTrackId) : selectedTrack?.kind === "vocal" ? selectedTrack : undefined;
@@ -1313,7 +1314,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const timelineProgress = Math.min(100, Math.max(0, (currentTime / Math.max(projectDuration, 1)) * 100));
   const playheadLeft = `${Math.min(100, Math.max(0, currentTime / timelineDuration * 100))}%`;
   const hasRenderableAudio = hasAudibleClips(currentProject);
-  const taskStatus = ncmStatus && <div role="status" className="space-y-2 rounded-xl border border-white/8 bg-black/15 p-2.5">
+  const taskStatus = ncmStatus && jobId && <div role="status" className="space-y-2 rounded-xl border border-white/8 bg-black/15 p-2.5">
     <div className="flex items-start gap-2"><p className="min-w-0 flex-1 break-words text-[11px] leading-relaxed text-white/65">{ncmStatus}{jobId ? ` · ${stemStage}` : ""}</p>{jobId && <button type="button" onClick={() => void cancelNcm()} className="shrink-0 rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-white/50 hover:bg-white/15">取消</button>}</div>
     {(jobId || exporting) && <div className="h-1.5 overflow-hidden rounded-full bg-white/10" role="progressbar" aria-label={exporting ? "导出进度" : "伴奏准备进度"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={exporting || stemIndeterminate ? undefined : Math.round(stemProgress * 100)}>
       <div className={`h-full rounded-full bg-lime-200 transition-[width] duration-500 ${exporting || stemIndeterminate ? "animate-pulse" : ""}`} style={{ width: exporting || stemIndeterminate ? "40%" : `${Math.max(2, stemProgress * 100)}%` }} />

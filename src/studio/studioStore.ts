@@ -33,6 +33,7 @@ type StudioState = {
   pasteEffects: (id: string) => void;
   resetEffects: (id: string) => void;
   updateClip: (trackId: string, clipId: string, patch: Partial<StudioClip>) => void;
+  previewClip: (trackId: string, clipId: string, patch: Partial<StudioClip>) => void;
   removeClip: (trackId: string, clipId: string) => void;
   duplicateClip: (trackId: string, clipId: string) => void;
   splitClip: (trackId: string, clipId: string, timeSec: number) => void;
@@ -51,6 +52,23 @@ function touch(project: StudioProject): StudioProject {
 }
 
 const HISTORY_LIMIT = 80;
+function updateClipProject(project: StudioProject, trackId: string, clipId: string, patch: Partial<StudioClip>): StudioProject {
+  return {
+    ...project,
+    tracks: project.tracks.map((track) => {
+      if (track.id !== trackId) return track;
+      return { ...track, clips: track.clips.map((clip) => {
+        if (clip.id !== clipId) return clip;
+        const next = { ...clip, ...patch };
+        const asset = track.assets.find((item) => item.id === next.assetId);
+        const maxDuration = asset?.durationSec ?? next.durationSec;
+        const offset = Math.max(0, Math.min(next.offsetSec, Math.max(0, maxDuration - 0.05)));
+        const duration = Math.max(0.05, Math.min(next.durationSec, maxDuration - offset));
+        return { ...next, startSec: Math.max(0, next.startSec), offsetSec: offset, durationSec: duration };
+      }) };
+    }),
+  };
+}
 function historyCommit(state: Pick<StudioState, "project" | "historyPast" | "historyFuture" | "historyTransaction">, project: StudioProject) {
   if (!state.project || state.project === project) return state;
   if (state.historyTransaction) return { project, historyFuture: [], historyTransaction: state.historyTransaction };
@@ -135,22 +153,12 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   }),
   updateClip: (trackId, clipId, patch) => set((state) => {
     if (!state.project || state.recordingTrackId) return state;
-    return historyCommit(state, touch({
-      ...state.project,
-      tracks: state.project.tracks.map((track) => {
-        if (track.id !== trackId) return track;
-        return { ...track, clips: track.clips.map((clip) => {
-          if (clip.id !== clipId) return clip;
-          const next = { ...clip, ...patch };
-          const asset = track.assets.find((item) => item.id === next.assetId);
-          const maxDuration = asset?.durationSec ?? next.durationSec;
-          const offset = Math.max(0, Math.min(next.offsetSec, Math.max(0, maxDuration - 0.05)));
-          const duration = Math.max(0.05, Math.min(next.durationSec, maxDuration - offset));
-          const start = Math.max(0, next.startSec);
-          return { ...next, startSec: start, offsetSec: offset, durationSec: duration };
-        }) };
-      }),
-    }));
+    const project = updateClipProject(state.project, trackId, clipId, patch);
+    return historyCommit(state, touch(project));
+  }),
+  previewClip: (trackId, clipId, patch) => set((state) => {
+    if (!state.project || state.recordingTrackId) return state;
+    return { project: touch(updateClipProject(state.project, trackId, clipId, patch)) };
   }),
   removeClip: (trackId, clipId) => set((state) => {
     if (!state.project || state.recordingTrackId) return state;
