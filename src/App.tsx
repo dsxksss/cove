@@ -37,6 +37,7 @@ import {
 } from "lucide-react";
 import GlassPlayer from "./components/GlassPlayer";
 import StudioWorkspace from "./components/StudioWorkspace";
+import { StudioQueueIndicator } from "./components/StudioQueueIndicator";
 import { ToastHost } from "./components/ToastHost";
 import type { LyricMotionStyle, PlayerLayout, Song as PlayerSong } from "./components/playerTypes";
 import { getAudio } from "./lib/audio";
@@ -1093,6 +1094,7 @@ export default function App() {
       />}
 
       <div className="relative z-10 w-full h-full">
+        <StudioQueueIndicator />
         {studioOpen && studioProject ? (
           <StudioWorkspace
             key={studioProject.id}

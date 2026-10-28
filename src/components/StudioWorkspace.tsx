@@ -11,6 +11,7 @@ import { StudioAudioEngine } from "../lib/studioAudio";
 import { normalizationGain, renderStudioMix } from "../lib/studioExport";
 import { StudioRecorder, type StudioInputLevel } from "../lib/studioRecorder";
 import { useStudioStore } from "../studio/studioStore";
+import { useStudioQueueStore } from "../studio/studioQueueStore";
 import { downloadStudioOriginal, resolveStudioSourceUrl } from "../studio/source";
 import type { StudioAsset, StudioClip, StudioEffects, StudioProject, StudioTrack } from "../studio/types";
 import { getProjectDuration, hasAudibleClips, scheduledClip } from "../lib/studioSchedule";
@@ -176,6 +177,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const replaceAssetOnTrack = useStudioStore((state) => state.replaceAssetOnTrack);
   const removeTrack = useStudioStore((state) => state.removeTrack);
   const updateLatency = useStudioStore((state) => state.updateLatency);
+  const enqueueStemJob = useStudioQueueStore((state) => state.enqueue);
   const undo = useStudioStore((state) => state.undo);
   const redo = useStudioStore((state) => state.redo);
   const canUndo = useStudioStore((state) => state.historyPast.length > 0);
@@ -318,7 +320,6 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       recorderRef.current?.dispose();
       recorderRef.current = null;
       useStudioStore.getState().setRecordingTrackId(null);
-      if (stemJobRef.current) void invokeNative("studio_cancel_job", { jobId: stemJobRef.current }).catch(() => undefined);
       // StrictMode replays effects synchronously; keep the context for that replay.
       queueMicrotask(() => {
         if (!mountedRef.current) engineRef.current?.dispose();
@@ -376,7 +377,6 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       }
       if (!isCurrentProject(previousId)) return;
       engineRef.current?.pause();
-      if (stemJobRef.current) void invokeNative("studio_cancel_job", { jobId: stemJobRef.current }).catch(() => undefined);
       stemJobRef.current = null;
       setJobId(null);
       sessionProjectIdRef.current = loaded.id;
@@ -966,8 +966,42 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     })();
   });
 
+  // Kept as a compatibility path for projects that still have an active
+  // native job while the queue worker takes ownership of new conversions.
+  void startStemJob;
+
+  const startQueuedStemJob = (input: { inputBase64?: string; sourceUrl?: string; fileName: string }, target: "instrumental" | "vocals" = "instrumental") => new Promise<void>((resolve, reject) => {
+    const projectId = currentProject.id;
+    const queueId = enqueueStemJob({ projectId, cacheId: instrumentalCacheId(currentProject), title: currentProject.title, target, input });
+    stemJobRef.current = queueId;
+    setJobId(queueId);
+    setStemStage("准备文件"); setStemProgress(0.02); setStemIndeterminate(false); setNcmStatus("已加入伴奏转换队列");
+    const poll = async () => {
+      const item = useStudioQueueStore.getState().items.find((entry) => entry.id === queueId);
+      if (!item) { reject(new Error("转换队列任务已丢失")); return; }
+      if (!isCurrentProject(projectId)) { resolve(); return; }
+      setStemStage(item.stage); setStemProgress(item.progress); setNcmStatus(item.message ?? (item.state === "queued" ? "等待前序任务完成" : `${item.stage} ${Math.round(item.progress * 100)}%`));
+      if (item.state === "queued" || item.state === "running") { window.setTimeout(() => void poll(), 700); return; }
+      try {
+        if (item.state === "cancelled") throw new Error("伴奏转换已取消");
+        if (item.state === "failed") throw new Error(item.error ?? "伴奏任务失败");
+        const cached = await invokeNative<{ name?: string; mimeType?: string; base64?: string } | null>("studio_cache_read", { cacheId: item.cacheId, stem: target === "vocals" ? "vocals" : undefined });
+        if (!cached?.base64) throw new Error("转换完成但没有找到输出音频");
+        const bytes = Uint8Array.from(atob(cached.base64), (char) => char.charCodeAt(0));
+        const mimeType = cached.mimeType || "audio/wav";
+        const file = new File([bytes], studioStemName(currentProject.title, target, cached.name, mimeType), { type: mimeType });
+        if (target === "instrumental") await importAudio(file);
+        else { const trackId = addReferenceTrack("vocals"); if (trackId) await importAudio(file, trackId); }
+        setStemProgress(1); setStemIndeterminate(false); setNcmStatus(target === "vocals" ? "原曲人声已导入参考轨" : "伴奏已生成并缓存");
+        resolve();
+      } catch (error) { reject(error instanceof Error ? error : new Error("无法载入转换结果")); }
+      finally { if (isCurrentProject(projectId)) { setJobId(null); stemJobRef.current = null; } }
+    };
+    void poll();
+  });
+
   const handleNcm = async (file: File) => {
-    try { await startStemJob({ inputBase64: await readFileAsBase64(file), fileName: file.name }); }
+    try { await startQueuedStemJob({ inputBase64: await readFileAsBase64(file), fileName: file.name }); }
     catch (error) { setNcmStatus(error instanceof Error ? error.message : "读取 .ncm 文件失败"); }
   };
 
@@ -978,7 +1012,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       const sourceUrl = await resolveStudioSourceUrl(currentProject);
       if (!isCurrentProject(currentProject.id)) return;
       const fileName = `${currentProject.title.replace(/[\\/:*?"<>|]/g, "_")}.mp3`;
-      await startStemJob({ sourceUrl, fileName });
+      await startQueuedStemJob({ sourceUrl, fileName });
     } catch (error) { if (isCurrentProject(currentProject.id)) setNcmStatus(error instanceof Error ? error.message : "无法获取当前歌曲"); }
   };
 
@@ -1015,9 +1049,9 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         setNcmStatus("旧缓存仅有伴奏，正在提取原曲人声…");
         const sourceUrl = await resolveStudioSourceUrl(currentProject);
         if (!isCurrentProject(projectId)) return;
-        await startStemJob({ sourceUrl, fileName: `${currentProject.title.replace(/[\\/:*?"<>|]/g, "_")}.mp3` }, "vocals");
+        await startQueuedStemJob({ sourceUrl, fileName: `${currentProject.title.replace(/[\\/:*?"<>|]/g, "_")}.mp3` }, "vocals");
       } else {
-        await startStemJob({ inputBase64: await readFileAsBase64(file), fileName: file.name }, "vocals");
+        await startQueuedStemJob({ inputBase64: await readFileAsBase64(file), fileName: file.name }, "vocals");
       }
     } catch (error) { if (isCurrentProject(projectId)) setNcmStatus(error instanceof Error ? error.message : "无法提取原曲人声"); }
     finally { setLoadingVocals(false); }
@@ -1044,7 +1078,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const cancelNcm = async () => {
     if (!jobId) return;
     try {
-      await invokeNative("studio_cancel_job", { jobId });
+      useStudioQueueStore.getState().cancel(jobId);
       setNcmStatus("已取消伴奏任务");
       setJobId(null);
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "取消任务失败"); }
