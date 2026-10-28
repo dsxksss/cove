@@ -55,7 +55,7 @@ async function runItem(id: string) {
         continue;
       }
       if (status.state !== "completed") throw new Error(status.error ?? "伴奏任务失败");
-      const audio = await invokeNative<{ name: string; base64: string }>("studio_job_audio", { jobId: started.jobId });
+      const audio = await invokeNative<{ name: string; base64: string }>("studio_job_audio", { jobId: started.jobId, stem: item.target === "vocals" ? "vocals" : undefined });
       const mimeType = audio.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav";
       await invokeNative("studio_cache_write", { cacheId: item.cacheId, stem: item.target === "vocals" ? "vocals" : undefined, name: audio.name, mimeType, inputBase64: audio.base64 });
       if (item.target === "instrumental") {

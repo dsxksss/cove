@@ -144,6 +144,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [loadingVocals, setLoadingVocals] = useState(false);
   const [loadingProject, setLoadingProject] = useState<{ title: string; done: number; total: number } | null>(null);
   const loadingProjectRef = useRef(false);
+  const skipNextEngineLoadRef = useRef<string | null>(null);
   const storedProject = useStudioStore((state) => state.project);
   const currentProject = storedProject?.id === sessionProjectIdRef.current ? storedProject : project;
   const projectDuration = getProjectDuration(currentProject);
@@ -366,12 +367,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setLoadingProject({ title: "正在读取工程…", done: 0, total: 1 });
     try {
       const loaded = await invokeNative<StudioProject>("studio_load_project", { projectId: id });
-      const assets = loaded.tracks.flatMap((track) => track.assets);
+      const referencedIds = new Set(loaded.tracks.flatMap((track) => track.clips.map((clip) => clip.assetId)));
+      const assets = loaded.tracks.flatMap((track) => track.assets).filter((asset, index, all) => referencedIds.has(asset.id) && all.findIndex((candidate) => candidate.id === asset.id) === index);
       setLoadingProject({ title: loaded.title || "正在打开工程", done: 0, total: Math.max(1, assets.length) });
       for (let index = 0; index < assets.length; index += 1) {
         const asset = assets[index];
-        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         const encoded = await invokeNative<string>("studio_read_asset", { projectId: loaded.id, assetId: asset.id });
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         asset.url = base64Url(encoded, asset.mimeType);
         setLoadingProject({ title: loaded.title || "正在打开工程", done: index + 1, total: Math.max(1, assets.length) });
       }
@@ -382,6 +385,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       sessionProjectIdRef.current = loaded.id;
       persistedProjectIdsRef.current.add(loaded.id);
       savedSnapshotRef.current = structuredClone(loaded);
+      skipNextEngineLoadRef.current = loaded.id;
       setProject(loaded); setSelectedTrackId("instrumental"); setProjectMenuOpen(false);
       setLoadingProject({ title: loaded.title || "正在载入播放引擎", done: assets.length, total: Math.max(1, assets.length) });
       await engineRef.current?.setProject(loaded);
@@ -396,17 +400,20 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     try {
       const loaded = await invokeNative<StudioProject | null>("studio_import_package");
       if (!loaded || !isCurrentProject(currentProject.id)) return;
-      const assets = loaded.tracks.flatMap((track) => track.assets);
+      const referencedIds = new Set(loaded.tracks.flatMap((track) => track.clips.map((clip) => clip.assetId)));
+      const assets = loaded.tracks.flatMap((track) => track.assets).filter((asset, index, all) => referencedIds.has(asset.id) && all.findIndex((candidate) => candidate.id === asset.id) === index);
       setLoadingProject({ title: loaded.title || "正在恢复工程包", done: 0, total: Math.max(1, assets.length) });
       for (let index = 0; index < assets.length; index += 1) {
         const asset = assets[index];
-        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         const encoded = await invokeNative<string>("studio_read_asset", { projectId: loaded.id, assetId: asset.id });
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         asset.url = base64Url(encoded, asset.mimeType);
         setLoadingProject({ title: loaded.title || "正在恢复工程包", done: index + 1, total: Math.max(1, assets.length) });
       }
       sessionProjectIdRef.current = loaded.id;
       persistedProjectIdsRef.current.add(loaded.id);
+      skipNextEngineLoadRef.current = loaded.id;
       setProject(loaded);
       savedSnapshotRef.current = structuredClone(loaded);
       setSelectedTrackId("instrumental");
@@ -433,6 +440,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   useEffect(() => {
     const engine = engineRef.current;
     if (!engine) return;
+    if (skipNextEngineLoadRef.current === currentProject.id) {
+      skipNextEngineLoadRef.current = null;
+      return;
+    }
     void engine.setProject(currentProject).catch((error) => setNcmStatus(error instanceof Error ? error.message : "音频载入失败"));
   }, [currentProject.id, currentProject.tracks]);
 
