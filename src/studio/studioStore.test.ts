@@ -335,6 +335,32 @@ describe("studio editing state", () => {
     expect(track.mixer.pan).toBe(-0.4);
   });
 
+  it("collapses continuous clip dragging into one undo step", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    const before = structuredClone(useStudioStore.getState().project!);
+    store.beginHistoryTransaction();
+    store.updateClip(vocalId, "clip-1", { startSec: 0.5 });
+    store.updateClip(vocalId, "clip-1", { startSec: 1 });
+    store.updateClip(vocalId, "clip-1", { startSec: 1.5 });
+    expect(useStudioStore.getState().historyPast.length).toBe(0);
+    store.endHistoryTransaction();
+    expect(useStudioStore.getState().historyPast.length).toBe(1);
+    expect(useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!.clips[0].startSec).toBe(1.5);
+    store.undo();
+    expect(useStudioStore.getState().project).toEqual(before);
+    expect(useStudioStore.getState().historyFuture.length).toBe(1);
+  });
+
+  it("does not create an undo step for a click without movement", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    store.beginHistoryTransaction();
+    store.endHistoryTransaction();
+    expect(useStudioStore.getState().historyPast.length).toBe(0);
+    expect(useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!.clips[0].startSec).toBe(0);
+  });
+
   it("undoes and redoes project edits without changing transport state", () => {
     const { vocalId } = setup();
     const store = useStudioStore.getState();

@@ -9,6 +9,7 @@ type StudioState = {
   project: StudioProject | null;
   historyPast: StudioProject[];
   historyFuture: StudioProject[];
+  historyTransaction: StudioProject | null;
   currentTime: number;
   isPlaying: boolean;
   inputDeviceId: string;
@@ -39,6 +40,8 @@ type StudioState = {
   replaceAssetOnTrack: (trackId: string, asset: StudioAsset, startSec?: number) => void;
   removeTrack: (id: string) => void;
   updateLatency: (value: number) => void;
+  beginHistoryTransaction: () => void;
+  endHistoryTransaction: () => void;
   undo: () => void;
   redo: () => void;
 };
@@ -48,12 +51,14 @@ function touch(project: StudioProject): StudioProject {
 }
 
 const HISTORY_LIMIT = 80;
-function historyCommit(state: Pick<StudioState, "project" | "historyPast" | "historyFuture">, project: StudioProject) {
+function historyCommit(state: Pick<StudioState, "project" | "historyPast" | "historyFuture" | "historyTransaction">, project: StudioProject) {
   if (!state.project || state.project === project) return state;
+  if (state.historyTransaction) return { project, historyFuture: [], historyTransaction: state.historyTransaction };
   return {
     project,
     historyPast: [...state.historyPast, structuredClone(state.project)].slice(-HISTORY_LIMIT),
     historyFuture: [],
+    historyTransaction: null,
   };
 }
 
@@ -61,13 +66,14 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   project: null,
   historyPast: [],
   historyFuture: [],
+  historyTransaction: null,
   currentTime: 0,
   isPlaying: false,
   inputDeviceId: "default",
   monitorInput: false,
   recordingTrackId: null,
   effectsClipboard: null,
-  setProject: (project) => set({ project: project ? migrateStudioEffectDefaults(repairStudioAssetNames(project)) : null, historyPast: [], historyFuture: [], currentTime: 0, isPlaying: false, recordingTrackId: null }),
+  setProject: (project) => set({ project: project ? migrateStudioEffectDefaults(repairStudioAssetNames(project)) : null, historyPast: [], historyFuture: [], historyTransaction: null, currentTime: 0, isPlaying: false, recordingTrackId: null }),
   setCurrentTime: (currentTime) => set({ currentTime: Math.max(0, currentTime) }),
   setPlaying: (isPlaying) => set({ isPlaying }),
   setInputDeviceId: (inputDeviceId) => set({ inputDeviceId }),
@@ -199,14 +205,21 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     return historyCommit(state, touch({ ...state.project, tracks: state.project.tracks.filter((track) => track.id !== id) }));
   }),
   updateLatency: (inputLatencyMs) => set((state) => state.project ? historyCommit(state, touch({ ...state.project, inputLatencyMs })) : state),
+  beginHistoryTransaction: () => set((state) => state.project && !state.historyTransaction ? { historyTransaction: structuredClone(state.project) } : state),
+  endHistoryTransaction: () => set((state) => {
+    if (!state.historyTransaction || !state.project) return state;
+    const original = state.historyTransaction;
+    const changed = JSON.stringify(original) !== JSON.stringify(state.project);
+    return changed ? { historyPast: [...state.historyPast, original].slice(-HISTORY_LIMIT), historyFuture: [], historyTransaction: null } : { historyTransaction: null };
+  }),
   undo: () => set((state) => {
     if (!state.project || state.historyPast.length === 0) return state;
     const project = state.historyPast[state.historyPast.length - 1];
-    return { project, historyPast: state.historyPast.slice(0, -1), historyFuture: [...state.historyFuture, structuredClone(state.project)].slice(-HISTORY_LIMIT) };
+    return { project, historyPast: state.historyPast.slice(0, -1), historyFuture: [...state.historyFuture, structuredClone(state.project)].slice(-HISTORY_LIMIT), historyTransaction: null };
   }),
   redo: () => set((state) => {
     if (!state.project || state.historyFuture.length === 0) return state;
     const project = state.historyFuture[state.historyFuture.length - 1];
-    return { project, historyPast: [...state.historyPast, structuredClone(state.project)].slice(-HISTORY_LIMIT), historyFuture: state.historyFuture.slice(0, -1) };
+    return { project, historyPast: [...state.historyPast, structuredClone(state.project)].slice(-HISTORY_LIMIT), historyFuture: state.historyFuture.slice(0, -1), historyTransaction: null };
   }),
 }));

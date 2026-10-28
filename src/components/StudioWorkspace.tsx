@@ -180,6 +180,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const replaceAssetOnTrack = useStudioStore((state) => state.replaceAssetOnTrack);
   const removeTrack = useStudioStore((state) => state.removeTrack);
   const updateLatency = useStudioStore((state) => state.updateLatency);
+  const beginHistoryTransaction = useStudioStore((state) => state.beginHistoryTransaction);
+  const endHistoryTransaction = useStudioStore((state) => state.endHistoryTransaction);
   const enqueueStemJob = useStudioQueueStore((state) => state.enqueue);
   const undo = useStudioStore((state) => state.undo);
   const redo = useStudioStore((state) => state.redo);
@@ -504,6 +506,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
 
   const finishScrub = useCallback(() => {
     const scrub = scrubRef.current;
+    if (clipDragRef.current?.started) endHistoryTransaction();
     scrubRef.current = null;
     clipDragRef.current = null;
     setEditingDuration(null);
@@ -599,6 +602,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       if (!drag.started) {
         if (Math.abs(delta / drag.secondsPerPixel) < 3) return;
         drag.started = true;
+        beginHistoryTransaction();
         beginScrub(true);
       }
       if (drag.mode === "move") {
@@ -611,13 +615,16 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       }
     };
     const move = (event: PointerEvent) => { if (clipDragRef.current) clipDragRef.current.clientX = event.clientX; applyDrag(); };
-    const end = () => { clipDragRef.current = null; };
+    const end = () => {
+      if (clipDragRef.current?.started) endHistoryTransaction();
+      clipDragRef.current = null;
+    };
     const viewport = timelineViewportRef.current;
     viewport?.addEventListener("scroll", applyDrag);
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
     return () => { viewport?.removeEventListener("scroll", applyDrag); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); };
-  }, [projectDuration, updateClip, beginScrub]);
+  }, [projectDuration, updateClip, beginScrub, beginHistoryTransaction, endHistoryTransaction]);
 
   const selectedTrack = currentProject.tracks.find((track) => track.id === selectedTrackId) ?? currentProject.tracks[0];
   const recordingTarget = recordingTrackId ? currentProject.tracks.find(track => track.id === recordingTrackId) : selectedTrack?.kind === "vocal" ? selectedTrack : undefined;
