@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, MousePointer2, Pause, Pencil, Play, Plus, RotateCcw, Save, Scissors, SlidersHorizontal, Trash2, Undo2, Redo2, Upload, Volume2, X } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, MousePointer2, Pause, Pencil, Play, Plus, RotateCcw, Save, Scissors, SlidersHorizontal, Trash2, Undo2, Redo2, Upload, Volume2 } from "lucide-react";
 import { StudioInstrumentalPopover } from "./StudioInstrumentalPopover";
 import { StudioInputControls } from "./StudioInputControls";
 import { useStudioTimelineViewport } from "./useStudioTimelineViewport";
@@ -199,7 +199,6 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [ncmStatus, setNcmStatus] = useState<string | null>(null);
   const [instrumentalOpen, setInstrumentalOpen] = useState(false);
-  const [statusNoticeVisible, setStatusNoticeVisible] = useState(false);
   const instrumentalFileRef = useRef<HTMLInputElement>(null);
   const ncmFileRef = useRef<HTMLInputElement>(null);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -284,12 +283,6 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     if (trackTools && !toolsTrack) setTrackTools(null);
   }, [contextMenu, currentProject, trackTools, toolsTrack]);
 
-  useEffect(() => {
-    setStatusNoticeVisible(Boolean(ncmStatus));
-    if (jobId || exporting) return;
-    const timer = window.setTimeout(() => setStatusNoticeVisible(false), 6000);
-    return () => window.clearTimeout(timer);
-  }, [ncmStatus, jobId, exporting, savingProject]);
   useEffect(() => {
     if (recordingTrackId || exitPromptOpen || trackTools || contextMenu || workspaceContextMenu || projectMenuOpen || exportMenuOpen || micMenuOpen || localImportOpen) setInstrumentalOpen(false);
   }, [recordingTrackId, exitPromptOpen, trackTools, contextMenu, workspaceContextMenu, projectMenuOpen, exportMenuOpen, micMenuOpen, localImportOpen]);
@@ -1381,10 +1374,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     </div>}
     <input ref={instrumentalFileRef} aria-label="选择伴奏音频" type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file && !editLockedRef.current && !stemJobRef.current) void importAudio(file); event.currentTarget.value = ""; }} />
     <input ref={ncmFileRef} aria-label="选择 NCM 伴奏源" type="file" accept=".ncm" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file && !editLockedRef.current && !stemJobRef.current) void handleNcm(file); event.currentTarget.value = ""; }} />
-    {!instrumentalOpen && !jobId && !exitPromptOpen && ncmStatus && (statusNoticeVisible || exporting) && <div className="absolute right-5 top-[9.25rem] z-[80] w-80 max-w-[calc(100vw-40px)] rounded-xl border border-white/10 bg-slate-900/95 p-1 shadow-xl backdrop-blur-xl">
-      {!exporting && <button type="button" aria-label="关闭工作室提示" onClick={() => setStatusNoticeVisible(false)} className="float-right m-1 grid h-5 w-5 place-items-center rounded text-white/35 hover:bg-white/10 hover:text-white"><X size={12} /></button>}
-      {taskStatus}
-    </div>}
+
     <div className="flex min-h-0 flex-1">
       <aside className="flex min-h-0 w-72 shrink-0 flex-col gap-3 overflow-hidden border-r border-white/10 p-4">
         <div className="flex shrink-0 items-center justify-between gap-2"><span className="text-[11px] font-black tracking-[0.16em] text-white/35">轨道</span><button type="button" disabled={Boolean(recordingTrackId) || processingTrack || exporting} onClick={createAndSelectVocal} className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-[11px] font-bold text-white/70 hover:bg-white/15 disabled:opacity-40"><Plus size={13} />人声轨</button></div>
