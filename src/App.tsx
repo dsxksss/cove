@@ -1094,7 +1094,7 @@ export default function App() {
       />}
 
       <div className="relative z-10 w-full h-full">
-        <StudioQueueIndicator />
+        <StudioQueueIndicator hidden={queueOpen || searchOpen || playlistsOpen || settingsOpen} />
         {studioOpen && studioProject ? (
           <StudioWorkspace
             key={studioProject.id}

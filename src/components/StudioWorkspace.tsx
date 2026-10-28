@@ -138,12 +138,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const [exitError, setExitError] = useState<string | null>(null);
   const [trackTools, setTrackTools] = useState<{ trackId: string; rename?: boolean; tab?: "channel" | "effects" | "audio" } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ projectId: string; trackId: string; clipId?: string; x: number; y: number } | null>(null);
+  const [workspaceContextMenu, setWorkspaceContextMenu] = useState<{ x: number; y: number } | null>(null);
   const contextOriginRef = useRef<HTMLElement | null>(null);
   const toolsOriginRef = useRef<HTMLElement | null>(null);
   const [processingTrack, setProcessingTrack] = useState(false);
   const [loadingVocals, setLoadingVocals] = useState(false);
   const [loadingProject, setLoadingProject] = useState<{ title: string; done: number; total: number } | null>(null);
   const loadingProjectRef = useRef(false);
+  const saveProjectRef = useRef<(() => Promise<StudioProject | null>) | null>(null);
   const skipNextEngineLoadRef = useRef<string | null>(null);
   const storedProject = useStudioStore((state) => state.project);
   const currentProject = storedProject?.id === sessionProjectIdRef.current ? storedProject : project;
@@ -246,6 +248,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setContextMenu(null);
     if (restoreFocus && contextOriginRef.current?.isConnected) contextOriginRef.current.focus({ preventScroll: true });
   };
+  const closeWorkspaceContextMenu = () => setWorkspaceContextMenu(null);
   const openTrackTools = (trackId: string, origin?: HTMLElement, options?: { rename?: boolean; tab?: "channel" | "effects" | "audio" }) => {
     if (editLockedRef.current || !useStudioStore.getState().project?.tracks.some(track => track.id === trackId)) return;
     toolsOriginRef.current = origin ?? contextOriginRef.current;
@@ -260,11 +263,22 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     event.preventDefault(); event.stopPropagation();
     const bounds = event.currentTarget.getBoundingClientRect();
     contextOriginRef.current = event.currentTarget;
+    setWorkspaceContextMenu(null);
     setSelectedTrackId(trackId);
     setContextMenu({ projectId: currentProject.id, trackId, clipId, x: "clientX" in event ? event.clientX : bounds.left + 24, y: "clientY" in event ? event.clientY : bounds.top + 24 });
   };
+  const openWorkspaceContextMenu = (event: MouseEvent<HTMLElement> | ReactKeyboardEvent<HTMLElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest("button,input,select,textarea,[role=\"menu\"],[role=\"dialog\"]")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu(null);
+    const bounds = event.currentTarget.getBoundingClientRect();
+    setWorkspaceContextMenu({ x: "clientX" in event ? event.clientX : bounds.left + 32, y: "clientY" in event ? event.clientY : bounds.top + 32 });
+  };
   useEffect(() => {
     if (contextMenu && (contextMenu.projectId !== currentProject.id || !currentProject.tracks.some(track => track.id === contextMenu.trackId && (!contextMenu.clipId || track.clips.some(clip => clip.id === contextMenu.clipId))))) setContextMenu(null);
+    if (workspaceContextMenu && (exitPromptOpen || loadingProject)) setWorkspaceContextMenu(null);
     if (trackTools && !toolsTrack) setTrackTools(null);
   }, [contextMenu, currentProject, trackTools, toolsTrack]);
 
@@ -275,8 +289,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     return () => window.clearTimeout(timer);
   }, [ncmStatus, jobId, exporting, savingProject]);
   useEffect(() => {
-    if (recordingTrackId || exitPromptOpen || trackTools || contextMenu || projectMenuOpen || exportMenuOpen || micMenuOpen || localImportOpen) setInstrumentalOpen(false);
-  }, [recordingTrackId, exitPromptOpen, trackTools, contextMenu, projectMenuOpen, exportMenuOpen, micMenuOpen, localImportOpen]);
+    if (recordingTrackId || exitPromptOpen || trackTools || contextMenu || workspaceContextMenu || projectMenuOpen || exportMenuOpen || micMenuOpen || localImportOpen) setInstrumentalOpen(false);
+  }, [recordingTrackId, exitPromptOpen, trackTools, contextMenu, workspaceContextMenu, projectMenuOpen, exportMenuOpen, micMenuOpen, localImportOpen]);
 
   useEffect(() => {
     const dismiss = (event: PointerEvent) => {
@@ -622,6 +636,14 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     if (!track || (contextMenu.clipId && !clip)) return;
     action(track, clip);
   };
+  const workspaceMenuItems: StudioMenuItem[] = [
+    { id: "undo", label: "撤销上一步", hint: "Ctrl+Z", disabled: !canUndo || editLocked || Boolean(loadingProject), action: undo },
+    { id: "redo", label: "重做下一步", hint: "Ctrl+Shift+Z", disabled: !canRedo || editLocked || Boolean(loadingProject), action: redo },
+    { id: "save", label: "保存工程", hint: "Ctrl+S", separator: true, disabled: savingProject || Boolean(recordingTrackId) || Boolean(loadingProject), action: () => { void saveProject(); } },
+    { id: "add-vocal", label: "新增人声轨", disabled: editLocked, action: createAndSelectVocal },
+    { id: "import-package", label: "导入工程包…", separator: true, disabled: editLocked || Boolean(loadingProject), action: () => { void importProjectPackage(); } },
+    { id: "export-package", label: "导出工程包…", disabled: editLocked || Boolean(loadingProject), action: () => { void exportFile("cove-studio"); } },
+  ];
   const menuItems: StudioMenuItem[] = menuTrack ? [
     { id: "settings", label: "音轨详细设置", hint: "双击", disabled: editLocked, action: menuAction(track => openTrackTools(track.id)) },
     { id: "rename", label: "重命名音轨", disabled: editLocked, action: menuAction(track => openTrackTools(track.id, undefined, { rename: true })) },
@@ -1164,6 +1186,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     } catch (error) { const message = error instanceof Error ? error.message : "工程保存失败，请检查应用数据目录权限"; setNcmStatus(message); setExitError(message); return null; }
     finally { setSavingProject(false); }
   };
+  saveProjectRef.current = saveProject;
   const exportFile = async (extension: "wav" | "mp3" | "cove-studio") => {
     if (useStudioStore.getState().recordingTrackId) { setNcmStatus("请先停止录音，等待音轨保存后再导出"); return; }
     if (exportBusyRef.current) return;
@@ -1275,6 +1298,18 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     setRenamingProject(false);
   };
 
+  useEffect(() => {
+    const onSaveKey = (event: globalThis.KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.isComposing || event.key.toLowerCase() !== "s") return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest("input,textarea,select,[contenteditable=\"true\"]")) return;
+      event.preventDefault();
+      if (!editLockedRef.current && !loadingProjectRef.current) void saveProjectRef.current?.();
+    };
+    window.addEventListener("keydown", onSaveKey, true);
+    return () => window.removeEventListener("keydown", onSaveKey, true);
+  }, []);
+
   const timelineProgress = Math.min(100, Math.max(0, (currentTime / Math.max(projectDuration, 1)) * 100));
   const playheadLeft = `${Math.min(100, Math.max(0, currentTime / timelineDuration * 100))}%`;
   const hasRenderableAudio = hasAudibleClips(currentProject);
@@ -1339,7 +1374,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
     </div>}
     <input ref={instrumentalFileRef} aria-label="选择伴奏音频" type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file && !editLockedRef.current && !stemJobRef.current) void importAudio(file); event.currentTarget.value = ""; }} />
     <input ref={ncmFileRef} aria-label="选择 NCM 伴奏源" type="file" accept=".ncm" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file && !editLockedRef.current && !stemJobRef.current) void handleNcm(file); event.currentTarget.value = ""; }} />
-    {!instrumentalOpen && !jobId && !exitPromptOpen && ncmStatus && (statusNoticeVisible || exporting) && <div className="absolute right-5 top-[72px] z-[80] w-80 max-w-[calc(100vw-40px)] rounded-xl border border-white/10 bg-slate-900/95 p-1 shadow-xl backdrop-blur-xl">
+    {!instrumentalOpen && !jobId && !exitPromptOpen && ncmStatus && (statusNoticeVisible || exporting) && <div className="absolute right-5 top-[9.25rem] z-[80] w-80 max-w-[calc(100vw-40px)] rounded-xl border border-white/10 bg-slate-900/95 p-1 shadow-xl backdrop-blur-xl">
       {!exporting && <button type="button" aria-label="关闭工作室提示" onClick={() => setStatusNoticeVisible(false)} className="float-right m-1 grid h-5 w-5 place-items-center rounded text-white/35 hover:bg-white/10 hover:text-white"><X size={12} /></button>}
       {taskStatus}
     </div>}
@@ -1361,7 +1396,7 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         </div>
         <div aria-label="音轨列表" className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-y-contain [scrollbar-width:thin]">{currentProject.tracks.map((track) => <TrackRow key={track.id} track={track} recording={editLocked} selected={track.id === selectedTrackId} onSelect={() => setSelectedTrackId(track.id)} onMixer={(patch) => updateMixer(track.id, patch)} onRename={(name) => renameTrack(track.id, name)} onDelete={() => removeTrack(track.id)} onContextMenu={(event) => openContextMenu(event, track.id)} onOpenDetails={(element) => openTrackTools(track.id, element)} />)}</div>
       </aside>
-      <main aria-label="工作室编辑区" className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <main aria-label="工作室编辑区" tabIndex={-1} onContextMenu={openWorkspaceContextMenu} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden outline-none">
         <div className="flex min-h-0 flex-1 flex-col px-5 pt-4 pb-3">
           <div onKeyDown={(event) => {
             if (editLocked || editingDuration !== null || event.defaultPrevented || event.repeat || event.nativeEvent.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
@@ -1475,7 +1510,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         </div>
       </main>
     </div>
-    {contextMenu && menuTrack && <StudioContextMenu x={contextMenu.x} y={contextMenu.y} title={menuClip ? `${menuTrack.name} · 片段` : menuTrack.name} items={menuItems} onClose={closeContextMenu} />}
+    {workspaceContextMenu && <StudioContextMenu x={workspaceContextMenu.x} y={workspaceContextMenu.y} title={currentProject.title} items={workspaceMenuItems} ariaLabel="工作室编辑菜单" onClose={closeWorkspaceContextMenu} />}
+    {contextMenu && menuTrack && <StudioContextMenu x={contextMenu.x} y={contextMenu.y} title={menuClip ? `${menuTrack.name} · 片段` : menuTrack.name} items={menuItems} ariaLabel="音轨右键菜单" onClose={closeContextMenu} />}
     {trackTools && toolsTrack && <StudioTrackTools key={`${currentProject.id}:${toolsTrack.id}`} track={toolsTrack} rename={trackTools.rename} initialTab={trackTools.tab} busy={editLocked} onClose={closeTrackTools}
       onMixer={(patch) => updateMixer(toolsTrack.id, patch)} onRename={(name) => renameTrack(toolsTrack.id, name)} onOffset={(offsetMs) => updateTrack(toolsTrack.id, { offsetMs })}
       onNormalize={() => void normalizeTrack(toolsTrack.id)} onDenoise={(strength) => void denoiseTrack(toolsTrack.id, strength)}

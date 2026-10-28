@@ -4,7 +4,7 @@ import { Check } from "lucide-react";
 
 export type StudioMenuItem = { id: string; label: string; action: () => void; disabled?: boolean; checked?: boolean; danger?: boolean; separator?: boolean; hint?: string };
 
-export function StudioContextMenu({ x, y, title, items, onClose }: { x: number; y: number; title: string; items: StudioMenuItem[]; onClose: (restoreFocus?: boolean) => void }) {
+export function StudioContextMenu({ x, y, title, items, onClose, ariaLabel = "音轨右键菜单" }: { x: number; y: number; title: string; items: StudioMenuItem[]; onClose: (restoreFocus?: boolean) => void; ariaLabel?: string }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose); closeRef.current = onClose;
   const [position, setPosition] = useState({ left: x, top: y });
@@ -22,7 +22,7 @@ export function StudioContextMenu({ x, y, title, items, onClose }: { x: number; 
     window.addEventListener("resize", dismiss); window.addEventListener("blur", dismiss);
     return () => { document.removeEventListener("pointerdown", outside, true); document.removeEventListener("scroll", scroll, true); window.removeEventListener("resize", dismiss); window.removeEventListener("blur", dismiss); };
   }, [x, y]);
-  return createPortal(<div ref={menuRef} role="menu" aria-label="音轨右键菜单" onContextMenu={event => event.preventDefault()}
+  return createPortal(<div ref={menuRef} role="menu" aria-label={ariaLabel} onContextMenu={event => event.preventDefault()}
     onKeyDown={event => {
       if (event.key === "Escape" || event.key === "Tab") { event.preventDefault(); event.stopPropagation(); onClose(true); return; }
       if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
