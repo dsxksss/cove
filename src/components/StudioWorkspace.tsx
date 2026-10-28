@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, MousePointer2, Pause, Pencil, Play, Plus, RotateCcw, Save, Scissors, SlidersHorizontal, Trash2, Upload, Volume2, X } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, ClipboardPaste, Copy, Disc3, Download, Headphones, Minus, MousePointer2, Pause, Pencil, Play, Plus, RotateCcw, Save, Scissors, SlidersHorizontal, Trash2, Undo2, Redo2, Upload, Volume2, X } from "lucide-react";
 import { StudioInstrumentalPopover } from "./StudioInstrumentalPopover";
 import { StudioInputControls } from "./StudioInputControls";
 import { useStudioTimelineViewport } from "./useStudioTimelineViewport";
@@ -141,6 +141,8 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const toolsOriginRef = useRef<HTMLElement | null>(null);
   const [processingTrack, setProcessingTrack] = useState(false);
   const [loadingVocals, setLoadingVocals] = useState(false);
+  const [loadingProject, setLoadingProject] = useState<{ title: string; done: number; total: number } | null>(null);
+  const loadingProjectRef = useRef(false);
   const storedProject = useStudioStore((state) => state.project);
   const currentProject = storedProject?.id === sessionProjectIdRef.current ? storedProject : project;
   const projectDuration = getProjectDuration(currentProject);
@@ -174,6 +176,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   const replaceAssetOnTrack = useStudioStore((state) => state.replaceAssetOnTrack);
   const removeTrack = useStudioStore((state) => state.removeTrack);
   const updateLatency = useStudioStore((state) => state.updateLatency);
+  const undo = useStudioStore((state) => state.undo);
+  const redo = useStudioStore((state) => state.redo);
+  const canUndo = useStudioStore((state) => state.historyPast.length > 0);
+  const canRedo = useStudioStore((state) => state.historyFuture.length > 0);
   const engineRef = useRef<StudioAudioEngine | null>(null);
   const recorderRef = useRef<StudioRecorder | null>(null);
   const recordStartRef = useRef({ songTime: 0, contextTime: 0, inputLatencyMs: 0 });
@@ -286,6 +292,19 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   }, []);
 
   useEffect(() => {
+    const onHistoryKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.isComposing) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input,textarea,select,[contenteditable=\"true\"]")) return;
+      if (event.key.toLowerCase() !== "z" || editLockedRef.current || loadingProjectRef.current) return;
+      event.preventDefault();
+      if (event.shiftKey) redo(); else undo();
+    };
+    window.addEventListener("keydown", onHistoryKey, true);
+    return () => window.removeEventListener("keydown", onHistoryKey, true);
+  }, [redo, undo]);
+
+  useEffect(() => {
     mountedRef.current = true;
     useStudioStore.getState().setProject(project);
     engineRef.current ??= new StudioAudioEngine();
@@ -340,13 +359,20 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
   useEffect(() => { if (editingDuration === null) setPlaybackStart(value => Math.min(value, projectDuration)); }, [projectDuration, editingDuration]);
 
   const openSavedProject = async (id: string) => {
-    if (savingProject || exporting || processingTrack || recordingTrackId) return;
+    if (savingProject || exporting || processingTrack || recordingTrackId || loadingProjectRef.current) return;
     const previousId = currentProject.id;
+    loadingProjectRef.current = true;
+    setLoadingProject({ title: "正在读取工程…", done: 0, total: 1 });
     try {
       const loaded = await invokeNative<StudioProject>("studio_load_project", { projectId: id });
-      for (const track of loaded.tracks) for (const asset of track.assets) {
+      const assets = loaded.tracks.flatMap((track) => track.assets);
+      setLoadingProject({ title: loaded.title || "正在打开工程", done: 0, total: Math.max(1, assets.length) });
+      for (let index = 0; index < assets.length; index += 1) {
+        const asset = assets[index];
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
         const encoded = await invokeNative<string>("studio_read_asset", { projectId: loaded.id, assetId: asset.id });
         asset.url = base64Url(encoded, asset.mimeType);
+        setLoadingProject({ title: loaded.title || "正在打开工程", done: index + 1, total: Math.max(1, assets.length) });
       }
       if (!isCurrentProject(previousId)) return;
       engineRef.current?.pause();
@@ -356,17 +382,28 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       sessionProjectIdRef.current = loaded.id;
       persistedProjectIdsRef.current.add(loaded.id);
       savedSnapshotRef.current = structuredClone(loaded);
-      setProject(loaded); setSelectedTrackId("instrumental"); setProjectMenuOpen(false); setNcmStatus("已打开本地工程");
+      setProject(loaded); setSelectedTrackId("instrumental"); setProjectMenuOpen(false);
+      setLoadingProject({ title: loaded.title || "正在载入播放引擎", done: assets.length, total: Math.max(1, assets.length) });
+      await engineRef.current?.setProject(loaded);
+      setNcmStatus("已打开本地工程");
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "无法打开工程"); }
+    finally { loadingProjectRef.current = false; setLoadingProject(null); }
   };
   const importProjectPackage = async () => {
-    if (savingProject || exporting || processingTrack || recordingTrackId) return;
+    if (savingProject || exporting || processingTrack || recordingTrackId || loadingProjectRef.current) return;
+    loadingProjectRef.current = true;
+    setLoadingProject({ title: "正在导入工程包…", done: 0, total: 1 });
     try {
       const loaded = await invokeNative<StudioProject | null>("studio_import_package");
       if (!loaded || !isCurrentProject(currentProject.id)) return;
-      for (const track of loaded.tracks) for (const asset of track.assets) {
+      const assets = loaded.tracks.flatMap((track) => track.assets);
+      setLoadingProject({ title: loaded.title || "正在恢复工程包", done: 0, total: Math.max(1, assets.length) });
+      for (let index = 0; index < assets.length; index += 1) {
+        const asset = assets[index];
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
         const encoded = await invokeNative<string>("studio_read_asset", { projectId: loaded.id, assetId: asset.id });
         asset.url = base64Url(encoded, asset.mimeType);
+        setLoadingProject({ title: loaded.title || "正在恢复工程包", done: index + 1, total: Math.max(1, assets.length) });
       }
       sessionProjectIdRef.current = loaded.id;
       persistedProjectIdsRef.current.add(loaded.id);
@@ -374,8 +411,11 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       savedSnapshotRef.current = structuredClone(loaded);
       setSelectedTrackId("instrumental");
       setProjectMenuOpen(false);
+      setLoadingProject({ title: loaded.title || "正在载入播放引擎", done: assets.length, total: Math.max(1, assets.length) });
+      await engineRef.current?.setProject(loaded);
       setNcmStatus("工程包已导入");
     } catch (error) { setNcmStatus(error instanceof Error ? error.message : "工程包导入失败"); }
+    finally { loadingProjectRef.current = false; setLoadingProject(null); }
   };
   const deleteSavedProject = async (id: string) => {
     if (savingProject || exporting || processingTrack || recordingTrackId) return;
@@ -1206,6 +1246,10 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
       {currentProject.coverUrl ? <img src={currentProject.coverUrl} alt="" className="h-10 w-10 rounded-xl object-cover" /> : <div className="grid h-10 w-10 place-items-center rounded-xl bg-white/10"><Disc3 size={18} /></div>}
       <div className="min-w-0 flex-1">{renamingProject ? <input autoFocus value={projectTitleDraft} onChange={(event) => setProjectTitleDraft(event.target.value)} onBlur={commitProjectRename} onKeyDown={(event) => { if (event.key === "Enter") commitProjectRename(); if (event.key === "Escape") { setProjectTitleDraft(currentProject.title); setRenamingProject(false); } }} aria-label="工程名称" className="no-drag w-full max-w-xs rounded-lg bg-white/10 px-2 py-1 text-sm font-bold text-white outline-none ring-1 ring-lime-200/50" /> : <div className="flex min-w-0 items-center gap-1"><h1 className="truncate text-sm font-bold">{currentProject.title}</h1><button type="button" onClick={() => { setProjectTitleDraft(currentProject.title); setRenamingProject(true); }} className="no-drag shrink-0 rounded p-1 text-white/35 transition hover:bg-white/10 hover:text-white/80" aria-label="重命名工程" title="重命名工程"><Pencil size={12} /></button></div>}<p className="truncate text-xs text-white/45">{currentProject.artist} · 翻唱工作室</p></div>
       <button type="button" disabled={savingProject || Boolean(recordingTrackId)} onClick={() => void saveProject()} className="flex items-center gap-1.5 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/15 disabled:opacity-40"><Save size={14} />{savingProject ? "保存中…" : "保存"}</button>
+      <div className="flex items-center gap-1 rounded-xl bg-white/[0.04] p-1" role="group" aria-label="编辑历史">
+        <button type="button" aria-label="撤销" title="撤销（Ctrl+Z）" disabled={!canUndo || editLocked || Boolean(loadingProject)} onClick={undo} className="grid h-7 w-7 place-items-center rounded-lg text-white/55 hover:bg-white/10 hover:text-white disabled:opacity-25"><Undo2 size={14} /></button>
+        <button type="button" aria-label="重做" title="重做（Ctrl+Shift+Z）" disabled={!canRedo || editLocked || Boolean(loadingProject)} onClick={redo} className="grid h-7 w-7 place-items-center rounded-lg text-white/55 hover:bg-white/10 hover:text-white disabled:opacity-25"><Redo2 size={14} /></button>
+      </div>
       <div className="relative no-drag">
         <button type="button" disabled={Boolean(recordingTrackId) || savingProject || exporting || processingTrack} title={recordingTrackId ? "请先停止录音" : undefined} aria-haspopup="menu" aria-expanded={projectMenuOpen} onClick={() => { setProjectMenuOpen((open) => !open); setMicMenuOpen(false); setExportMenuOpen(false); }} className="flex items-center justify-between gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/75 transition hover:bg-white/15 disabled:opacity-40"><span>工程</span><ChevronDown size={14} className={`transition-transform ${projectMenuOpen ? "rotate-180" : ""}`} /></button>
         {projectMenuOpen && <div role="menu" aria-label="工程列表" className="absolute right-0 top-full z-[100] mt-2 max-h-60 w-64 overflow-y-auto overscroll-y-contain rounded-xl border border-white/12 bg-slate-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
@@ -1241,6 +1285,13 @@ export default function StudioWorkspace({ project, onBack, onPlayInPlayer }: Pro
         {taskStatus}
       </StudioInstrumentalPopover>
     </header>
+    {loadingProject && <div className="absolute inset-0 z-[190] grid place-items-center bg-slate-950/70 p-6 backdrop-blur-sm" role="status" aria-label="正在打开工程">
+      <div className="w-full max-w-sm rounded-2xl border border-white/12 bg-slate-900/95 p-5 shadow-2xl">
+        <div className="flex items-center gap-3"><span className="h-4 w-4 animate-spin rounded-full border-2 border-lime-200/25 border-t-lime-200" /><div className="min-w-0"><p className="truncate text-sm font-bold text-white">{loadingProject.title}</p><p className="mt-1 text-xs text-white/45">正在恢复音频资源，页面仍在工作</p></div></div>
+        <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-lime-200 transition-[width] duration-300" style={{ width: `${loadingProject.total > 0 ? Math.max(8, loadingProject.done / loadingProject.total * 100) : 8}%` }} /></div>
+        <p className="mt-2 text-right font-mono text-[10px] text-white/35">{loadingProject.done}/{loadingProject.total}</p>
+      </div>
+    </div>}
     <input ref={instrumentalFileRef} aria-label="选择伴奏音频" type="file" accept="audio/*,.wav,.mp3,.flac" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file && !editLockedRef.current && !stemJobRef.current) void importAudio(file); event.currentTarget.value = ""; }} />
     <input ref={ncmFileRef} aria-label="选择 NCM 伴奏源" type="file" accept=".ncm" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file && !editLockedRef.current && !stemJobRef.current) void handleNcm(file); event.currentTarget.value = ""; }} />
     {!instrumentalOpen && !jobId && !exitPromptOpen && ncmStatus && (statusNoticeVisible || exporting) && <div className="absolute right-5 top-[72px] z-[80] w-80 max-w-[calc(100vw-40px)] rounded-xl border border-white/10 bg-slate-900/95 p-1 shadow-xl backdrop-blur-xl">

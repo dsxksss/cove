@@ -7,6 +7,8 @@ import { splitStudioClipAt } from "./clipEditing";
 
 type StudioState = {
   project: StudioProject | null;
+  historyPast: StudioProject[];
+  historyFuture: StudioProject[];
   currentTime: number;
   isPlaying: boolean;
   inputDeviceId: string;
@@ -37,32 +39,46 @@ type StudioState = {
   replaceAssetOnTrack: (trackId: string, asset: StudioAsset, startSec?: number) => void;
   removeTrack: (id: string) => void;
   updateLatency: (value: number) => void;
+  undo: () => void;
+  redo: () => void;
 };
 
 function touch(project: StudioProject): StudioProject {
   return { ...project, updatedAt: new Date().toISOString() };
 }
 
+const HISTORY_LIMIT = 80;
+function historyCommit(state: Pick<StudioState, "project" | "historyPast" | "historyFuture">, project: StudioProject) {
+  if (!state.project || state.project === project) return state;
+  return {
+    project,
+    historyPast: [...state.historyPast, structuredClone(state.project)].slice(-HISTORY_LIMIT),
+    historyFuture: [],
+  };
+}
+
 export const useStudioStore = create<StudioState>((set, get) => ({
   project: null,
+  historyPast: [],
+  historyFuture: [],
   currentTime: 0,
   isPlaying: false,
   inputDeviceId: "default",
   monitorInput: false,
   recordingTrackId: null,
   effectsClipboard: null,
-  setProject: (project) => set({ project: project ? migrateStudioEffectDefaults(repairStudioAssetNames(project)) : null, currentTime: 0, isPlaying: false, recordingTrackId: null }),
+  setProject: (project) => set({ project: project ? migrateStudioEffectDefaults(repairStudioAssetNames(project)) : null, historyPast: [], historyFuture: [], currentTime: 0, isPlaying: false, recordingTrackId: null }),
   setCurrentTime: (currentTime) => set({ currentTime: Math.max(0, currentTime) }),
   setPlaying: (isPlaying) => set({ isPlaying }),
   setInputDeviceId: (inputDeviceId) => set({ inputDeviceId }),
   setMonitorInput: (monitorInput) => set({ monitorInput }),
   setRecordingTrackId: (recordingTrackId) => set({ recordingTrackId }),
-  updateProjectTitle: (title) => set((state) => state.project ? { project: touch({ ...state.project, title: title.trim() || state.project.title }) } : state),
+  updateProjectTitle: (title) => set((state) => state.project ? historyCommit(state, touch({ ...state.project, title: title.trim() || state.project.title })) : state),
   addVocalTrack: () => {
     const project = get().project;
     if (!project) return null;
     const track = createVocalTrack(project.tracks.filter((track) => track.kind === "vocal").length + 1);
-    set({ project: touch({ ...project, tracks: [...project.tracks, track] }) });
+    set((state) => historyCommit(state, touch({ ...project, tracks: [...project.tracks, track] })));
     return track.id;
   },
   addReferenceTrack: (stem = "original") => {
@@ -71,36 +87,36 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const existing = project.tracks.find((track) => track.kind === "reference" && (track.referenceStem ?? "original") === stem);
     if (existing) return existing.id;
     const track = createReferenceTrack(stem);
-    set({ project: touch({ ...project, tracks: [...project.tracks, track] }) });
+    set((state) => historyCommit(state, touch({ ...project, tracks: [...project.tracks, track] })));
     return track.id;
   },
   updateTrack: (id, patch) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, ...patch } : track) }) };
+    return historyCommit(state, touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, ...patch } : track) }));
   }),
   renameTrack: (id, name) => set((state) => {
     if (!state.project) return state;
     const nextName = name.trim();
     if (!nextName) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, name: nextName } : track) }) };
+    return historyCommit(state, touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, name: nextName } : track) }));
   }),
   updateMixer: (id, patch) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => {
+    return historyCommit(state, touch({ ...state.project, tracks: state.project.tracks.map((track) => {
       if (track.id !== id) return track;
       const mixer = { ...track.mixer, ...patch };
       if (patch.solo === true) mixer.mute = false;
       if (patch.mute === true) mixer.solo = false;
       return { ...track, mixer };
-    }) }) };
+    }) }));
   }),
   updateEffects: (id, effects) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: { ...track.effects, ...effects, eq: { ...track.effects.eq, ...effects.eq }, compressor: { ...track.effects.compressor, ...effects.compressor }, reverb: { ...track.effects.reverb, ...effects.reverb }, delay: { ...track.effects.delay, ...effects.delay } } } : track) }) };
+    return historyCommit(state, touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: { ...track.effects, ...effects, eq: { ...track.effects.eq, ...effects.eq }, compressor: { ...track.effects.compressor, ...effects.compressor }, reverb: { ...track.effects.reverb, ...effects.reverb }, delay: { ...track.effects.delay, ...effects.delay } } } : track) }));
   }),
   resetEffects: (id) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: structuredClone(DEFAULT_EFFECTS) } : track) }) };
+    return historyCommit(state, touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: structuredClone(DEFAULT_EFFECTS) } : track) }));
   }),
   copyEffects: (id) => set((state) => {
     const track = state.project?.tracks.find((item) => item.id === id);
@@ -109,11 +125,11 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   pasteEffects: (id) => set((state) => {
     const { project, effectsClipboard } = state;
     if (!project || !effectsClipboard || !project.tracks.some((track) => track.id === id)) return state;
-    return { project: touch({ ...project, tracks: project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: structuredClone(effectsClipboard.effects) } : track) }) };
+    return historyCommit(state, touch({ ...project, tracks: project.tracks.map((track) => track.id === id ? { ...track, effectsVersion: 1, effects: structuredClone(effectsClipboard.effects) } : track) }));
   }),
   updateClip: (trackId, clipId, patch) => set((state) => {
     if (!state.project || state.recordingTrackId) return state;
-    return { project: touch({
+    return historyCommit(state, touch({
       ...state.project,
       tracks: state.project.tracks.map((track) => {
         if (track.id !== trackId) return track;
@@ -128,11 +144,11 @@ export const useStudioStore = create<StudioState>((set, get) => ({
           return { ...next, startSec: start, offsetSec: offset, durationSec: duration };
         }) };
       }),
-    }) };
+    }));
   }),
   removeClip: (trackId, clipId) => set((state) => {
     if (!state.project || state.recordingTrackId) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === trackId ? { ...track, clips: track.clips.filter((clip) => clip.id !== clipId) } : track) }) };
+    return historyCommit(state, touch({ ...state.project, tracks: state.project.tracks.map((track) => track.id === trackId ? { ...track, clips: track.clips.filter((clip) => clip.id !== clipId) } : track) }));
   }),
   duplicateClip: (trackId, clipId) => set((state) => {
     const project = state.project;
@@ -140,7 +156,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const clip = track?.clips.find(clip => clip.id === clipId);
     if (!project || !track || !clip || state.recordingTrackId) return state;
     const duplicate = { ...clip, id: `clip-${crypto.randomUUID()}`, startSec: clip.startSec + clip.durationSec };
-    return { project: touch({ ...project, tracks: project.tracks.map(item => item.id === trackId ? { ...item, clips: [...item.clips, duplicate] } : item) }) };
+    return historyCommit(state, touch({ ...project, tracks: project.tracks.map(item => item.id === trackId ? { ...item, clips: [...item.clips, duplicate] } : item) }));
   }),
   splitClip: (trackId, clipId, timeSec) => set((state) => {
     const project = state.project;
@@ -150,22 +166,22 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const split = splitStudioClipAt(track, clip, timeSec);
     if (!split) return state;
     const right = { ...split.right, id: `clip-${crypto.randomUUID()}` };
-    return { project: touch({ ...project, tracks: project.tracks.map(item => item.id === trackId ? { ...item, clips: item.clips.flatMap(part => part.id === clipId ? [split.left, right] : [part]) } : item) }) };
+    return historyCommit(state, touch({ ...project, tracks: project.tracks.map(item => item.id === trackId ? { ...item, clips: item.clips.flatMap(part => part.id === clipId ? [split.left, right] : [part]) } : item) }));
   }),
   addAssetToTrack: (trackId, asset, take, startSec = 0) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({ ...state.project, instrumental: trackId === "instrumental" ? asset : state.project.instrumental, tracks: state.project.tracks.map((track) => {
+    return historyCommit(state, touch({ ...state.project, instrumental: trackId === "instrumental" ? asset : state.project.instrumental, tracks: state.project.tracks.map((track) => {
       if (track.id !== trackId) return track;
       const nextTake = take ?? { id: `take-${Date.now()}`, assetId: asset.id, createdAt: new Date().toISOString(), label: `Take ${track.takes.length + 1}` };
       // Advancing a recording across song time zero must trim its audible
       // head, not silently discard the compensation. Keep the full take.
       const offsetSec = Math.min(asset.durationSec, Math.max(0, -startSec));
       return { ...track, assets: [...track.assets, asset], takes: track.kind === "vocal" ? [...track.takes, nextTake] : track.takes, clips: [...track.clips, { id: `clip-${Date.now()}`, assetId: asset.id, startSec: Math.max(0, startSec), offsetSec, durationSec: Math.max(0, asset.durationSec - offsetSec) }] };
-    }) }) };
+    }) }));
   }),
   replaceAssetOnTrack: (trackId, asset, startSec = 0) => set((state) => {
     if (!state.project) return state;
-    return { project: touch({
+    return historyCommit(state, touch({
       ...state.project,
       instrumental: trackId === "instrumental" ? asset : state.project.instrumental,
       tracks: state.project.tracks.map((track) => track.id !== trackId ? track : {
@@ -176,11 +192,21 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         clips: [{ id: `clip-${Date.now()}`, assetId: asset.id, startSec: Math.max(0, startSec), offsetSec: 0, durationSec: asset.durationSec }],
         takes: track.kind === "instrumental" ? [] : track.takes,
       }),
-    }) };
+    }));
   }),
   removeTrack: (id) => set((state) => {
     if (!state.project || id === "instrumental" || id === state.recordingTrackId) return state;
-    return { project: touch({ ...state.project, tracks: state.project.tracks.filter((track) => track.id !== id) }) };
+    return historyCommit(state, touch({ ...state.project, tracks: state.project.tracks.filter((track) => track.id !== id) }));
   }),
-  updateLatency: (inputLatencyMs) => set((state) => state.project ? { project: touch({ ...state.project, inputLatencyMs }) } : state),
+  updateLatency: (inputLatencyMs) => set((state) => state.project ? historyCommit(state, touch({ ...state.project, inputLatencyMs })) : state),
+  undo: () => set((state) => {
+    if (!state.project || state.historyPast.length === 0) return state;
+    const project = state.historyPast[state.historyPast.length - 1];
+    return { project, historyPast: state.historyPast.slice(0, -1), historyFuture: [...state.historyFuture, structuredClone(state.project)].slice(-HISTORY_LIMIT) };
+  }),
+  redo: () => set((state) => {
+    if (!state.project || state.historyFuture.length === 0) return state;
+    const project = state.historyFuture[state.historyFuture.length - 1];
+    return { project, historyPast: [...state.historyPast, structuredClone(state.project)].slice(-HISTORY_LIMIT), historyFuture: state.historyFuture.slice(0, -1) };
+  }),
 }));

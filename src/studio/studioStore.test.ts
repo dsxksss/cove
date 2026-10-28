@@ -334,4 +334,23 @@ describe("studio editing state", () => {
     expect(track.mixer.gain).toBe(1.8);
     expect(track.mixer.pan).toBe(-0.4);
   });
+
+  it("undoes and redoes project edits without changing transport state", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    const original = structuredClone(useStudioStore.getState().project!);
+    store.renameTrack(vocalId, "主唱");
+    store.updateMixer(vocalId, { pan: -0.4 });
+    expect(useStudioStore.getState().historyPast.length).toBe(2);
+    store.undo();
+    expect(useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!.mixer.pan).toBe(0);
+    store.undo();
+    expect(useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!.name).toBe(original.tracks.find(track => track.id === vocalId)!.name);
+    expect(useStudioStore.getState().historyFuture.length).toBe(2);
+    store.redo();
+    expect(useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!.name).toBe("主唱");
+    store.redo();
+    expect(useStudioStore.getState().project!.tracks.find(track => track.id === vocalId)!.mixer.pan).toBe(-0.4);
+    expect(useStudioStore.getState().historyFuture.length).toBe(0);
+  });
 });
