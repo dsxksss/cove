@@ -12,7 +12,7 @@ export function migrateStudioEffectDefaults(project: StudioProject): StudioProje
   const tracks = project.tracks.map(track => {
     if (track.effectsVersion === 1) return track;
     changed = true;
-    const untouched = (Object.keys(legacyDefaults) as (keyof StudioEffects)[]).every(group =>
+    const untouched = !track.effects.outputDb && !track.effects.eq.bands && !track.effects.eq.outputDb && !track.effects.eq.bypass && (["eq", "compressor", "reverb", "delay"] as const).every(group =>
       Object.entries(legacyDefaults[group]).every(([key, value]) =>
         (track.effects[group] as Record<string, number>)[key] === value));
     return { ...track, effectsVersion: 1 as const, effects: untouched ? structuredClone(DEFAULT_EFFECTS) : track.effects };

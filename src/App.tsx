@@ -36,8 +36,7 @@ import {
   Mic2,
 } from "lucide-react";
 import GlassPlayer from "./components/GlassPlayer";
-import StudioWorkspace from "./components/StudioWorkspace";
-import { StudioQueueIndicator } from "./components/StudioQueueIndicator";
+import { STUDIO_ENABLED } from "./lib/buildFeatures";
 import { ToastHost } from "./components/ToastHost";
 import type { LyricMotionStyle, PlayerLayout, Song as PlayerSong } from "./components/playerTypes";
 import { getAudio } from "./lib/audio";
@@ -102,6 +101,8 @@ import { getProjectDuration } from "./lib/studioSchedule";
 const LoginPanel = lazy(() =>
   import("./components/LoginPanel").then((module) => ({ default: module.LoginPanel })),
 );
+const StudioWorkspace = STUDIO_ENABLED ? lazy(() => import("./components/StudioWorkspace")) : () => null;
+const StudioQueueIndicator = STUDIO_ENABLED ? lazy(() => import("./components/StudioQueueIndicator").then(module => ({ default: module.StudioQueueIndicator }))) : () => null;
 
 /** Default "My Favorites" playlist id detected for this account.
  *  Overridable via localStorage "nmp.favPlaylistId". */
@@ -770,6 +771,7 @@ export default function App() {
   const shown = activePlayerSong ?? emptySong;
 
   const openStudioForSong = useCallback(async (song: Song | undefined) => {
+    if (!STUDIO_ENABLED) return;
     if (!song) {
       toast("请先播放或选择一首歌曲", { tone: "error" });
       return;
@@ -843,6 +845,7 @@ export default function App() {
   }, [activeRaw, cover, level, lyrics, shown.artist, shown.duration, shown.title, studioProject]);
 
   const playStudioMixInPlayer = useCallback(async (audioUrl: string, project: StudioProject, returnProject: StudioProject) => {
+    if (!STUDIO_ENABLED) return;
     const previous = usePlayerStore.getState();
     const audio = getAudio();
     const previousSrc = audio.getAttribute("src");
@@ -1094,14 +1097,16 @@ export default function App() {
       />}
 
       <div className="relative z-10 w-full h-full">
-        <StudioQueueIndicator hidden={studioOpen || queueOpen || searchOpen || playlistsOpen || settingsOpen} />
-        {studioOpen && studioProject ? (
+        {STUDIO_ENABLED && <Suspense fallback={null}><StudioQueueIndicator hidden={studioOpen || queueOpen || searchOpen || playlistsOpen || settingsOpen} /></Suspense>}
+        {STUDIO_ENABLED && studioOpen && studioProject ? (
+          <Suspense fallback={<div className="grid h-full place-items-center text-sm text-white/50">正在打开工作室…</div>}>
           <StudioWorkspace
             key={studioProject.id}
             project={studioProject}
             onBack={(updatedProject) => { if (updatedProject) setStudioProject(updatedProject); setStudioOpen(false); }}
             onPlayInPlayer={playStudioMixInPlayer}
           />
+          </Suspense>
         ) : (
           <GlassPlayer
             song={shown}
@@ -1853,7 +1858,7 @@ function SongActionDialog({
               </button>
             </div>
 
-            <button
+            {STUDIO_ENABLED && <button
               type="button"
               onClick={() => {
                 onOpenStudio(song);
@@ -1863,7 +1868,7 @@ function SongActionDialog({
             >
               <Mic2 size={17} />
               打开翻唱工作室
-            </button>
+            </button>}
 
             <button
               type="button"

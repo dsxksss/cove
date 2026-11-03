@@ -1,10 +1,12 @@
 import type { StudioAsset, StudioProject, StudioTrack } from "../studio/types";
 import { createTrackGraph, type TrackGraph } from "./studioDsp";
-import { getProjectDuration, isTrackAudible, scheduledClip, trackOffsetSeconds } from "./studioSchedule";
+import { getClipDuration, getProjectDuration, isTrackAudible, scheduledClip, trackOffsetSeconds } from "./studioSchedule";
+import { createClipEnvelope } from "./studioFades";
 import { decodeStudioAsset } from "./studioAssetAudio";
+import { normalizePitch, studioAssetPlaybackKey } from "./studioPitch";
 
 type LoadedAsset = { buffer: AudioBuffer; url: string };
-type ScheduledSource = { source: AudioBufferSourceNode; trackId: string };
+type ScheduledSource = { source: AudioBufferSourceNode; trackId: string; envelope: GainNode | null };
 
 /**
  * Shared realtime transport for a StudioProject. Every clip owns an
@@ -75,22 +77,23 @@ export class StudioAudioEngine {
     // version into RAM. Only clips currently on the timeline need PCM buffers.
     const activeAssets = project.tracks.flatMap((track) => {
       const ids = new Set(track.clips.map((clip) => clip.assetId));
-      return track.assets.filter((asset) => ids.has(asset.id));
+      return track.assets.filter((asset) => ids.has(asset.id)).map(asset => ({ asset, pitch: track.pitch }));
     });
-    const requestedUrls = new Map(activeAssets.map((asset) => [asset.id, asset.url] as const));
+    const requestedUrls = new Map(activeAssets.map(({ asset, pitch }) => [studioAssetPlaybackKey(asset, pitch), asset.url] as const));
     for (const [id, loaded] of this.loaded) if (requestedUrls.get(id) !== loaded.url) this.loaded.delete(id);
     this.structureKey = nextKey;
     this.updateGraphs(project.tracks);
 
-    const requested = new Map<string, StudioAsset>();
-    for (const asset of activeAssets) {
-        if (requested.has(asset.id) || this.loaded.get(asset.id)?.url === asset.url) continue;
-        requested.set(asset.id, asset);
+    const requested = new Map<string, { asset: StudioAsset; pitch: typeof project.tracks[number]["pitch"] }>();
+    for (const { asset, pitch } of activeAssets) {
+        const key = studioAssetPlaybackKey(asset, pitch);
+        if (requested.has(key) || this.loaded.get(key)?.url === asset.url) continue;
+        requested.set(key, { asset, pitch });
     }
-    const loading = Promise.all([...requested.values()].map(async (asset) => {
-      const { id, url } = asset;
+    const loading = Promise.all([...requested.entries()].map(async ([id, { asset, pitch }]) => {
+      const { url } = asset;
       try {
-        const buffer = await decodeStudioAsset(this.context, asset);
+        const buffer = await decodeStudioAsset(this.context, asset, pitch);
         if (revision === this.loadRevision && this.project?.id === project.id) this.loaded.set(id, { buffer, url });
       } catch (error) {
         if (revision === this.loadRevision && this.project?.id === project.id) {
@@ -133,6 +136,7 @@ export class StudioAudioEngine {
     for (const item of this.sources) {
       try { item.source.stop(); } catch { /* already stopped */ }
       item.source.disconnect();
+      item.envelope?.disconnect();
     }
     this.sources = [];
   }
@@ -154,7 +158,8 @@ export class StudioAudioEngine {
       for (const track of this.project?.tracks ?? []) {
         if (!isTrackAudible(track, hasSolo)) continue;
         for (const clip of track.clips) {
-          const error = this.loadErrors.get(clip.assetId);
+          const asset = track.assets.find(candidate => candidate.id === clip.assetId);
+          const error = asset ? this.loadErrors.get(studioAssetPlaybackKey(asset, track.pitch)) : undefined;
           if (error && clip.startSec + trackOffsetSeconds(track) + clip.durationSec > startPosition) throw error;
         }
       }
@@ -168,7 +173,7 @@ export class StudioAudioEngine {
       this.startContextTime = origin;
       for (const item of scheduled) {
         item.source.start(item.when, item.offset, item.duration);
-        this.sources.push({ source: item.source, trackId: item.trackId });
+        this.sources.push({ source: item.source, trackId: item.trackId, envelope: item.envelope });
       }
     } catch (error) {
       if (transportRevision !== this.transportRevision) return;
@@ -177,8 +182,8 @@ export class StudioAudioEngine {
     }
   }
 
-  private buildSources(project: StudioProject, time: number, origin: number): Array<{ source: AudioBufferSourceNode; trackId: string; when: number; offset: number; duration: number }> {
-    const result: Array<{ source: AudioBufferSourceNode; trackId: string; when: number; offset: number; duration: number }> = [];
+  private buildSources(project: StudioProject, time: number, origin: number): Array<ScheduledSource & { when: number; offset: number; duration: number }> {
+    const result: Array<ScheduledSource & { when: number; offset: number; duration: number }> = [];
     for (const track of project.tracks) {
       // Schedule muted tracks as well so unmuting/solo changes work immediately.
       // The track graph is the sole authority for audibility.
@@ -186,7 +191,7 @@ export class StudioAudioEngine {
       if (!graph) continue;
       for (const clip of track.clips) {
         const asset = track.assets.find((candidate) => candidate.id === clip.assetId);
-        const loaded = asset ? this.loaded.get(asset.id) : undefined;
+        const loaded = asset ? this.loaded.get(studioAssetPlaybackKey(asset, track.pitch)) : undefined;
         if (!asset || !loaded) continue;
         const scheduled = scheduledClip(clip, { durationSec: loaded.buffer.duration }, track);
         const clipStart = scheduled.startSec;
@@ -196,8 +201,10 @@ export class StudioAudioEngine {
         const elapsed = Math.max(0, time - clipStart);
         const source = this.context.createBufferSource();
         source.buffer = loaded.buffer;
-        source.connect(graph.input);
-        result.push({ source, trackId: track.id, when: origin + Math.max(0, clipStart - time), offset: Math.min(loaded.buffer.duration, offset + elapsed), duration: Math.max(0.001, duration - elapsed) });
+        const when = origin + Math.max(0, clipStart - time);
+        const envelope = createClipEnvelope(this.context, graph.input, clip, getClipDuration(clip, { durationSec: loaded.buffer.duration }), when, scheduled.offsetSec - clip.offsetSec + elapsed);
+        source.connect(envelope ?? graph.input);
+        result.push({ source, envelope, trackId: track.id, when, offset: Math.min(loaded.buffer.duration, offset + elapsed), duration: Math.max(0.001, duration - elapsed) });
       }
     }
     return result;
@@ -223,6 +230,8 @@ export class StudioAudioEngine {
     return data;
   }
 
+  spectrum(trackId: string) { return this.graphs.get(trackId)?.spectrum() ?? null; }
+
   dispose(): void {
     ++this.loadRevision;
     this.pause();
@@ -240,7 +249,8 @@ function projectStructureKey(project: StudioProject): string {
   return JSON.stringify(project.tracks.map((track) => ({
     id: track.id,
     assets: track.assets.map((asset) => [asset.id, asset.url]),
-    clips: track.clips.map((clip) => [clip.id, clip.assetId, clip.startSec, clip.offsetSec, clip.durationSec]),
+    clips: track.clips.map((clip) => [clip.id, clip.assetId, clip.startSec, clip.offsetSec, clip.durationSec, clip.fadeInSec ?? 0, clip.fadeOutSec ?? 0]),
     offsetMs: track.offsetMs ?? 0,
+    pitch: normalizePitch(track.pitch),
   })));
 }

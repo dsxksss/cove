@@ -1,5 +1,6 @@
 import { getClipDuration, scheduledClip, trackOffsetSeconds } from "../lib/studioSchedule";
 import type { StudioClip, StudioTrack } from "./types";
+import { getClipFades } from "../lib/studioFades";
 
 export const MIN_STUDIO_CLIP_DURATION_SEC = 0.05;
 const TIME_EPSILON = 1e-9;
@@ -23,12 +24,13 @@ export function splitStudioClipAt(track: StudioTrack, clip: StudioClip, timeSec:
   const delta = timeSec - clip.startSec - trackOffsetSeconds(track);
   const usableDuration = getClipDuration(clip, asset);
   return {
-    left: { ...clip, durationSec: delta },
+    left: { ...clip, durationSec: delta, ...getClipFades({ fadeInSec: clip.fadeInSec }, delta) },
     right: {
       ...clip,
       startSec: clip.startSec + delta,
       offsetSec: clip.offsetSec + delta,
       durationSec: usableDuration - delta,
+      ...getClipFades({ fadeOutSec: clip.fadeOutSec }, usableDuration - delta),
     },
   };
 }

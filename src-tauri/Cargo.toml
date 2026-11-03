@@ -1,10 +1,14 @@
 [package]
 name = "netease-music-player"
-version = "1.5.6"
+version = "1.5.7"
 description = "Cove 可沃 — multi-source immersive desktop music player"
 authors = ["you"]
 edition = "2021"
 rust-version = "1.77"
+
+[features]
+default = ["studio"]
+studio = ["dep:rfd", "dep:zip"]
 
 [lib]
 name = "netease_music_player_lib"
@@ -16,7 +20,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-single-instance = "2"
-rfd = "=0.15.4"
+rfd = { version = "=0.15.4", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -24,7 +28,7 @@ aes = "0.8"
 ecb = { version = "0.1", features = ["alloc"] }
 md5 = "0.7"
 tokio = { version = "1", features = ["macros"] }
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
 
 [profile.release]
 panic = "abort"

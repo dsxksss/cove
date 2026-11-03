@@ -175,7 +175,7 @@ describe("studio transport state", () => {
     context.currentTime += 1;
     const position = engine.currentTime;
     await engine.setProject(changed);
-    expect(context.filters.map(filter => filter.gain.value)).toEqual([-4, 5, 2]);
+    expect([0, 3, 6].map(index => context.filters[index].gain.value)).toEqual([-4, 5, 2]);
     expect(context.decodes).toBe(1);
     expect(context.sources.length).toBe(1);
     expect(context.sources[0]).toBe(source);

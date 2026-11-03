@@ -242,6 +242,41 @@ pub async fn studio_denoise_asset(project_id: String, asset_id: String, strength
     }).await.map_err(|e| e.to_string())?
 }
 
+fn pitch_filter(semitones: f64, preserve_formants: bool, duration_sec: f64) -> Result<String, String> {
+    if !semitones.is_finite() || !(-24.0..=24.0).contains(&semitones) || !duration_sec.is_finite() || duration_sec <= 0.0 || duration_sec > 86400.0 {
+        return Err("移调参数无效：支持 ±24 半音和 24 小时以内音频".into());
+    }
+    let factor = 2_f64.powf(semitones / 12.0);
+    let formant = if preserve_formants { "preserved" } else { "shifted" };
+    let frames = (duration_sec * 48000.0).round().max(1.0) as u64;
+    Ok(format!("aresample=48000,rubberband=tempo=1:pitch={factor:.10}:formant={formant}:pitchq=quality,apad=whole_len={frames},atrim=end_sample={frames},asetpts=N/SR/TB"))
+}
+
+#[tauri::command]
+pub async fn studio_pitch_audio(input_base64: String, semitones: f64, preserve_formants: bool, duration_sec: f64) -> Result<String, String> {
+    let filter = pitch_filter(semitones, preserve_formants, duration_sec)?;
+    if input_base64.len() > 720 * 1024 * 1024 { return Err("音频超过 512 MiB 限制".into()); }
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = super::decode_base64(&input_base64).ok_or("音频数据无效")?;
+        let dir = std::env::temp_dir().join(format!("cove-pitch-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()));
+        fs::create_dir(&dir).map_err(|e| e.to_string())?;
+        let source = dir.join("source.audio");
+        let output = dir.join("shifted.wav");
+        let result = (|| {
+            fs::write(&source, bytes).map_err(|e| e.to_string())?;
+            let mut command = Command::new(studio_ffmpeg());
+            #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
+            let status = command.args(["-v", "error", "-nostdin", "-y", "-i"]).arg(&source)
+                .args(["-vn", "-af", &filter, "-c:a", "pcm_s24le"]).arg(&output).output()
+                .map_err(|e| format!("无法启动移调，需要带 Rubber Band 的 FFmpeg：{e}"))?;
+            if !status.status.success() { return Err(format!("移调失败，请确认 FFmpeg 支持 rubberband：{}", String::from_utf8_lossy(&status.stderr).chars().take(800).collect::<String>())); }
+            fs::read(&output).map(|bytes| encode_base64(&bytes)).map_err(|e| e.to_string())
+        })();
+        let _ = fs::remove_file(&source); let _ = fs::remove_file(&output); let _ = fs::remove_dir(&dir);
+        result
+    }).await.map_err(|e| e.to_string())?
+}
+
 fn studio_ffmpeg() -> PathBuf {
     #[cfg(debug_assertions)]
     {
@@ -544,6 +579,42 @@ pub fn studio_encode_mp3(project_id: String, input_base64: String) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validates_pitch_and_preserves_timeline_filter() {
+        for pitch in [f64::NAN, f64::INFINITY, 24.1, -24.1] { assert!(pitch_filter(pitch, true, 2.0).is_err()); }
+        for duration in [0.0, -1.0, f64::NAN, 86401.0] { assert!(pitch_filter(12.0, true, duration).is_err()); }
+        let filter = pitch_filter(12.0, true, 2.0).unwrap();
+        assert!(filter.contains("tempo=1:pitch=2.0000000000:formant=preserved"));
+        assert!(filter.contains("atrim=end_sample=96000"));
+    }
+
+    #[tokio::test]
+    async fn actual_ffmpeg_pitch_changes_frequency_without_changing_length() {
+        let rate = 48000_u32;
+        let pcm: Vec<i16> = (0..rate * 2).map(|i| (0.2 * 32767.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / rate as f64).sin()) as i16).collect();
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF"); wav.extend_from_slice(&(36 + pcm.len() as u32 * 2).to_le_bytes()); wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes()); wav.extend_from_slice(&1_u16.to_le_bytes()); wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes()); wav.extend_from_slice(&(rate * 2).to_le_bytes()); wav.extend_from_slice(&2_u16.to_le_bytes()); wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data"); wav.extend_from_slice(&(pcm.len() as u32 * 2).to_le_bytes());
+        for sample in pcm { wav.extend_from_slice(&sample.to_le_bytes()); }
+        for (semitones, preserve, expected) in [(12.0, false, 880.0), (-12.0, false, 220.0), (12.0, true, 880.0)] {
+            let encoded = studio_pitch_audio(encode_base64(&wav), semitones, preserve, 2.0).await.expect("bundled FFmpeg Rubber Band processing");
+            let output = super::super::decode_base64(&encoded).unwrap();
+            let mut offset = 12;
+            let mut audio = None;
+            while offset + 8 <= output.len() {
+                let length = u32::from_le_bytes(output[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                if &output[offset..offset + 4] == b"data" { audio = Some(&output[offset + 8..offset + 8 + length]); break; }
+                offset += 8 + length + length % 2;
+            }
+            let audio = audio.expect("24-bit PCM data");
+            assert_eq!(audio.len(), 96000 * 3, "pitch must keep the exact original duration");
+            let samples: Vec<i32> = audio.chunks_exact(3).map(|p| i32::from_le_bytes([p[0], p[1], p[2], if p[2] & 0x80 != 0 { 255 } else { 0 }])).collect();
+            let crossings = samples[24000..72000].windows(2).filter(|p| p[0] <= 0 && p[1] > 0).count() as f64;
+            assert!((crossings - expected).abs() <= 3.0, "expected {expected} Hz, measured {crossings} Hz");
+        }
+    }
     #[test]
     fn stem_caches_preserve_old_paths_and_reject_other_names() {
         assert_eq!(stem_cache_names(None).unwrap(), ("meta.json", "instrumental.audio"));

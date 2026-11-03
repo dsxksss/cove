@@ -5,6 +5,7 @@
 // a separately running local API service.
 
 mod desktop_background;
+#[cfg(feature = "studio")]
 mod studio_files;
 #[cfg(target_os = "windows")]
 mod window_shape;
@@ -54,6 +55,7 @@ struct NeteaseState {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(feature = "studio")]
 struct StemJob {
     id: String,
     state: String,
@@ -67,18 +69,23 @@ struct StemJob {
     indeterminate: bool,
 }
 
+#[cfg(feature = "studio")]
 type StemJobsState = std::sync::Arc<Mutex<HashMap<String, StemJob>>>;
 
 // Only one model may run at a time, including download/preparation and the
 // interval after cancellation while the previous process is still exiting.
+#[cfg(feature = "studio")]
 static STEM_JOB_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "studio")]
 struct StemJobPermit;
+#[cfg(feature = "studio")]
 impl StemJobPermit {
     fn acquire() -> Result<Self, String> {
         STEM_JOB_ACTIVE.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
             .map(|_| Self).map_err(|_| "已有伴奏任务正在处理或停止中，请稍后重试".into())
     }
 }
+#[cfg(feature = "studio")]
 impl Drop for StemJobPermit {
     fn drop(&mut self) { STEM_JOB_ACTIVE.store(false, std::sync::atomic::Ordering::Release); }
 }
@@ -5594,6 +5601,7 @@ fn safe_file_name(name: Option<&str>) -> String {
     if clean.is_empty() { "input.ncm".to_string() } else { clean }
 }
 
+#[cfg(feature = "studio")]
 fn update_stem_job(jobs: &StemJobsState, id: &str, update: impl FnOnce(&mut StemJob)) {
     if let Ok(mut guard) = jobs.lock() {
         if let Some(job) = guard.get_mut(id) { update(job); }
@@ -5601,6 +5609,7 @@ fn update_stem_job(jobs: &StemJobsState, id: &str, update: impl FnOnce(&mut Stem
 }
 
 #[tauri::command]
+#[cfg(feature = "studio")]
 async fn studio_download_source(
     args: StudioDownloadSourceArgs,
     state: State<'_, NeteaseState>,
@@ -5623,6 +5632,7 @@ async fn studio_download_source(
 }
 
 #[tauri::command]
+#[cfg(feature = "studio")]
 async fn studio_prepare_instrumental(
     args: StudioPrepareArgs,
     jobs: State<'_, StemJobsState>,
@@ -5783,17 +5793,20 @@ async fn studio_prepare_instrumental(
 }
 
 #[tauri::command]
+#[cfg(feature = "studio")]
 fn studio_job_status(job_id: String, jobs: State<'_, StemJobsState>) -> Result<StemJob, String> {
     jobs.lock().map_err(|_| "伴奏任务状态锁定失败")?.get(&job_id).cloned().ok_or_else(|| "找不到伴奏任务".into())
 }
 
 #[tauri::command]
+#[cfg(feature = "studio")]
 fn studio_cancel_job(job_id: String, jobs: State<'_, StemJobsState>) -> Result<(), String> {
     update_stem_job(&jobs.inner().clone(), &job_id, |job| { if matches!(job.state.as_str(), "queued" | "running") { job.state = "cancelled".into(); job.error = Some("用户取消了伴奏任务".into()); } });
     Ok(())
 }
 
 #[tauri::command]
+#[cfg(feature = "studio")]
 fn studio_job_audio(job_id: String, stem: Option<String>, jobs: State<'_, StemJobsState>) -> Result<Value, String> {
     let job = jobs.lock().map_err(|_| "任务锁定失败")?.get(&job_id).cloned().ok_or("找不到伴奏任务")?;
     if job.state != "completed" { return Err("伴奏尚未完成".into()); }
@@ -5986,20 +5999,51 @@ async fn netease_user_playlists(
     }))
 }
 
+fn cove_invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    macro_rules! handler {
+        ($($studio:path),* $(,)?) => {
+            tauri::generate_handler![
+                set_desktop_blur, netease_qr_key, netease_qr_check, netease_login_status,
+                netease_logout, netease_search, netease_song_url, netease_song_metadata,
+                netease_playlist_page, netease_user_playlists, auth_status, auth_logout_all,
+                qq_auth_status, qq_logout, qq_qr_key, qq_qr_check, kugou_auth_status,
+                kugou_logout, kugou_qr_key, kugou_qr_check, kugou_user_playlists,
+                kugou_playlist_page, qq_user_playlists, qq_playlist_page, http_proxy,
+                qq_search, qq_song_play, kugou_search, kugou_song_play, load_app_playlists,
+                save_app_playlists, $($studio),*
+            ]
+        };
+    }
+    #[cfg(feature = "studio")]
+    { handler!(
+        studio_prepare_instrumental, studio_download_source, studio_job_status, studio_cancel_job,
+        studio_files::studio_write_asset, studio_files::studio_read_asset,
+        studio_files::studio_cache_read, studio_files::studio_cache_write, studio_files::studio_cache_remove,
+        studio_files::studio_save_project, studio_files::studio_load_project, studio_files::studio_list_projects,
+        studio_files::studio_delete_project, studio_files::studio_export_package_to_file, studio_files::studio_import_package,
+        studio_files::studio_save_export, studio_files::studio_encode_mp3, studio_files::studio_denoise_asset,
+        studio_files::studio_pitch_audio, studio_job_audio
+    ) }
+    #[cfg(not(feature = "studio"))]
+    { handler!() }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let client = http_clients().default.clone();
     let cookie_file = cookie_file_path();
     let device_file = cookie_file.with_file_name("device_id.txt");
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "studio")]
+    let builder = builder.manage(std::sync::Arc::new(Mutex::new(HashMap::<String, StemJob>::new())));
+    builder
         .manage(NeteaseState {
             client,
             cookie_file,
             device_file,
             playlist_cache: Mutex::new(HashMap::new()),
         })
-        .manage(std::sync::Arc::new(Mutex::new(HashMap::<String, StemJob>::new())))
         .manage(QqLoginState {
             pending: Mutex::new(None),
         })
@@ -6088,58 +6132,7 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .invoke_handler(tauri::generate_handler![
-            set_desktop_blur,
-            netease_qr_key,
-            netease_qr_check,
-            netease_login_status,
-            netease_logout,
-            netease_search,
-            netease_song_url,
-            netease_song_metadata,
-            netease_playlist_page,
-            netease_user_playlists,
-            auth_status,
-            auth_logout_all,
-            qq_auth_status,
-            qq_logout,
-            qq_qr_key,
-            qq_qr_check,
-            kugou_auth_status,
-            kugou_logout,
-            kugou_qr_key,
-            kugou_qr_check,
-            kugou_user_playlists,
-            kugou_playlist_page,
-            qq_user_playlists,
-            qq_playlist_page,
-            http_proxy,
-            qq_search,
-            qq_song_play,
-            kugou_search,
-            kugou_song_play,
-            load_app_playlists,
-            save_app_playlists,
-            studio_prepare_instrumental,
-            studio_download_source,
-            studio_job_status,
-            studio_cancel_job,
-            studio_files::studio_write_asset,
-            studio_files::studio_read_asset,
-            studio_files::studio_cache_read,
-            studio_files::studio_cache_write,
-            studio_files::studio_cache_remove,
-            studio_files::studio_save_project,
-            studio_files::studio_load_project,
-            studio_files::studio_list_projects,
-            studio_files::studio_delete_project,
-            studio_files::studio_export_package_to_file,
-            studio_files::studio_import_package,
-            studio_files::studio_save_export,
-            studio_files::studio_encode_mp3,
-            studio_files::studio_denoise_asset,
-            studio_job_audio
-        ])
+        .invoke_handler(cove_invoke_handler())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,9 +1,11 @@
 import type { StudioEffects, StudioTrack } from "../studio/types";
+import { configureEqFilter, getEqBands, isEqBandActive } from "./studioEq";
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, Number.isFinite(n) ? n : min));
 export function normalizeEffects(e: StudioEffects): StudioEffects {
   return {
-    eq: { lowDb: clamp(e.eq.lowDb, -24, 24), midDb: clamp(e.eq.midDb, -24, 24), highDb: clamp(e.eq.highDb, -24, 24) },
+    outputDb: clamp(e.outputDb ?? 0, -60, 18),
+    eq: { ...e.eq, lowDb: clamp(e.eq.lowDb, -24, 24), midDb: clamp(e.eq.midDb, -24, 24), highDb: clamp(e.eq.highDb, -24, 24), outputDb: clamp(e.eq.outputDb ?? 0, -18, 18) },
     compressor: { thresholdDb: clamp(e.compressor.thresholdDb, -100, 0), ratio: clamp(e.compressor.ratio, 1, 20), attackMs: clamp(e.compressor.attackMs, 0, 1000), releaseMs: clamp(e.compressor.releaseMs, 1, 1000) },
     reverb: { mix: clamp(e.reverb.mix, 0, 1), decaySec: clamp(e.reverb.decaySec, 0.1, 8) },
     delay: { mix: clamp(e.delay.mix, 0, 1), timeMs: clamp(e.delay.timeMs, 1, 2000), feedback: clamp(e.delay.feedback, 0, 0.85) },
@@ -27,9 +29,8 @@ export function impulse(context: BaseAudioContext, seconds: number): AudioBuffer
 
 export function createTrackGraph(context: BaseAudioContext, destination: AudioNode) {
   const input = context.createGain();
-  const low = context.createBiquadFilter(); low.type = "lowshelf"; low.frequency.value = 120;
-  const mid = context.createBiquadFilter(); mid.type = "peaking"; mid.frequency.value = 1000; mid.Q.value = 0.8;
-  const high = context.createBiquadFilter(); high.type = "highshelf"; high.frequency.value = 8000;
+  const filters = Array.from({ length: 7 }, () => context.createBiquadFilter());
+  const eqOutput = context.createGain();
   const compressor = context.createDynamicsCompressor();
   const dry = context.createGain();
   const reverb = context.createConvolver();
@@ -38,34 +39,42 @@ export function createTrackGraph(context: BaseAudioContext, destination: AudioNo
   const feedback = context.createGain();
   const echo = context.createGain();
   const gain = context.createGain();
+  const effectGain = context.createGain(); effectGain.connect(gain);
   const pan = context.createStereoPanner();
   gain.connect(pan).connect(destination);
-  const nodes = [input, low, mid, high, compressor, dry, reverb, wet, delay, feedback, echo, gain, pan];
-  const effectNodes = [input, low, mid, high, compressor, dry, reverb, wet, delay, feedback, echo];
+  const nodes = [input, ...filters, eqOutput, compressor, dry, reverb, wet, delay, feedback, echo, effectGain, gain, pan];
+  const effectNodes = [input, ...filters, eqOutput, compressor, dry, reverb, wet, delay, feedback, echo];
+  let analyser: AnalyserNode | null = null;
   let routing = "";
   let decay = 0;
   return {
     input,
     update(track: StudioTrack, hasSolo: boolean) {
       const e = normalizeEffects(track.effects);
-      const enabled = [e.eq.lowDb !== 0, e.eq.midDb !== 0, e.eq.highDb !== 0, e.compressor.ratio > 1, e.reverb.mix > 0, e.delay.mix > 0];
-      const nextRouting = enabled.join(",");
+      const bands = getEqBands(e.eq);
+      const active = bands.map(band => !e.eq.bypass && isEqBandActive(band));
+      const enabled = [e.compressor.ratio > 1, e.reverb.mix > 0, e.delay.mix > 0];
+      const nextRouting = [...active, ...enabled].join(",");
       if (routing !== nextRouting) {
         // A neutral compressor still introduces lookahead. Disconnect unused
         // effects completely, for identical dry playback and offline export.
         effectNodes.forEach(node => node.disconnect());
         let output: AudioNode = input;
-        [low, mid, high, compressor].forEach((node, index) => { if (enabled[index]) { output.connect(node); output = node; } });
-        output.connect(dry).connect(gain);
-        if (enabled[4]) output.connect(reverb).connect(wet).connect(gain);
-        if (enabled[5]) {
-          output.connect(delay).connect(echo).connect(gain);
+        filters.forEach((node, index) => { if (active[index]) { output.connect(node); output = node; } });
+        output.connect(eqOutput); output = eqOutput;
+        if (enabled[0]) { output.connect(compressor); output = compressor; }
+        output.connect(dry).connect(effectGain);
+        if (enabled[1]) output.connect(reverb).connect(wet).connect(effectGain);
+        if (enabled[2]) {
+          output.connect(delay).connect(echo).connect(effectGain);
           delay.connect(feedback).connect(delay);
         }
         routing = nextRouting;
       }
       input.gain.value = clamp(track.normalizationGain ?? 1, 0, 100);
-      low.gain.value = e.eq.lowDb; mid.gain.value = e.eq.midDb; high.gain.value = e.eq.highDb;
+      filters.forEach((filter, index) => configureEqFilter(filter, bands[index], context.sampleRate));
+      eqOutput.gain.value = e.eq.bypass ? 1 : Math.pow(10, (e.eq.outputDb ?? 0) / 20);
+      effectGain.gain.value = Math.pow(10, (e.outputDb ?? 0) / 20);
       compressor.threshold.value = e.compressor.thresholdDb; compressor.ratio.value = e.compressor.ratio;
       compressor.attack.value = e.compressor.attackMs / 1000; compressor.release.value = e.compressor.releaseMs / 1000;
       dry.gain.value = 1 - e.reverb.mix; wet.gain.value = e.reverb.mix;
@@ -79,7 +88,12 @@ export function createTrackGraph(context: BaseAudioContext, destination: AudioNo
       gain.channelInterpretation = "speakers";
       pan.pan.value = clamp(track.mixer.pan, -1, 1);
     },
-    dispose() { nodes.forEach(node => node.disconnect()); },
+    spectrum() {
+      if (!analyser) { analyser = context.createAnalyser(); analyser.fftSize = 4096; analyser.smoothingTimeConstant = 0.75; pan.connect(analyser); }
+      const bins = new Uint8Array(analyser.frequencyBinCount); analyser.getByteFrequencyData(bins);
+      return { bins, sampleRate: context.sampleRate };
+    },
+    dispose() { nodes.forEach(node => node.disconnect()); analyser?.disconnect(); },
   };
 }
 export type TrackGraph = ReturnType<typeof createTrackGraph>;

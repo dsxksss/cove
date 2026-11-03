@@ -21,10 +21,20 @@ export type StudioClip = {
   startSec: number;
   offsetSec: number;
   durationSec: number;
+  fadeInSec?: number;
+  fadeOutSec?: number;
 };
 
+export type StudioEqBand = { type: "peaking" | "lowshelf" | "highshelf" | "highpass" | "lowpass" | "notch" | "bandpass"; frequency: number; gainDb: number; q: number; enabled: boolean };
+export type StudioEq = { lowDb: number; midDb: number; highDb: number; bands?: StudioEqBand[]; outputDb?: number; bypass?: boolean };
+export type StudioNormalizationOptions = { mode: "average" | "peak"; targetDb: number; ceilingDb: number };
+export type StudioNormalization = StudioNormalizationOptions & { gainDb: number; inputRmsDb: number; inputPeakDb: number; limited: boolean };
+export type StudioPitch = { semitones: number; preserveFormants: boolean };
+export type VocalPresetId = "natural" | "lead" | "space";
+
 export type StudioEffects = {
-  eq: { lowDb: number; midDb: number; highDb: number };
+  outputDb?: number;
+  eq: StudioEq;
   compressor: {
     thresholdDb: number;
     ratio: number;
@@ -42,6 +52,9 @@ export type StudioTrack = {
   referenceStem?: "original" | "vocals";
   offsetMs?: number;
   normalizationGain?: number;
+  normalization?: StudioNormalization;
+  pitch?: StudioPitch;
+  vocalTreatment?: { presetId: VocalPresetId; before: { effects: StudioEffects; normalizationGain?: number; normalization?: StudioNormalization } };
   denoiseOriginalAssets?: Record<string, string>;
   color: string;
   clips: StudioClip[];

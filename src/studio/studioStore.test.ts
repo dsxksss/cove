@@ -3,6 +3,7 @@ import { createStudioProject, createVocalTrack } from "./types";
 import { useStudioStore } from "./studioStore";
 import { canSplitStudioClip } from "./clipEditing";
 import { scheduledClip } from "../lib/studioSchedule";
+import { defaultEqBands } from "../lib/studioEq";
 
 function setup() {
   const project = createStudioProject({ songId: "1", title: "Song", artist: "Artist", coverUrl: "", durationSec: 10, lyrics: [] });
@@ -15,6 +16,55 @@ function setup() {
 }
 
 describe("studio editing state", () => {
+  it("creates an independently adjustable octave layer and preserves intentional gain differences", () => {
+    const { vocalId } = setup(); const store = useStudioStore.getState();
+    store.updateMixer(vocalId, { gain: 0.6, pan: -0.4, solo: true });
+    store.updateTrack(vocalId, { offsetMs: -75, normalizationGain: 2 });
+    const original = structuredClone(useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!);
+    const id = store.addHarmonyTrack(vocalId, { semitones: 12, preserveFormants: true })!;
+    const layer = useStudioStore.getState().project!.tracks.find(t => t.id === id)!;
+    expect(layer.pitch!.semitones).toBe(12); expect(layer.mixer.gain).toBeCloseTo(0.21, 6);
+    expect(layer.normalizationGain).toBe(2); expect(layer.mixer.solo).toBe(true);
+    expect(layer.clips[0].assetId).toBe(original.clips[0].assetId);
+    expect(layer.clips[0].id).not.toBe(original.clips[0].id); expect(layer.offsetMs).toBe(-75);
+    store.updateMixer(id, { gain: 0.12 }); store.updateClip(id, layer.clips[0].id, { startSec: 1 });
+    expect(useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)).toEqual(original);
+    store.undo(); store.undo(); store.undo();
+    expect(useStudioStore.getState().project!.tracks.length).toBe(2);
+  });
+  it("copies seven-band EQ independently and persists normalization analysis", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    const bands = defaultEqBands(); bands[2] = { ...bands[2], frequency: 650, gainDb: -5, q: 3, type: "notch" };
+    const eq = { lowDb: 0, midDb: 0, highDb: 0, bands, outputDb: -2, bypass: true };
+    store.updateEffects("instrumental", { eq }); store.copyEffects("instrumental"); store.pasteEffects(vocalId);
+    store.updateEffects("instrumental", { eq: { ...eq, bands: defaultEqBands() } });
+    expect(useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!.effects.eq).toEqual(eq);
+    const normalization = { mode: "average" as const, targetDb: -18, ceilingDb: -3, gainDb: 6, inputRmsDb: -24, inputPeakDb: -12, limited: false };
+    store.updateTrack(vocalId, { normalizationGain: Math.pow(10, 6 / 20), normalization });
+    const saved = JSON.parse(JSON.stringify(useStudioStore.getState().project)); store.setProject(saved);
+    const restored = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!;
+    expect(restored.effects.eq).toEqual(eq); expect(restored.normalization).toEqual(normalization);
+    expect(useStudioStore.getState().effectsClipboard!.effects.eq).toEqual(eq);
+  });
+  it("saves independent clip fades, clamps them after trimming, and supports undo", () => {
+    const { vocalId } = setup();
+    const store = useStudioStore.getState();
+    store.updateClip(vocalId, "clip-1", { fadeInSec: 1, fadeOutSec: 2 });
+    const saved = JSON.parse(JSON.stringify(useStudioStore.getState().project!));
+    store.setProject(saved);
+    store.updateClip(vocalId, "clip-1", { durationSec: 1.5 });
+    let clip = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!.clips[0];
+    expect(clip.fadeInSec! + clip.fadeOutSec!).toBeCloseTo(1.5);
+    store.undo();
+    clip = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!.clips[0];
+    expect(clip.durationSec).toBe(4); expect(clip.fadeInSec).toBe(1); expect(clip.fadeOutSec).toBe(2);
+    store.splitClip(vocalId, "clip-1", 2);
+    const clips = useStudioStore.getState().project!.tracks.find(t => t.id === vocalId)!.clips;
+    expect(clips[0].fadeInSec).toBe(1); expect(clips[0].fadeOutSec).toBe(0);
+    expect(clips[1].fadeInSec).toBe(0); expect(clips[1].fadeOutSec).toBe(2);
+    expect(useStudioStore.getState().project!.tracks[0].clips.length).toBe(0);
+  });
   afterEach(() => {
     useStudioStore.getState().setProject(null);
     useStudioStore.setState({ effectsClipboard: null });

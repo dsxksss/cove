@@ -1,9 +1,11 @@
 import { create } from "zustand";
-import type { StudioEffects, StudioProject, StudioTrack, StudioAsset, StudioTake, StudioClip } from "./types";
+import type { StudioEffects, StudioProject, StudioTrack, StudioAsset, StudioTake, StudioClip, StudioPitch } from "./types";
 import { createReferenceTrack, createVocalTrack, DEFAULT_EFFECTS } from "./types";
 import { repairStudioAssetNames } from "./assetNames";
 import { migrateStudioEffectDefaults } from "./effectDefaults";
 import { splitStudioClipAt } from "./clipEditing";
+import { getClipFades } from "../lib/studioFades";
+import { normalizePitch } from "../lib/studioPitch";
 
 type StudioState = {
   project: StudioProject | null;
@@ -24,6 +26,7 @@ type StudioState = {
   setRecordingTrackId: (id: string | null) => void;
   updateProjectTitle: (title: string) => void;
   addVocalTrack: () => string | null;
+  addHarmonyTrack: (trackId: string, pitch: StudioPitch) => string | null;
   addReferenceTrack: (stem?: "original" | "vocals") => string | null;
   updateTrack: (id: string, patch: Partial<StudioTrack>) => void;
   renameTrack: (id: string, name: string) => void;
@@ -64,7 +67,7 @@ function updateClipProject(project: StudioProject, trackId: string, clipId: stri
         const maxDuration = asset?.durationSec ?? next.durationSec;
         const offset = Math.max(0, Math.min(next.offsetSec, Math.max(0, maxDuration - 0.05)));
         const duration = Math.max(0.05, Math.min(next.durationSec, maxDuration - offset));
-        return { ...next, startSec: Math.max(0, next.startSec), offsetSec: offset, durationSec: duration };
+        return { ...next, ...getClipFades(next, duration), startSec: Math.max(0, next.startSec), offsetSec: offset, durationSec: duration };
       }) };
     }),
   };
@@ -103,6 +106,19 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     if (!project) return null;
     const track = createVocalTrack(project.tracks.filter((track) => track.kind === "vocal").length + 1);
     set((state) => historyCommit(state, touch({ ...project, tracks: [...project.tracks, track] })));
+    return track.id;
+  },
+  addHarmonyTrack: (trackId, pitch) => {
+    const state = get(), source = state.project?.tracks.find(track => track.id === trackId);
+    if (!state.project || !source || source.kind !== "vocal" || !source.clips.length || state.recordingTrackId) return null;
+    const settings = normalizePitch(pitch), track = structuredClone(source);
+    track.id = `vocal-${crypto.randomUUID()}`;
+    track.name = `${source.name} · ${settings.semitones >= 0 ? "+" : ""}${settings.semitones} 半音叠唱`;
+    track.pitch = settings;
+    track.clips = track.clips.map(clip => ({ ...clip, id: `clip-${crypto.randomUUID()}` }));
+    track.mixer = { ...track.mixer, gain: Math.min(2, Math.max(0, track.mixer.gain * 0.35)), pan: 0.2, mute: false, solo: source.mixer.solo, armed: false };
+    track.normalization = undefined; track.vocalTreatment = undefined;
+    set(current => historyCommit(current, touch({ ...state.project!, tracks: [...state.project!.tracks, track] })));
     return track.id;
   },
   addReferenceTrack: (stem = "original") => {
@@ -203,6 +219,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         assets: [asset],
         denoiseOriginalAssets: undefined,
         normalizationGain: undefined,
+        normalization: undefined,
+        vocalTreatment: undefined,
         clips: [{ id: `clip-${Date.now()}`, assetId: asset.id, startSec: Math.max(0, startSec), offsetSec: 0, durationSec: asset.durationSec }],
         takes: track.kind === "instrumental" ? [] : track.takes,
       }),

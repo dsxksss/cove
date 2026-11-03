@@ -32,6 +32,7 @@ import { LyricMotionStyle, Song, PlayerLayout } from './playerTypes';
 import { getLyricLineMotion, isFoliaAbsoluteStyle } from './lyricMotion';
 import FoliaLyricsRail from './FoliaLyricsRail';
 import { LEVEL_OPTIONS } from '../lib/playbackPrefs';
+import { STUDIO_ENABLED } from '../lib/buildFeatures';
 import type { LyricSourceMode } from '../lib/lyrics/matchLyrics';
 import { usePlayerStore } from '../store/playerStore';
 
@@ -977,7 +978,7 @@ export default function GlassPlayer({
                     </motion.button>
                   </div>
 
-                  <motion.button
+                  {STUDIO_ENABLED && <motion.button
                     type="button"
                     whileHover={{ scale: 1.06 }}
                     whileTap={{ scale: 0.94 }}
@@ -990,7 +991,7 @@ export default function GlassPlayer({
                     style={{ ["--lg-solid-size" as string]: "2.25rem" }}
                   >
                     <Mic2 size={17} />
-                  </motion.button>
+                  </motion.button>}
 
                   <div ref={moreMenuRef} className="relative shrink-0">
                   <motion.button

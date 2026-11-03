@@ -1,0 +1,125 @@
+/** Actual WebAudio/WAV envelopes and the per-clip transition editor. */
+import { chromium } from "playwright";
+import assert from "node:assert/strict";
+import { mkdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const base = process.env.COVE_TEST_URL || "http://127.0.0.1:1420";
+const output = new URL("../.tmp/studio-fades-regression/", import.meta.url);
+mkdirSync(output, { recursive: true });
+const browser = await chromium.launch({ headless: true, args: ["--autoplay-policy=no-user-gesture-required"] });
+const page = await browser.newPage({ viewport: { width: 1080, height: 700 } });
+const errors = [];
+page.on("pageerror", error => errors.push(error.message));
+try {
+  const csp = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8")).app.security.csp;
+  await page.route("**/__studio_fades", route => route.fulfill({ contentType: "text/html", headers: { "Content-Security-Policy": csp }, body: '<html><body style="margin:0"><div id="root" style="height:100vh"></div></body></html>' }));
+  await page.goto(`${base}/__studio_fades`);
+  const audio = await page.evaluate(async () => {
+    const { createStudioProject, createVocalTrack } = await import("/src/studio/types.ts");
+    const { renderStudioMix } = await import("/src/lib/studioExport.ts");
+    const { StudioAudioEngine } = await import("/src/lib/studioAudio.ts");
+    const { createClipEnvelope } = await import("/src/lib/studioFades.ts");
+    const { encodePcmWav } = await import("/src/lib/studioWav.ts");
+    const pcm = new Float32Array(48000 * 4).fill(0.25);
+    const asset = { id: "audio", name: "过渡测试.wav", url: URL.createObjectURL(encodePcmWav([pcm, pcm], 48000, 24)), durationSec: 4, mimeType: "audio/wav" };
+    const project = createStudioProject({ songId: "test", title: "多轨过渡", artist: "Test", coverUrl: "", durationSec: 4, lyrics: [] });
+    const track = project.tracks[0]; track.assets = [asset]; project.instrumental = asset;
+    const clip = { id: "clip", assetId: asset.id, startSec: 0, offsetSec: 0, durationSec: 4, fadeInSec: 1, fadeOutSec: 1 };
+    track.clips = [clip];
+    const engine = new StudioAudioEngine();
+    const decode = async () => engine.context.decodeAudioData(await (await renderStudioMix(project)).arrayBuffer());
+    const at = (buffer, time) => buffer.getChannelData(0)[Math.round(time * buffer.sampleRate)];
+    const normal = await decode();
+    const samples = [0, 0.25, 0.5, 1.5, 3.5, 3.75].map(time => at(normal, time));
+    track.offsetMs = -500;
+    const shifted = await decode();
+    const shiftedSamples = [0, 0.25, 1, 3.25].map(time => at(shifted, time));
+    track.offsetMs = 0;
+    // The same envelope when transport starts halfway into a fade must equal
+    // the corresponding samples in a full offline render, without restarting.
+    const offline = new OfflineAudioContext(2, 48000, 48000);
+    const source = offline.createBufferSource();
+    source.buffer = await offline.decodeAudioData(await (await fetch(asset.url)).arrayBuffer());
+    source.connect(createClipEnvelope(offline, offline.destination, clip, 4, 0, 0.5));
+    source.start(0, 0.5, 1);
+    const seeked = await offline.startRendering();
+    let seekError = 0;
+    for (let i = 0; i < 48000; i++) seekError = Math.max(seekError, Math.abs(seeked.getChannelData(0)[i] - normal.getChannelData(0)[i + 24000]));
+    await engine.setProject(project); await engine.play(0.5);
+    const liveEnvelope = Boolean(engine.sources[0].envelope);
+    const changed = structuredClone(project); changed.tracks[0].clips[0].fadeInSec = 2;
+    const previousSource = engine.sources[0].source;
+    await engine.setProject(changed);
+    const liveEdit = engine.isPlaying && engine.sources[0].source !== previousSource;
+    engine.dispose();
+    // Matching linear fades on two overlapping tracks keep the level steady.
+    track.clips = [{ ...clip, durationSec: 3, fadeInSec: 0 }];
+    const vocal = createVocalTrack(1); vocal.assets = [asset];
+    vocal.clips = [{ ...clip, id: "second", startSec: 2, durationSec: 2, fadeOutSec: 0 }];
+    project.tracks.push(vocal);
+    const context = new AudioContext();
+    const overlap = await context.decodeAudioData(await (await renderStudioMix(project)).arrayBuffer());
+    const overlapSamples = [2, 2.25, 2.5, 2.75, 3].map(time => at(overlap, time));
+    await context.close();
+    window.fadeProject = project;
+    return { samples, shiftedSamples, seekError, liveEnvelope, liveEdit, overlapSamples };
+  });
+  const near = (values, expected) => values.forEach((value, index) => assert.ok(Math.abs(value - expected[index]) < 0.00001, `sample ${index}: ${value} vs ${expected[index]}`));
+  near(audio.samples, [0, 0.0625, 0.125, 0.25, 0.125, 0.0625]);
+  near(audio.shiftedSamples, [0.125, 0.1875, 0.25, 0.0625]);
+  near(audio.overlapSamples, [0.25, 0.25, 0.25, 0.25, 0.25]);
+  assert.ok(audio.seekError < 0.000001);
+  assert.ok(audio.liveEnvelope && audio.liveEdit);
+  await page.evaluate(async () => {
+    const refresh = (await import("/@react-refresh")).default;
+    refresh.injectIntoGlobalHook(window); window.$RefreshReg$ = () => {}; window.$RefreshSig$ = () => type => type; window.__vite_plugin_react_preamble_installed__ = true;
+    await import("/src/index.css?import");
+    const React = (await import("/node_modules/.vite/deps/react.js")).default;
+    const { createRoot } = (await import("/node_modules/.vite/deps/react-dom_client.js")).default;
+    const { default: Workspace } = await import("/src/components/StudioWorkspace.tsx");
+    const moduleUrl = path => performance.getEntriesByType("resource").filter(entry => new URL(entry.name).pathname === path).at(-1)?.name ?? path;
+    const { useStudioStore } = await import(moduleUrl("/src/studio/studioStore.ts"));
+    window.fadeStore = useStudioStore;
+    window.__TAURI_INTERNALS__ = { invoke: async (command, args) => { if (command === "studio_list_projects") return []; if (command === "studio_save_project") window.savedFadeProject = JSON.parse(JSON.stringify(args.project)); return null; } };
+    createRoot(document.getElementById("root")).render(React.createElement(Workspace, { project: window.fadeProject, onBack() {}, onPlayInPlayer() {} }));
+  });
+  const clips = page.getByRole("button", { name: "音频片段 伴奏", exact: true });
+  await clips.click({ button: "right" });
+  await page.getByRole("menuitem", { name: "淡入 / 淡出…", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "音轨调整", exact: true });
+  await dialog.getByRole("tabpanel", { name: "淡入淡出", exact: true }).waitFor();
+  const fadeIn = page.getByRole("spinbutton", { name: "淡入时长（秒）", exact: true });
+  await fadeIn.fill("0.35"); await fadeIn.press("Enter");
+  const storedFade = () => page.evaluate(() => window.fadeStore.getState().project.tracks[0].clips[0].fadeInSec);
+  assert.equal(await storedFade(), 0.35);
+  await page.screenshot({ path: fileURLToPath(new URL("clip-fades.png", output)) });
+  const slider = page.getByRole("slider", { name: "淡入时长滑块", exact: true });
+  await slider.focus(); await slider.press("ArrowRight"); await slider.press("ArrowRight");
+  await page.keyboard.press("Escape");
+  assert.equal(await page.evaluate(() => window.fadeStore.getState().historyTransaction), null, "closing while focused commits the slider undo transaction");
+  assert.equal(await storedFade(), 0.37);
+  await page.evaluate(() => window.fadeStore.getState().undo());
+  assert.equal(await storedFade(), 0.35);
+  assert.ok(await page.locator("[data-studio-fade-envelope]").count() >= 2);
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await page.waitForFunction(() => window.savedFadeProject?.tracks[0].clips[0].fadeInSec === 0.35);
+  await page.evaluate(() => window.fadeStore.getState().setProject(window.savedFadeProject));
+  assert.equal(await storedFade(), 0.35);
+  // Open a specific later clip through its context menu, not the first take.
+  await page.evaluate(() => {
+    const store = window.fadeStore.getState();
+    const track = store.project.tracks[0];
+    store.updateTrack(track.id, { clips: [...track.clips, { ...track.clips[0], id: "later", startSec: 3, durationSec: 1, fadeInSec: 0.1, fadeOutSec: 0.2 }] });
+  });
+  await clips.nth(1).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "淡入 / 淡出…", exact: true }).click();
+  assert.equal(await dialog.getByRole("button", { name: "片段 2", exact: true }).getAttribute("aria-pressed"), "true");
+  await fadeIn.fill("10"); await fadeIn.press("Enter");
+  assert.equal(await page.evaluate(() => window.fadeStore.getState().project.tracks[0].clips[1].fadeInSec), 0.8);
+  await page.setViewportSize({ width: 800, height: 600 });
+  assert.equal(await dialog.evaluate(node => node.scrollWidth > node.clientWidth), false);
+  await page.screenshot({ path: fileURLToPath(new URL("clip-fades-small.png", output)) });
+  assert.deepEqual(errors, []);
+  console.log("PASS: actual WAV fade samples, overlapping tracks, negative offset, seeking, live edits, per-clip UI, grouped undo, save/reopen and narrow dialog.");
+} finally { await browser.close(); }

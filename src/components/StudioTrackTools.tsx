@@ -2,10 +2,12 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { RotateCcw, Volume2, X } from "lucide-react";
 import { StudioPanKnob } from "./StudioPanKnob";
 import type { StudioTrack } from "../studio/types";
+import type { StudioNormalizationOptions } from "../studio/types";
+import { StudioNormalizationControls } from "./StudioNormalizationControls";
 
 export function trapStudioDialogTab(event: React.KeyboardEvent<HTMLElement>) {
   if (event.key !== "Tab") return;
-  const controls = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), [tabindex="0"]')].filter((node) => !node.closest("fieldset:disabled"));
+  const controls = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, [tabindex="0"]')].filter((node) => !node.closest("fieldset:disabled") && node.getClientRects().length > 0);
   const first = controls[0], last = controls[controls.length - 1];
   if (!first) { event.preventDefault(); return; }
   if (event.shiftKey && (document.activeElement === first || !controls.includes(document.activeElement as HTMLElement))) { event.preventDefault(); last?.focus(); }
@@ -25,9 +27,9 @@ export function SignedMilliseconds({ label, value, onChange, limit = 30000, disa
   }} className="no-drag w-20 rounded-lg bg-white/10 px-2 py-1.5 text-right font-mono text-white outline-none focus:ring-1 focus:ring-lime-200/60" /><span>{unit}</span></label>;
 }
 
-export function StudioTrackTools({ track, busy, onClose, onMixer, onRename, onOffset, onNormalize, onDenoise, onRestore, effects, rename = false, initialTab = "channel" }: {
+export function StudioTrackTools({ track, busy, onClose, onMixer, onRename, onOffset, onNormalize, onCancelNormalization, onDenoise, onRestore, effects, fades, voice, rename = false, initialTab = "channel" }: {
   track: StudioTrack; busy: boolean; onClose: () => void; onMixer: (patch: Partial<StudioTrack["mixer"]>) => void; onRename: (name: string) => void; onOffset: (offset: number) => void;
-  onNormalize: () => void; onDenoise: (strength: number) => void; onRestore: () => void; effects: ReactNode; rename?: boolean; initialTab?: "channel" | "effects" | "audio";
+  onNormalize: (options: StudioNormalizationOptions) => void; onCancelNormalization: () => void; onDenoise: (strength: number) => void; onRestore: () => void; effects: ReactNode; fades: ReactNode; voice: ReactNode; rename?: boolean; initialTab?: "channel" | "effects" | "audio" | "fades" | "voice";
 }) {
   const [strength, setStrength] = useState(2);
   const [tab, setTab] = useState(initialTab);
@@ -39,7 +41,7 @@ export function StudioTrackTools({ track, busy, onClose, onMixer, onRename, onOf
   const gainLabel = track.mixer.gain === 0 ? "−∞ dB" : `${db > 0 ? "+" : ""}${db.toFixed(1)} dB`;
   const commitName = () => { if (cancelNameRef.current) { cancelNameRef.current = false; return; } const next = name.trim() || track.name; if (next !== track.name) onRename(next); setName(next); };
   return <div className="absolute inset-0 z-[220] grid place-items-center bg-black/60 p-5 backdrop-blur-sm" onKeyDown={(event) => { trapStudioDialogTab(event); if (event.key === "Escape" && !busy) { event.stopPropagation(); onClose(); } }}>
-    <section role="dialog" aria-modal="true" aria-label="音轨调整" className="flex h-[min(620px,calc(100vh-40px))] min-h-0 max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/15 bg-slate-900 shadow-2xl">
+    <section role="dialog" aria-modal="true" aria-label="音轨调整" className={`flex h-[min(760px,calc(100vh-40px))] min-h-0 max-h-full w-full ${tab === "effects" ? "max-w-5xl" : "max-w-2xl"} flex-col overflow-hidden rounded-2xl border border-white/15 bg-slate-900 shadow-2xl`}>
       <div className="flex shrink-0 items-center gap-3 border-b border-white/10 px-5 py-4">
         <span className="h-8 w-1 shrink-0 rounded-full" style={{ background: track.color }} />
         <div className="min-w-0 flex-1"><p className="mb-1 text-[10px] tracking-widest text-white/35">音轨设置 · {track.kind === "vocal" ? "人声" : track.kind === "reference" ? "参考" : "伴奏"}</p><input ref={nameRef} aria-label="详细音轨名称" disabled={busy} value={name} onChange={event => setName(event.target.value)} onBlur={commitName} onKeyDown={event => { if (event.key === "Enter") { commitName(); event.currentTarget.blur(); } if (event.key === "Escape") { event.stopPropagation(); cancelNameRef.current = true; setName(track.name); event.currentTarget.blur(); } }} className="w-full rounded bg-transparent px-1 py-0.5 text-sm font-bold text-white outline-none focus:bg-white/10 focus:ring-1 focus:ring-lime-200/50" /></div>
@@ -57,7 +59,7 @@ export function StudioTrackTools({ track, busy, onClose, onMixer, onRename, onOf
           <p className="text-[9px] text-white/30">静音 / 独奏</p>
         </aside>
         <div className="flex min-h-0 min-w-0 flex-1 flex-col p-5">
-          <div role="tablist" aria-label="音轨设置分组" className="mb-5 flex shrink-0 gap-1 rounded-lg bg-black/20 p-1">{([["channel", "通道"], ["effects", "效果器"], ["audio", "音频处理"]] as const).map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => setTab(id)} className={`flex-1 rounded-md px-2 py-1.5 text-xs ${tab === id ? "bg-white/10 font-bold text-white" : "text-white/40 hover:text-white/70"}`}>{label}</button>)}</div>
+          <div role="tablist" aria-label="音轨设置分组" className="mb-5 flex shrink-0 flex-wrap gap-1 rounded-lg bg-black/20 p-1">{([["channel", "通道"], ["effects", "效果器"], ["fades", "淡入淡出"], ["voice", "移调 / 人声"], ["audio", "音频处理"]] as const).map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => setTab(id)} className={`flex-1 whitespace-nowrap rounded-md px-2 py-1.5 text-xs ${tab === id ? "bg-white/10 font-bold text-white" : "text-white/40 hover:text-white/70"}`}>{label}</button>)}</div>
           <div aria-label="音轨设置内容" className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain [scrollbar-width:thin]">
           {tab === "channel" && <div role="tabpanel" aria-label="通道" className="space-y-5">
             <div className="flex flex-wrap items-center gap-5 rounded-xl border border-white/8 bg-white/[0.025] p-4"><StudioPanKnob value={track.mixer.pan} onChange={pan => onMixer({ pan })} /><div className="space-y-2"><p className="text-xs font-bold text-white/70">左右声像</p><SignedMilliseconds label="声像" value={Math.round(track.mixer.pan * 100)} onChange={value => onMixer({ pan: value / 100 })} limit={100} unit="%" /><p className="text-[10px] text-white/35">负数偏左，正数偏右 · 双击旋钮居中</p></div></div>
@@ -65,8 +67,10 @@ export function StudioTrackTools({ track, busy, onClose, onMixer, onRename, onOf
             <div className="border-t border-white/10 pt-4"><div className="flex flex-wrap items-center justify-between gap-2"><SignedMilliseconds label="音轨偏移" value={track.offsetMs ?? 0} onChange={onOffset} /><button type="button" onClick={() => onOffset(0)} title="重置音轨偏移" aria-label="重置音轨偏移" className="rounded p-1.5 text-white/40 hover:bg-white/10"><RotateCcw size={13} /></button></div><p className="mt-2 text-[10px] leading-5 text-white/35">负数提前，正数延后 · ±30,000 ms</p></div>
           </div>}
           {tab === "effects" && <div role="tabpanel" aria-label="效果器">{effects}<p className="mt-4 text-[11px] text-white/35">参数实时生效，播放和导出使用相同设置。</p></div>}
+          {tab === "fades" && fades}
+          {tab === "voice" && voice}
           {tab === "audio" && <div role="tabpanel" aria-label="音频处理" className="space-y-5">
-            <div><button type="button" disabled={!track.clips.length} onClick={onNormalize} className="rounded-xl bg-lime-200/15 px-3 py-2 text-xs font-bold text-lime-100 disabled:opacity-40">{track.normalizationGain != null ? "取消归一化" : "声音归一化"}</button><p className="mt-2 text-[11px] leading-5 text-white/40">输入峰值调整至 −1 dB，音量推子和效果器仍可独立调整。</p></div>
+            <StudioNormalizationControls track={track} onApply={onNormalize} onCancel={onCancelNormalization} />
             <div className="space-y-3 border-t border-white/10 pt-4"><div className="flex flex-wrap items-center gap-2"><span className="mr-1 text-xs text-white/60">录音降噪</span>{["轻度", "标准", "较强"].map((label, index) => <button type="button" key={label} aria-pressed={strength === index + 1} onClick={() => setStrength(index + 1)} className={`rounded-lg px-2.5 py-1.5 text-xs ${strength === index + 1 ? "bg-white/20 text-white" : "bg-white/5 text-white/45"}`}>{label}</button>)}</div><div className="flex gap-2"><button type="button" disabled={!track.clips.length} onClick={() => onDenoise(strength)} className="rounded-xl bg-white/10 px-3 py-2 text-xs font-bold disabled:opacity-40">应用降噪</button>{track.denoiseOriginalAssets && <button type="button" onClick={onRestore} className="rounded-xl px-3 py-2 text-xs text-white/60 hover:bg-white/10">恢复降噪前</button>}</div><p className="text-[11px] leading-5 text-white/40">减少持续底噪。较强处理可能影响气声和细节，原始音频会保留以供恢复。</p></div>
           </div>}
           </div>
